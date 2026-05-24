@@ -4,6 +4,10 @@ This is a noob-friendly guide to standing up your own ipfs-gate server. It assum
 
 > '''Status:''' v0.1 first build. Working software but expect rough edges. Bugs found during real deployment get folded back into the [[#Common problems|Common Problems]] section below.
 
+> '''Reference OS:''' Ubuntu Server 24.04 LTS (Noble). The recipes are tested on this OS specifically. Other distros (Ubuntu 22.04, Debian 12, etc.) will likely work but might have subtle differences. For reproducibility, stick to '''Ubuntu 24.04 LTS''' on a fresh VPS.
+
+> '''Reference user:''' This guide assumes you SSH in as <code>root</code> on a fresh VPS (the default for most providers — Vultr, Hetzner, Linode, DigitalOcean, etc.). If you operate as a non-root user with sudo, swap <code>sudo</code> in where shown.
+
 == What you are setting up ==
 
 A server that:
@@ -17,42 +21,61 @@ You don't need to know how IPFS works internally. ipfs-gate sits in front of it,
 
 == What you need before starting ==
 
-# A Linux VPS with at least:
+# A '''fresh Ubuntu 24.04 LTS VPS''' with at least:
 #* '''2 CPU cores''', '''2GB RAM''', '''20GB disk''' (more disk = more pinning capacity)
-#* Ubuntu 22.04+ or Debian 12+ (other distros work but recipes below assume these)
-#* A '''public IP address''' and the ability to open port 80 + 443
-# A '''domain name''' you control (e.g. <code>ipfs.v4call.com</code>). It must point at your VPS's IP via an A record.
+#* A '''public IP address''' and the ability to open ports 80 + 443
+# A '''domain name''' you control (e.g. <code>ipfs.v4call.com</code>). It must point at your VPS's IP via an A record. Set this up at your DNS provider '''before''' starting — Let's Encrypt needs the domain to resolve.
 # A '''dedicated Hive account''' for ipfs-gate (separate from any v4call account). [https://signup.hive.io Create one] if needed. Fund it with about '''2 HBD''' for refunds and Resource Credits.
 # The '''active private key''' for that Hive account (NOT the owner key, NOT the posting key — the active key). You will paste it into the server's <code>.env</code> file. Keep it secret.
-# Docker and docker-compose installed (recipe below).
 
 If you don't have CNOOBS to test with, ask CompleteNoobs in v4call or contact via the Hive blockchain.
 
-== Step 1: Install Docker (if not already) ==
+This guide installs everything on '''one VPS''' (kubo, ipfs-gate, nginx). For v0.1 scale this is fine; splitting onto separate boxes can come later.
+
+== Step 1: Install Docker on Ubuntu 24.04 ==
+
+SSH into the VPS as root:
 
 <pre>
-# Update package lists
-sudo apt update && sudo apt upgrade -y
+ssh root@your-vps-ip
+</pre>
 
-# Install Docker the official way
-curl -fsSL https://get.docker.com | sudo sh
+Update + install Docker (the official one-liner installer):
 
-# Add yourself to the docker group so you don't need sudo every time
-sudo usermod -aG docker $USER
+<pre>
+apt update && apt upgrade -y
+curl -fsSL https://get.docker.com | sh
+</pre>
 
-# Log out + log back in for the group change to take effect, then verify:
+Verify:
+
+<pre>
 docker --version
 docker compose version
 </pre>
 
-== Step 2: Clone ipfs-gate ==
+You should see Docker 27.x or newer and Docker Compose v2.x or newer.
+
+''(If you'd rather operate as a non-root user, also run <code>usermod -aG docker your-user</code> then log out and back in. The rest of this guide uses root; adjust paths under <code>/root/...</code> to <code>/home/your-user/...</code> as needed.)''
+
+== Step 2: Clone ipfs-gate + prepare data directories ==
+
+We'll deploy from <code>/opt/IPFS-Gate</code> (a standard location for operator-managed services):
 
 <pre>
+cd /opt
 git clone https://github.com/CompleteNoobs/IPFS-Gate.git
-cd IPFS-Gate
+cd /opt/IPFS-Gate
 </pre>
-* maybe needed - run in dir IPFS-Gate/
-<code>chown -R 1000:1000 ./data/</code>
+
+'''Critical permission step.''' The ipfs-gate container runs as UID 1000 (the <code>node</code> user inside the container). Because we're running docker as root, the host data directories get created owned by root, and the container can't write to them. Pre-create them and chown:
+
+<pre>
+mkdir -p data/kubo data/ipfs-gate data/letsencrypt data/letsencrypt-webroot
+chown -R 1000:1000 data/
+</pre>
+
+Skipping this leads to <code>SQLITE_CANTOPEN</code> errors in the ipfs-gate logs (see [[#Common problems|Common Problems]] #2).
 
 == Step 3: Configure .env ==
 
@@ -61,15 +84,19 @@ cp .env.example .env
 nano .env
 </pre>
 
-Fill in at minimum:
+Fill in at minimum (the only three required fields):
+
 * <code>IPFS_GATE_HIVE_ACCOUNT</code> — your dedicated Hive account name (e.g. <code>v4call-ipfs</code>)
 * <code>IPFS_GATE_ACTIVE_KEY</code> — its active private key (starts with <code>5...</code>)
-* <code>ADMIN_KEY</code> — pick a long random string (this is your admin password for the server)
+* <code>ADMIN_KEY</code> — pick a long random string. Generate one with <code>openssl rand -hex 32</code> from another terminal.
 
-Leave the rest at defaults unless you know what you're changing. Sensible defaults:
+Sensible defaults to leave alone:
+
+* <code>BIND_HOST=0.0.0.0</code> — required for docker; do '''not''' change to 127.0.0.1
 * <code>DISK_LIMIT_GB=5</code> — increase as your VPS allows
-* <code>DEFAULT_TTL_DAYS=7</code> — how long files stay pinned
+* <code>DEFAULT_TTL_DAYS=7</code> — accepts fractions for testing (e.g. <code>0.001</code> ≈ 1.4 min)
 * <code>MAX_FILE_SIZE_MB=10</code> — per-upload cap
+* <code>KUBO_DHT_MODE=none</code> — private hosting; CID only servable from your own gateway. Set to <code>client</code> for public IPFS network availability
 
 Save and exit (Ctrl-X, Y, Enter in nano).
 
@@ -79,32 +106,43 @@ Save and exit (Ctrl-X, Y, Enter in nano).
 nano nginx/ipfs-gate.conf
 </pre>
 
-Replace '''every instance''' of <code>ipfs.example.com</code> with your actual domain (e.g. <code>ipfs.v4call.com</code>). The HTTPS server block is commented out — leave it commented for now; we'll uncomment after getting the cert.
+Replace '''every instance''' of <code>ipfs.example.com</code> with your actual domain (e.g. <code>ipfs.v4call.com</code>).
+
+Leave the HTTPS server block '''commented out''' for now — we'll enable it after the cert is in place in Step 6.
 
 == Step 5: Boot HTTP-only and get an SSL cert ==
 
-First bring up the stack with HTTP only (no HTTPS yet — that comes after the cert exists):
+Bring up the stack with HTTP only:
 
 <pre>
-docker compose up -d kubo ipfs-gate nginx
+docker compose up -d
 </pre>
 
-Wait ~30 seconds for Kubo's first-boot identity generation. Verify:
+Wait ~30 seconds for Kubo's first-boot identity generation. Then verify:
 
 <pre>
 docker compose ps
 docker compose logs ipfs-gate | tail -20
 </pre>
 
-You should see <code>ipfs-gate v0.1 listening on 127.0.0.1:3001</code> and <code>kubo backend OK</code>.
+You should see lines like:
+
+<pre>
+[quota] schema_version = 1
+[server] kubo backend OK, version 0.41.0, used <N> bytes
+[sweeper] starting, interval = 60000ms
+ipfs-gate v0.1 listening on 0.0.0.0:3001
+  operator account: @your-hive-account
+  payment: 1 CNOOBS per upload (≤10MB, 7-day TTL)
+  CORS origin: *
+</pre>
+
+If you see <code>listening on 127.0.0.1:3001</code> instead, your <code>.env</code> has the old BIND_HOST. Fix it (Common Problems #6) before proceeding — the cert step needs HTTP serving to work.
 
 Now request the cert from Let's Encrypt:
 
 <pre>
-# Make the directories certbot will use
-mkdir -p data/letsencrypt data/letsencrypt-webroot
-
-# Run certbot once to issue
+# Replace ipfs.your-domain.com with your actual domain in both places below.
 docker run --rm -it \
   -v "$PWD/data/letsencrypt:/etc/letsencrypt" \
   -v "$PWD/data/letsencrypt-webroot:/var/www/certbot" \
@@ -115,7 +153,9 @@ docker run --rm -it \
   --email you@your-domain.com --agree-tos --no-eff-email
 </pre>
 
-If it succeeds, you'll see "Successfully received certificate." Files will be in <code>data/letsencrypt/live/ipfs.your-domain.com/</code>.
+On success: <code>Successfully received certificate.</code> The cert files land in <code>data/letsencrypt/live/ipfs.your-domain.com/</code>.
+
+If this fails with a DNS error, double-check that your domain's A record actually points at this VPS's IP (try <code>dig ipfs.your-domain.com</code> from a different machine).
 
 == Step 6: Enable HTTPS ==
 
@@ -123,72 +163,86 @@ If it succeeds, you'll see "Successfully received certificate." Files will be in
 nano nginx/ipfs-gate.conf
 </pre>
 
-Uncomment the <code>server { listen 443 ssl; ... }</code> block. Make sure every <code>ipfs.example.com</code> in that block is also replaced with your domain.
+Uncomment the entire <code>server { listen 443 ssl; ... }</code> block. Make sure every <code>ipfs.example.com</code> in that block is also replaced with your domain (it should already match what you set in Step 4).
 
 Reload nginx:
 
 <pre>
 docker compose restart nginx
-</pre>
-
-Check logs:
-
-<pre>
 docker compose logs nginx | tail -10
 </pre>
 
 == Step 7: Verify it's working ==
 
-<pre>
-# Public root endpoint should respond with service info
-curl https://ipfs.your-domain.com/
+From your laptop (NOT the VPS):
 
-# Admin stats endpoint (replace YOUR_ADMIN_KEY with the value from .env)
+<pre>
+curl https://ipfs.your-domain.com/
+</pre>
+
+Expected JSON response:
+
+<pre>
+{"service":"ipfs-gate","version":"0.1.0-dev","operator":"your-hive-account","payment":{"currency":"CNOOBS","amount":"1","max_size_mb":10,"ttl_days":7}}
+</pre>
+
+Test the admin endpoint too (substitute your real ADMIN_KEY):
+
+<pre>
 curl -H 'Authorization: Bearer YOUR_ADMIN_KEY' https://ipfs.your-domain.com/admin/stats
 </pre>
 
-You should see a JSON response with disk, pin, and kubo stats.
+You should see a JSON response with disk, pin, payment, moderation, and kubo stats.
+
+'''Note:''' an HTTP request (<code>http://...</code>) returns a 301 redirect to HTTPS. That's expected — nginx forces HTTPS for all real traffic. Use <code>curl -L</code> to follow the redirect or hit <code>https://</code> directly.
 
 == Step 8: Schedule cert renewal ==
 
-Let's Encrypt certs expire after 90 days. Add a cron job:
+Let's Encrypt certs expire after 90 days. Add a cron job for root:
 
 <pre>
 crontab -e
 </pre>
 
-Add this line (adjust the path to your actual ipfs-gate directory):
+Add this single line (adjust nothing — uses <code>/opt/IPFS-Gate</code> from this walkthrough):
 
 <pre>
-0 3 * * 1 cd /home/USER/IPFS-Gate && docker run --rm -v "$PWD/data/letsencrypt:/etc/letsencrypt" -v "$PWD/data/letsencrypt-webroot:/var/www/certbot" --entrypoint certbot certbot/certbot renew --quiet && docker compose restart nginx
+0 3 * * 1 cd /opt/IPFS-Gate && docker run --rm -v "$PWD/data/letsencrypt:/etc/letsencrypt" -v "$PWD/data/letsencrypt-webroot:/var/www/certbot" --entrypoint certbot certbot/certbot renew --quiet && docker compose restart nginx
 </pre>
+
+Runs every Monday at 03:00 UTC. Certbot only actually renews when within 30 days of expiry — earlier runs are no-ops.
 
 == Updating to a new version ==
 
 <pre>
-cd ~/IPFS-Gate
+IPFS_GATE_DIR=/opt/IPFS-Gate
+cd "$IPFS_GATE_DIR"
 
-# Back up your config + data BEFORE pulling
+# 1. Back up your config + data BEFORE pulling
 cp .env .env.bk-$(date +%Y%m%d)
 cp -r data data.bk-$(date +%Y%m%d)
+cp nginx/ipfs-gate.conf nginx/ipfs-gate.conf.bk-$(date +%Y%m%d)
 
-# Pull latest code
+# 2. Pull latest code (this WILL clobber .env and nginx/ipfs-gate.conf if you've edited them)
 git fetch --all && git reset --hard origin/main
 
-# If git reset removed your edited files, restore them:
+# 3. Restore your operator-specific files
 cp .env.bk-$(date +%Y%m%d) .env
-# nginx/ipfs-gate.conf may also need to be re-edited for your domain.
+cp nginx/ipfs-gate.conf.bk-$(date +%Y%m%d) nginx/ipfs-gate.conf
 
-# Rebuild and restart
+# 4. Re-apply data ownership (in case new directories appeared)
+chown -R 1000:1000 data/
+
+# 5. Rebuild and restart (env-change or code-change BOTH need down/up, not restart)
 docker compose down
 docker compose build --no-cache
 docker compose up -d
 
-# Watch logs to confirm clean start
+# 6. Watch logs to confirm clean start
 docker compose logs -f ipfs-gate
 </pre>
 
-'''Always back up <code>.env</code> and the <code>data/</code> directory before any update.''' A hard reset will wipe your config edits.
+'''Always back up <code>.env</code>, <code>nginx/ipfs-gate.conf</code>, and the <code>data/</code> directory before any update.''' A <code>git reset --hard</code> will wipe any operator-edited files in the repo.
 
 == Admin tasks ==
 
@@ -293,14 +347,14 @@ ipfs-gate is currently standalone. Each operator runs their own server with thei
 #:* <code>EACCES: permission denied, mkdir '/app/data'</code>
 #:* <code>SqliteError: unable to open database file</code> with <code>code: 'SQLITE_CANTOPEN'</code>
 #:* Container in restart loop with errors mentioning <code>/app/data/ipfs-gate.db</code>
-#: '''A:''' Same root cause: the container runs as UID 1000 (node user), but if you ran <code>docker compose up</code> as root (e.g. on a fresh VPS as root), Docker created the host <code>./data/</code> directories owned by root. The container can't write there. Fix:
-#:<pre>sudo chown -R 1000:1000 ./data/
-docker compose restart ipfs-gate
+#: '''A:''' Same root cause: the container runs as UID 1000 (node user), but if you ran <code>docker compose up</code> as root, Docker created the host <code>./data/</code> directories owned by root. The container can't write there. Fix:
+#:<pre>chown -R 1000:1000 ./data/
+docker compose down && docker compose up -d
 docker compose logs ipfs-gate | tail -20</pre>
-#: Confirmed during the v0.1 first-VPS test (2026-05-24). The Dockerfile correctly <code>chown</code>s <code>/app/data</code> at build, but the host volume mount overlays that with the host's ownership, which wins.
+#: Confirmed during the v0.1 first-VPS test (2026-05-24). The Dockerfile correctly <code>chown</code>s <code>/app/data</code> at build, but the host volume mount overlays that with the host's ownership, which wins. Step 2 of this walkthrough does the chown proactively to avoid hitting this.
 # '''Q:''' Boot logs say <code>FATAL: IPFS_GATE_HIVE_ACCOUNT not set. Refusing to start.</code>
-#: '''A:''' Your <code>.env</code> is missing or doesn't have <code>IPFS_GATE_HIVE_ACCOUNT</code>. Copy <code>.env.example</code> to <code>.env</code> and fill in the values.
-# '''Q:''' I changed something in <code>.env</code> and ran <code>docker compose restart ipfs-gate</code>, but the change didn't take effect (e.g. the logs still show the old BIND_HOST or old TTL).
+#: '''A:''' Your <code>.env</code> is missing or doesn't have <code>IPFS_GATE_HIVE_ACCOUNT</code>. Copy <code>.env.example</code> to <code>.env</code> and fill in the values (Step 3).
+# '''Q:''' I changed something in <code>.env</code> and ran <code>docker compose restart ipfs-gate</code>, but the change didn't take effect (e.g. logs still show the old BIND_HOST or old TTL).
 #: '''A:''' <code>docker compose restart</code> reuses the existing container (and the env vars baked in at create-time). To pick up <code>.env</code> changes you must recreate the container:
 #:<pre># Either down + up (clean, also recreates the network):
 docker compose down && docker compose up -d
@@ -311,19 +365,17 @@ docker compose up -d --force-recreate ipfs-gate</pre>
 # '''Q:''' My response JSON shows <code>"ttl_days":0</code> even though I set <code>DEFAULT_TTL_DAYS=0.001</code> for testing fast sweeper expiry. Or pins expire immediately.
 #: '''A:''' Pre-v0.1.1 code used <code>parseInt</code> which truncated <code>0.001</code> to <code>0</code>. Fixed in v0.1.1: now uses <code>parseFloat</code>, so fractional days work. If you're on an old binary, <code>git pull</code> + rebuild. Reference: <code>0.001 day ≈ 1.44 minutes</code> — handy for testing the sweeper.
 # '''Q:''' Nginx returns <code>502 Bad Gateway</code> when I curl my domain. The ipfs-gate container is running fine and logs show it's listening.
-#: '''A:''' Your <code>.env</code> has <code>BIND_HOST=127.0.0.1</code>. That binds ipfs-gate to the container's loopback only, which is unreachable from the nginx container. For Docker deployment, set <code>BIND_HOST=0.0.0.0</code>. The container is still isolated by the docker network — only nginx can reach it from inside the stack; the public only sees ports 80/443 on nginx. Confirmed during the v0.1 first-VPS test (2026-05-24). The shipped <code>.env.example</code> now defaults to <code>0.0.0.0</code>, and <code>server.js</code> defaults to <code>0.0.0.0</code> when the env var is absent — but pre-existing <code>.env</code> files from earlier installs still need the manual edit.
-#:<pre>nano .env  # change BIND_HOST=127.0.0.1 to BIND_HOST=0.0.0.0
-docker compose restart ipfs-gate
-docker compose logs ipfs-gate | grep listening
-# Should show: listening on 0.0.0.0:3001</pre>
-# '''Q:''' Uploads succeed but recipients see "file not found" when fetching.
-#: '''A:''' Check <code>KUBO_DHT_MODE</code> in your <code>.env</code>. If set to <code>none</code> (the v0.1 default), only your own ipfs-gate's gateway serves the file. Other public IPFS gateways won't know about it. This is intentional for privacy; switch to <code>client</code> if you want public-IPFS-network availability.
+#: '''A:''' Your <code>.env</code> has <code>BIND_HOST=127.0.0.1</code>. That binds ipfs-gate to the container's loopback only, which is unreachable from the nginx container. For Docker deployment, set <code>BIND_HOST=0.0.0.0</code>. The container is still isolated by the docker network — only nginx can reach it from inside the stack; the public only sees ports 80/443 on nginx. The shipped <code>.env.example</code> defaults to <code>0.0.0.0</code> — but pre-existing <code>.env</code> files from earlier installs still need the manual edit, then a full <code>docker compose down && up -d</code> (Common Problems #4).
+# '''Q:''' Uploads succeed but recipients see "file not found" when fetching from a public IPFS gateway (e.g. ipfs.io).
+#: '''A:''' Check <code>KUBO_DHT_MODE</code> in your <code>.env</code>. If set to <code>none</code> (the v0.1 default), only your own ipfs-gate's gateway serves the file. Other public IPFS gateways won't know about it. This is intentional for privacy; switch to <code>client</code> if you want public-IPFS-network availability. Recipients fetching via <code>https://ipfs.your-domain.com/ipfs/&lt;cid&gt;</code> always work regardless of this setting.
 # '''Q:''' Payment verification fails with <code>memo mismatch</code>.
 #: '''A:''' The browser must send the exact memo string returned by <code>/reserve</code>. Format is <code>ipfs-gate:upload:&lt;16-hex-id&gt;</code>. If the client edited it, this will fail. The reservation_id in the memo also must match the URL parameter.
 # '''Q:''' Server logs say <code>kubo backend status: unreachable (fetch failed)</code>.
 #: '''A:''' Kubo container isn't healthy yet, or the <code>KUBO_API_URL</code> in <code>.env</code> doesn't match the docker-compose service name. Default is <code>http://kubo:5001</code>; only change if you renamed the kubo service.
 # '''Q:''' The cert renewal cron fires but nginx still serves the old cert.
-#: '''A:''' Certbot writes new files but nginx doesn't auto-reload. The cron line above includes <code>docker compose restart nginx</code> after renew — make sure you copied that part too.
+#: '''A:''' Certbot writes new files but nginx doesn't auto-reload. The cron line in Step 8 includes <code>docker compose restart nginx</code> after renew — make sure you copied that part too.
+# '''Q:''' Let's Encrypt certbot fails with "DNS problem" or "No A/AAAA record for host".
+#: '''A:''' Your domain's A record isn't pointing at this VPS, or DNS hasn't propagated yet. Verify with <code>dig ipfs.your-domain.com</code> from any machine. If it returns the wrong IP, fix at your DNS provider and wait 5-10 minutes for propagation, then retry the certbot command from Step 5.
 
 == Resources ==
 

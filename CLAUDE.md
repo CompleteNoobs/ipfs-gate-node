@@ -1,8 +1,12 @@
 # CLAUDE.md — ipfs-gate Project Context
 
-> **⚠️ Pre-v0.1. Code not yet written.** This file captures planning + architecture decisions made during the design phase so future Claude sessions (and humans) can pick up the project with full context. Source of truth for design history: `/home/noob/.claude/plans/question-i-have-you-groovy-hickey.md`.
+> **Status: v0.1 first build is live.** Working software deployed to production VPS (Ubuntu 24.04). Code complete; the actual next milestone is **v4call client integration** (the sender modal + recipient bubble in v4call's `public/index.html`), NOT another ipfs-gate version. See `roadmap_status.md`.
+
+> **Brainstorm scratchpad** (full design history with every decision's reasoning): `/home/noob/.claude/plans/question-i-have-you-groovy-hickey.md`. Read this if you need to understand WHY a v0.1 decision was made — locked decisions are mirrored here in CLAUDE.md but the rationale lives in the plan file.
 
 > **⚠️ Sister project of v4call.** The user is the same person, the design philosophy is the same, and many decisions reuse patterns from v4call (`/home/noob/CAI/v4call/`). When in doubt about a pattern, check v4call's `CLAUDE.md` and `server.js` first.
+
+> **⚠️ Docs convention.** WalkThrough.wiki is load-bearing, not optional polish. When a bug is found and fixed during deployment, fold the symptom-first entry into the wiki's "Common problems" section, ordered by first-boot likelihood. The user is a tinkerer who values reproducible recipes over re-deriving things months later. This convention is shared across v4call, nGate, and ipfs-gate.
 
 ## What This Is
 
@@ -268,20 +272,30 @@ PAYMENT_VERIFY_DELAY_MS=3000
 SIDECHAIN_CONFIRM_DELAY_MS=5000
 ```
 
-## Known Gotchas (inherited from v4call learnings)
+## Known Gotchas
+
+### Discovered during ipfs-gate v0.1 first-VPS deployment (2026-05-24)
+
+All also documented in `WalkThrough.wiki` Common Problems with operator-facing fix commands. Listed here for AI-session context.
+
+- **`SQLITE_CANTOPEN` on first boot** = host `data/` dirs owned by root, container is UID 1000. Pre-create dirs + `chown -R 1000:1000 data/` BEFORE first `docker compose up`. Wiki Step 2 does this proactively now. Symptoms can also surface as `EACCES: permission denied, mkdir '/app/data'` or container in restart loop.
+- **`BIND_HOST=127.0.0.1` breaks Docker deployment** = ipfs-gate binds to container loopback only; nginx (in a different container) returns 502 Bad Gateway. Default in both `.env.example` and `server.js` is now `0.0.0.0`. Pre-existing `.env` files from earlier installs still need the manual edit.
+- **`docker compose restart` does NOT reload `.env` changes** = env vars are baked into the container at create-time. Must `docker compose down && up -d` (or `up -d --force-recreate <service>`) for env-only changes. Parallel to v4call's "down before rebuild" gotcha but a different trigger.
+- **`parseInt` truncates fractional days to 0** = pre-v0.1.1 code used `parseInt(DEFAULT_TTL_DAYS)`. Setting `0.001` for testing fast sweeper expiry gave `0` and pins expired immediately. Fixed in v0.1.1 (now `parseFloat`). Test reference: `0.001 day ≈ 1.44 min`.
+
+### Inherited from v4call
 
 - **Hive-Engine `transferHistory` API is broken.** Don't use it. Verify token transfers via balance check on the recipient account combined with tx_id lookup on Hive itself. See v4call CLAUDE.md for the original lesson.
 - **Hive-Engine API URL is `/rpc/contracts` not `/contracts`.** The latter returns HTML.
 - **`condenser_api.get_discussions_by_created` caps `limit` at 20.** Higher values silently fail with `Assert Exception`. Same applies to other discussion queries.
 - **`docker compose down` before rebuilding.** Without this, Docker reuses old containers even after `--no-cache`.
-- **SQLite permission errors at first boot.** App runs as UID 1000 in container; `chown -R 1000:1000 ./data/` on host if needed.
 - **Certbot needs `--entrypoint certbot` flag.** Otherwise it runs the renewal loop instead of `certonly`.
 - **Nginx cert crash loop.** Don't add HTTPS config before cert exists. Start HTTP-only, get cert, then add HTTPS.
-- **Browser cache hides client fixes.** After a rebuild, mobile Safari/Brave can serve old `index.html` for hours. Clear site data on test devices.
-- **iOS Hive Keychain doesn't inject `window.hive_keychain`.** WebKit blocks the extension. Paid actions on iPhone fail; same problem v4call already has. HiveSigner web flow is the workaround.
+- **iOS Hive Keychain doesn't inject `window.hive_keychain`.** WebKit blocks the extension. Paid actions on iPhone fail; same problem v4call already has. HiveSigner web flow is the workaround. Will surface in v4call client integration of ipfs-gate uploads.
 - **`BEGIN` vs `BEGIN IMMEDIATE` in SQLite transactions.** Use IMMEDIATE for any transaction that will write — deferred can deadlock on upgrade.
-- **`element.style.display = ''` does NOT override CSS `display:none`.** Use a `.shown` class with `#id.shown { display: ... }` selector instead. v4call learned this the painful way (v0.11 to v0.14.5).
+- **`element.style.display = ''` does NOT override CSS `display:none`.** Use a `.shown` class with `#id.shown { display: ... }` selector instead. v4call learned this the painful way (v0.11 to v0.14.5). Relevant to v4call client integration UI work.
 - **CHECK constraints reject typo'd enum values at INSERT time** — catches bugs early. Use them on every status column.
+- **Browser cache hides client fixes.** After a rebuild, mobile Safari/Brave can serve old `index.html` for hours. Clear site data on test devices.
 
 ## Coding Style
 

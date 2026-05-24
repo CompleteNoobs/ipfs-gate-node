@@ -1,24 +1,67 @@
 # ipfs-gate — Roadmap & Status
 
-> Updated 2026-05-23. Source of truth: this file + [CLAUDE.md](CLAUDE.md).
+> Updated 2026-05-24. Source of truth: this file + [CLAUDE.md](CLAUDE.md).
 > Full design history + reasoning lives in the brainstorm scratchpad at
 > `/home/noob/.claude/plans/question-i-have-you-groovy-hickey.md`.
 
 ## Current status
 
-**Pre-v0.1 — planning complete, code not yet written.**
+**v0.1 first build is live.** Code complete, deployed and HTTPS-verified on an Ubuntu 24.04 VPS at `ipfs.completenoobs.com` (2026-05-24).
 
-All five pre-build blockers cleared:
+| # | Pre-build blocker | Status |
+|---|---|---|
+| B1 | Repo layout | ✅ Locked + repo created |
+| B2 | Database schema | ✅ Locked + migration applies on boot |
+| B3 | API endpoint contracts | ✅ Locked + 14 endpoints implemented |
+| B4 | Reservation token format | ✅ Locked + working |
+| B5 | Hive payment verification | ✅ Locked + Option C implemented |
 
-| # | Blocker | Status | Where decided |
-|---|---|---|---|
-| B1 | Repo layout | ✅ Locked | `~/CAI/IPFS-Gate` → `github.com/completenoobs/ipfs-gate` |
-| B2 | Database schema | ✅ Locked | 7 tables, indexes, hot-path queries; see CLAUDE.md |
-| B3 | API endpoint contracts | ✅ Locked | 14 endpoints with full request/response shapes; see CLAUDE.md |
-| B4 | Reservation token format | ✅ Locked | 16-hex random + DB lookup, 5-min TTL |
-| B5 | Hive payment verification | ✅ Locked | Option C: tx_id lookup + balance-check belt-and-braces |
+### v0.1 build deltas vs design
 
-**Next step**: `git init`, write code.
+Four deployment bugs found + fixed during first VPS deploy (all folded into `WalkThrough.wiki` Common Problems):
+1. `SQLITE_CANTOPEN` from host data/ ownership — wiki Step 2 now pre-chowns
+2. `BIND_HOST=127.0.0.1` blocking nginx → 502 — default flipped to `0.0.0.0`
+3. `docker compose restart` doesn't reload `.env` — wiki now says use `down && up -d`
+4. `parseInt(DEFAULT_TTL_DAYS)` truncated `0.001` to `0` — now `parseFloat`
+
+## 🎯 NEXT MILESTONE — v4call client integration
+
+**This is the actual next work**, not another ipfs-gate version. Lives in the v4call repo, not here.
+
+### Scope
+Add the sender + recipient UX in `~/CAI/v4call/public/index.html`:
+
+**Sender side (in a v4call room):**
+- 📎 button in room chat header → opens upload modal
+- File picker (jpeg only for v0.1)
+- Recipient checkbox list of current room members (sender auto-included)
+- ipfs-gate URL picker with default + alternatives + custom-entry option
+- Cost preview ("≈ 1 CNOOBS for 7 days")
+- "🔒 Encrypt & Upload" button + optional "⚠ Upload Unencrypted (public)" with confirmation gate
+- Browser-side: AES-GCM encryption + per-recipient hivecrypt envelopes → POST `/reserve` → Hive Keychain `requestCustomJson` for CNOOBS transfer → POST `/upload`
+- On success: emit `room-attachment` socket event to v4call server
+
+**Recipient side (in a v4call room):**
+- `room-attachment` socket event handler in `public/index.html`
+- Inline chat bubble: sender + sig ✓ + size + expiry countdown
+- Auto-fetch ciphertext from `gateway_hint` + decrypt with own posting key
+- Render image thumbnail inline (jpeg only for v0.1)
+- Save-to-device button (Blob URL + anchor download)
+- Bystander view (locked bubble for room members not in per_recipient list)
+- Error states: bad sig / decryption fail / 404 from gateway / TTL expired
+
+**Server side (v4call):**
+- ~30 lines: route `room-attachment` events to room members (inherits existing room broadcast infrastructure)
+
+### Reference docs for the integration
+- `~/CAI/IPFS-Gate/CLAUDE.md` — wire format spec (inner blob + outer envelope), API endpoint shapes, signature canonical messages
+- `/home/noob/.claude/plans/question-i-have-you-groovy-hickey.md` — full design rationale for the recipient UX, the two-signature scheme, the dedup model, etc. Recipient UX section has the chat-bubble mockups.
+- `~/CAI/IPFS-Gate/envelope.js` — canonical-message helpers ready to be ported to browser JS for client-side use (`buildUploadProofMessage`, `buildEnvelopeSigInput`, etc.)
+
+### Estimated scope
+- ~200 lines client (HTML + CSS + sender modal + recipient bubble + handlers)
+- ~30 lines server (envelope routing — mostly inherits existing room broadcast pattern)
+- One focused session
 
 ## v0.1 — scope
 
@@ -62,16 +105,18 @@ All five pre-build blockers cleared:
 - Multi-admin attribution
 - Auto-refund of wrong-currency or wrong-amount payments (operator review)
 
-## Pre-build nice-to-haves (not blocking, can be done during build)
+## v0.1.x follow-ups (after v4call integration starts surfacing real usage)
 
-| Item | Notes |
+These are nice-to-haves that didn't block v0.1 but are worth doing once there's real traffic:
+
+| Item | Trigger |
 |---|---|
-| Recipient-side error/edge cases in deeper detail | Sketched in CLAUDE.md, can refine during build |
-| Reservation token cleanup fine details (partial Kubo pin cleanup, etc.) | Edge case handling during sweeper development |
-| Kubo Docker config tuning | Storage limits, swarm peers, GC policy |
-| v4call sender modal UI sketch | HTML/CSS for the upload picker — done v4call-side |
-| Testing strategy | Manual smoke test minimum for v0.1; automated test suite v0.2+ |
-| Operator first-boot flow | Helper install script vs docs-only |
+| `sendRefund` actual broadcast wiring | First real disconnect-mid-upload event in production |
+| Recipient-side error/edge cases in deeper detail | First bug report from a v4call user |
+| Reservation token cleanup fine details (partial Kubo pin cleanup, etc.) | Audit during first sweeper-run analysis |
+| Kubo Docker config tuning | When disk usage gets close to limit |
+| Testing strategy | Probably after v0.2 multi-currency lands |
+| Operator first-boot flow | When the second operator wants to deploy |
 
 ## v0.2+ futures (sketched, not committed)
 
@@ -123,22 +168,34 @@ These came up during brainstorm sessions and don't fit cleanly into a single ver
 | v4call | Hive payment verifier, hivePost helper, hardened Hive-node fallback list, SQLite pattern (better-sqlite3), Express/Docker/Nginx deployment pattern | Encrypted file transport for room messages |
 | nGate | Identity-gated policy plugin pattern, per-server keypair model, Stage 4 architectural learnings | Discovery-loop pattern reuse for paid private relay onboarding |
 
-## Pre-flight checklist (before `git init`)
+## v0.1 build checklist (all complete)
 
 - [x] Repo path decided (`~/CAI/IPFS-Gate`)
-- [x] GitHub destination decided (`github.com/completenoobs/ipfs-gate`)
+- [x] GitHub destination created (`github.com/CompleteNoobs/IPFS-Gate`)
 - [x] License decided (MIT)
-- [x] Database schema spec written
-- [x] API contracts spec written
-- [x] Hive payment verification recipe written
-- [x] Reservation token format decided
-- [x] Wire format (envelope + inner blob) decided
-- [x] Recipient UX decided
-- [x] Deployment topology decided (separate box)
-- [x] Moderation primitives spec'd
-- [x] README.md, roadmap_status.md, CLAUDE.md scaffolded
-- [ ] `git init` + initial commit
-- [ ] `package.json` + `npm init`
-- [ ] Project skeleton (server.js, backends/kubo.js, quota.js, hive-verify.js, sweeper.js, moderation.js)
-- [ ] First passing test (Hive payment verify against a real test tx)
-- [ ] First successful encrypt → upload → pin → fetch → decrypt round-trip on localhost
+- [x] Database schema spec written + migration applies on boot
+- [x] API contracts spec written + all 14 endpoints implemented
+- [x] Hive payment verification implemented (Option C)
+- [x] Reservation token format implemented (16-hex random + DB lookup)
+- [x] Wire format (envelope + inner blob + 2 sigs) implemented in `envelope.js`
+- [x] Moderation primitives implemented (ban/takedown/unban/audit/refund-policy)
+- [x] Deployment topology decided + delivered (separate VPS, dedicated Hive account, Kubo + nginx + Docker)
+- [x] README.md, roadmap_status.md, CLAUDE.md
+- [x] WalkThrough.wiki (operator-facing, Ubuntu 24.04 reference)
+- [x] `git init` + initial commit (local; user pushes)
+- [x] `package.json` + dependencies
+- [x] Full project skeleton (server.js, backends/kubo.js, quota.js, hive-verify.js, envelope.js, moderation.js, sweeper.js)
+- [x] Local smoke test (modules load, server boots, all endpoints respond, ban/unban cascade works)
+- [x] First VPS deployment HTTPS-verified at `https://ipfs.completenoobs.com/`
+- [x] Four real-deploy bugs found + fixed + folded into wiki
+
+## v4call integration checklist (next milestone)
+
+- [ ] Read `~/CAI/v4call/public/index.html` to scope the file-picker button location and existing room-message rendering patterns
+- [ ] Browser-side: AES-GCM encryption helper + per-recipient hivecrypt envelopes
+- [ ] Sender modal HTML/CSS + file picker + recipient checkbox + ipfs-gate URL picker
+- [ ] `/reserve` → Keychain `requestCustomJson` → `/upload` flow in browser
+- [ ] `room-attachment` socket event handler (sender emit + recipient receive)
+- [ ] Recipient bubble: thumbnail render + save-to-device + bystander variant
+- [ ] Server-side: route the `room-attachment` event through existing room broadcast
+- [ ] End-to-end test: guest33 → noblemage real jpeg in a v4call room
