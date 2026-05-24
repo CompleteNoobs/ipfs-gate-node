@@ -1,0 +1,59 @@
+# ipfs-gate v0.1 — docker-compose.
+# Three services: kubo (IPFS daemon), ipfs-gate (this app), nginx (HTTPS + reverse proxy).
+# certbot is separate (run on-demand for cert issuance/renewal).
+
+services:
+  kubo:
+    image: ipfs/kubo:latest
+    container_name: ipfs-gate-kubo
+    restart: unless-stopped
+    volumes:
+      - ./data/kubo:/data/ipfs
+    environment:
+      # 'server' profile = no LAN discovery, suitable for VPS deployment
+      IPFS_PROFILE: server
+    # No external port mappings — only ipfs-gate talks to it via internal network.
+    networks:
+      - internal
+    healthcheck:
+      test: ["CMD", "ipfs", "id"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  ipfs-gate:
+    build: .
+    container_name: ipfs-gate
+    restart: unless-stopped
+    env_file: ./.env
+    volumes:
+      - ./data/ipfs-gate:/app/data
+    depends_on:
+      kubo:
+        condition: service_healthy
+    networks:
+      - internal
+    # No external port mapping — nginx in front handles public traffic.
+    expose:
+      - "3001"
+
+  nginx:
+    image: nginx:alpine
+    container_name: ipfs-gate-nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/ipfs-gate.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./data/letsencrypt:/etc/letsencrypt:ro
+      - ./data/letsencrypt-webroot:/var/www/certbot:ro
+    depends_on:
+      - ipfs-gate
+    networks:
+      - internal
+
+networks:
+  internal:
+    driver: bridge
