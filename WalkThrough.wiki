@@ -51,6 +51,8 @@ docker compose version
 git clone https://github.com/CompleteNoobs/IPFS-Gate.git
 cd IPFS-Gate
 </pre>
+* maybe needed - run in dir IPFS-Gate/
+<code>chown -R 1000:1000 ./data/</code>
 
 == Step 3: Configure .env ==
 
@@ -287,10 +289,33 @@ ipfs-gate is currently standalone. Each operator runs their own server with thei
 
 # '''Q:''' I ran <code>docker compose up</code> and Kubo doesn't respond for the first ~30 seconds. Is it broken?
 #: '''A:''' No. Kubo does a one-time identity generation on first boot. Takes 10–30s on a small VPS. Watch <code>docker compose logs kubo</code> to see when it's ready. The healthcheck in docker-compose.yml gates ipfs-gate startup on Kubo being healthy.
-# '''Q:''' My ipfs-gate container won't start: <code>EACCES: permission denied, mkdir '/app/data'</code> or similar SQLite errors.
-#: '''A:''' The container runs as UID 1000. The host's <code>data/</code> directory needs the right ownership: <code>sudo chown -R 1000:1000 ./data/</code>
+# '''Q:''' My ipfs-gate container won't start. I see one of:
+#:* <code>EACCES: permission denied, mkdir '/app/data'</code>
+#:* <code>SqliteError: unable to open database file</code> with <code>code: 'SQLITE_CANTOPEN'</code>
+#:* Container in restart loop with errors mentioning <code>/app/data/ipfs-gate.db</code>
+#: '''A:''' Same root cause: the container runs as UID 1000 (node user), but if you ran <code>docker compose up</code> as root (e.g. on a fresh VPS as root), Docker created the host <code>./data/</code> directories owned by root. The container can't write there. Fix:
+#:<pre>sudo chown -R 1000:1000 ./data/
+docker compose restart ipfs-gate
+docker compose logs ipfs-gate | tail -20</pre>
+#: Confirmed during the v0.1 first-VPS test (2026-05-24). The Dockerfile correctly <code>chown</code>s <code>/app/data</code> at build, but the host volume mount overlays that with the host's ownership, which wins.
 # '''Q:''' Boot logs say <code>FATAL: IPFS_GATE_HIVE_ACCOUNT not set. Refusing to start.</code>
 #: '''A:''' Your <code>.env</code> is missing or doesn't have <code>IPFS_GATE_HIVE_ACCOUNT</code>. Copy <code>.env.example</code> to <code>.env</code> and fill in the values.
+# '''Q:''' I changed something in <code>.env</code> and ran <code>docker compose restart ipfs-gate</code>, but the change didn't take effect (e.g. the logs still show the old BIND_HOST or old TTL).
+#: '''A:''' <code>docker compose restart</code> reuses the existing container (and the env vars baked in at create-time). To pick up <code>.env</code> changes you must recreate the container:
+#:<pre># Either down + up (clean, also recreates the network):
+docker compose down && docker compose up -d
+
+# Or force-recreate just one service:
+docker compose up -d --force-recreate ipfs-gate</pre>
+#: This is parallel to v4call's "<code>docker compose down</code> required before rebuilding" gotcha — different cause (env change vs code change) but same surprise. Confirmed during v0.1 first-VPS test (2026-05-24).
+# '''Q:''' My response JSON shows <code>"ttl_days":0</code> even though I set <code>DEFAULT_TTL_DAYS=0.001</code> for testing fast sweeper expiry. Or pins expire immediately.
+#: '''A:''' Pre-v0.1.1 code used <code>parseInt</code> which truncated <code>0.001</code> to <code>0</code>. Fixed in v0.1.1: now uses <code>parseFloat</code>, so fractional days work. If you're on an old binary, <code>git pull</code> + rebuild. Reference: <code>0.001 day ≈ 1.44 minutes</code> — handy for testing the sweeper.
+# '''Q:''' Nginx returns <code>502 Bad Gateway</code> when I curl my domain. The ipfs-gate container is running fine and logs show it's listening.
+#: '''A:''' Your <code>.env</code> has <code>BIND_HOST=127.0.0.1</code>. That binds ipfs-gate to the container's loopback only, which is unreachable from the nginx container. For Docker deployment, set <code>BIND_HOST=0.0.0.0</code>. The container is still isolated by the docker network — only nginx can reach it from inside the stack; the public only sees ports 80/443 on nginx. Confirmed during the v0.1 first-VPS test (2026-05-24). The shipped <code>.env.example</code> now defaults to <code>0.0.0.0</code>, and <code>server.js</code> defaults to <code>0.0.0.0</code> when the env var is absent — but pre-existing <code>.env</code> files from earlier installs still need the manual edit.
+#:<pre>nano .env  # change BIND_HOST=127.0.0.1 to BIND_HOST=0.0.0.0
+docker compose restart ipfs-gate
+docker compose logs ipfs-gate | grep listening
+# Should show: listening on 0.0.0.0:3001</pre>
 # '''Q:''' Uploads succeed but recipients see "file not found" when fetching.
 #: '''A:''' Check <code>KUBO_DHT_MODE</code> in your <code>.env</code>. If set to <code>none</code> (the v0.1 default), only your own ipfs-gate's gateway serves the file. Other public IPFS gateways won't know about it. This is intentional for privacy; switch to <code>client</code> if you want public-IPFS-network availability.
 # '''Q:''' Payment verification fails with <code>memo mismatch</code>.

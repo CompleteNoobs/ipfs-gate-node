@@ -20,13 +20,16 @@ const kubo = require('./backends/kubo');
 // ─── Config ─────────────────────────────────────────────────────────────────
 
 const PORT = parseInt(process.env.PORT || '3001', 10);
-const BIND_HOST = process.env.BIND_HOST || '127.0.0.1';
+// Default 0.0.0.0 — ipfs-gate is meant to live behind nginx in a docker network.
+// Override to 127.0.0.1 only when running outside Docker (local dev on a laptop).
+const BIND_HOST = process.env.BIND_HOST || '0.0.0.0';
 const CORS_ORIGIN = process.env.CORS_ORIGIN || '*';
 const ADMIN_KEY = process.env.ADMIN_KEY || '';
 const PAYMENT_CURRENCY = process.env.PAYMENT_CURRENCY || 'CNOOBS';
 const PAYMENT_AMOUNT = process.env.PAYMENT_AMOUNT || '1';
 const IPFS_GATE_HIVE_ACCOUNT = (process.env.IPFS_GATE_HIVE_ACCOUNT || '').toLowerCase();
-const DEFAULT_TTL_DAYS = parseInt(process.env.DEFAULT_TTL_DAYS || '7', 10);
+// parseFloat allows fractional days for testing (e.g. 0.001 ≈ 86s)
+const DEFAULT_TTL_DAYS = parseFloat(process.env.DEFAULT_TTL_DAYS || '7');
 const MAX_FILE_SIZE_MB = parseInt(process.env.MAX_FILE_SIZE_MB || '10', 10);
 const MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024;
 const RATE_LIMIT_RESERVE = parseInt(process.env.RATE_LIMIT_RESERVE_PER_MIN || '30', 10);
