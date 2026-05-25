@@ -137,7 +137,7 @@ app.get('/', (req, res) => {
 /**
  * POST /reserve
  * Body: { uploader, size_bytes }
- * Returns: { reservation_id, expires_at, payment: { currency, amount, escrow_account, memo }, max_size_bytes }
+ * Returns: { reservation_id, expires_at, payment: { currency, amount, escrow_account, memo, ttl_days }, max_size_bytes }
  */
 app.post('/reserve', reserveLimiter, (req, res) => {
   try {
@@ -155,7 +155,8 @@ app.post('/reserve', reserveLimiter, (req, res) => {
         currency: PAYMENT_CURRENCY,
         amount: String(PAYMENT_AMOUNT),
         escrow_account: IPFS_GATE_HIVE_ACCOUNT,
-        memo: quota.getMemoForReservation(r.id)
+        memo: quota.getMemoForReservation(r.id),
+        ttl_days: DEFAULT_TTL_DAYS
       },
       max_size_bytes: quota.MAX_FILE_SIZE_BYTES
     });
