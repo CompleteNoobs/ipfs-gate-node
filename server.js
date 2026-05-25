@@ -241,21 +241,37 @@ app.post('/upload', uploadLimiter, upload.single('ciphertext'), async (req, res)
       return handleError(res, e, 'unprocessable_entity');
     }
 
-    // Optional sidechain confirmation. We don't fail the upload if the balance
-    // check hasn't caught up — but we record paid_unconfirmed so operator can review.
+    // Sidechain confirmation — HARD reject. v0.1.2 (and earlier) used a balance
+    // comparison which was useless: the escrow's existing balance always exceeded
+    // the per-payment amount, so an under-balanced sender whose transfer was
+    // rejected by the Hive-Engine sidechain still passed the check, and the file
+    // got pinned for free. v0.1.3 polls getTransactionInfo on the Hive-Engine
+    // blockchain RPC for an authoritative success/fail signal.
     let paymentStatus = 'confirmed';
+    let sidechainResult;
     try {
-      const balance = await hive.getHiveEngineBalance(IPFS_GATE_HIVE_ACCOUNT, PAYMENT_CURRENCY);
-      payResult.balance_after = balance;
-      // If balance is suspiciously low (e.g. < the single payment), flag for review.
-      // For v0.1, this is a soft signal; we don't reject the upload.
-      if (balance < payResult.paid) {
-        paymentStatus = 'paid_unconfirmed';
-        console.warn(`[server] sidechain balance check below threshold for tx ${tx_id}: balance=${balance} paid=${payResult.paid}`);
-      }
+      sidechainResult = await hive.verifyHiveEngineSidechain(tx_id);
     } catch (e) {
-      console.warn(`[server] sidechain balance check failed: ${e.message}`);
-      paymentStatus = 'paid_unconfirmed';
+      console.error(`[server] sidechain RPC failed for ${tx_id}: ${e.message}`);
+      quota.markReservationCancelled(reservation_id);
+      return respondError(res, 'unprocessable_entity', `Hive-Engine sidechain unreachable: ${e.message}`);
+    }
+    if (sidechainResult.confirmed === false) {
+      quota.markReservationCancelled(reservation_id);
+      if (sidechainResult.reason === 'rejected') {
+        const detail = (sidechainResult.errors || []).join('; ') || 'sidechain rejected the transfer';
+        console.warn(`[server] sidechain rejected tx ${tx_id}: ${detail}`);
+        return respondError(res, 'unprocessable_entity', `Hive-Engine rejected the transfer: ${detail}`);
+      }
+      // 'pending' — exhausted retries; safer to reject than to pin a phantom payment
+      console.warn(`[server] sidechain still pending for tx ${tx_id} after retries`);
+      return respondError(res, 'unprocessable_entity', 'Hive-Engine sidechain did not confirm the transfer within the retry budget. Try uploading again in ~30s.');
+    }
+    // Belt-and-braces: also record balance for the audit log
+    try {
+      payResult.balance_after = await hive.getHiveEngineBalance(IPFS_GATE_HIVE_ACCOUNT, PAYMENT_CURRENCY);
+    } catch (e) {
+      console.warn(`[server] post-confirm balance read failed: ${e.message}`);
     }
 
     // 6. Record payment + mark reservation paid (atomic)
