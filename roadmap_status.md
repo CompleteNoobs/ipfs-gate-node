@@ -1,12 +1,19 @@
 # ipfs-gate — Roadmap & Status
 
-> Updated 2026-05-24. Source of truth: this file + [CLAUDE.md](CLAUDE.md).
+> Updated 2026-05-26. Source of truth: this file + [CLAUDE.md](CLAUDE.md).
 > Full design history + reasoning lives in the brainstorm scratchpad at
 > `/home/noob/.claude/plans/question-i-have-you-groovy-hickey.md`.
 
 ## Current status
 
-**v0.1 first build is live.** Code complete, deployed and HTTPS-verified on an Ubuntu 24.04 VPS at `ipfs.completenoobs.com` (2026-05-24).
+**v0.1.3 in production + v4call client integration complete.** Live at `https://ipfs.completenoobs.com/`. First end-to-end paid encrypted upload landed 2026-05-25. Sub-revisions:
+
+| Version | Date | What |
+|---|---|---|
+| v0.1 | 2026-05-24 | First VPS deploy, all 14 endpoints, sweeper running |
+| v0.1.1 | 2026-05-24 | Fractional TTL via `parseFloat` |
+| v0.1.2 | 2026-05-25 | Removed bogus `payload.from` check; documented `PUBLIC_GATEWAY_BASE`; `/reserve` returns `ttl_days` |
+| v0.1.3 | 2026-05-25 | Hard sidechain confirmation via `getTransactionInfo` (closes under-payment bypass) |
 
 | # | Pre-build blocker | Status |
 |---|---|---|
@@ -14,17 +21,22 @@
 | B2 | Database schema | ✅ Locked + migration applies on boot |
 | B3 | API endpoint contracts | ✅ Locked + 14 endpoints implemented |
 | B4 | Reservation token format | ✅ Locked + working |
-| B5 | Hive payment verification | ✅ Locked + Option C implemented |
+| B5 | Hive payment verification | ✅ v0.1.3 hardened with sidechain check |
 
-### v0.1 build deltas vs design
+### v0.1 → v0.1.3 build deltas vs design
 
-Four deployment bugs found + fixed during first VPS deploy (all folded into `WalkThrough.wiki` Common Problems):
+Seven real-deploy bugs found + fixed (all folded into `WalkThrough.wiki` Common Problems):
 1. `SQLITE_CANTOPEN` from host data/ ownership — wiki Step 2 now pre-chowns
 2. `BIND_HOST=127.0.0.1` blocking nginx → 502 — default flipped to `0.0.0.0`
 3. `docker compose restart` doesn't reload `.env` — wiki now says use `down && up -d`
 4. `parseInt(DEFAULT_TTL_DAYS)` truncated `0.001` to `0` — now `parseFloat`
+5. `payload.from undefined` always-fails check (v0.1.2)
+6. `https://ipfs.localhost` gateway URL with `PUBLIC_GATEWAY_BASE` unset (v0.1.2)
+7. Under-payment "succeeded" because balance check was useless — sidechain confirmation now hard-rejects (v0.1.3)
 
-## 🎯 NEXT MILESTONE — v4call client integration
+Plus two operator gotchas: leftover sweeper-test TTL of `0.001` masquerading as a pin-not-working bug, and `git reset --hard` clobbering operator-edited `nginx/ipfs-gate.conf` (workaround: backup before reset). Both documented.
+
+## 🎯 PREVIOUS MILESTONE (COMPLETE) — v4call client integration
 
 **This is the actual next work**, not another ipfs-gate version. Lives in the v4call repo, not here.
 

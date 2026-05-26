@@ -36,6 +36,10 @@ const RATE_LIMIT_RESERVE = parseInt(process.env.RATE_LIMIT_RESERVE_PER_MIN || '3
 const RATE_LIMIT_UPLOAD = parseInt(process.env.RATE_LIMIT_UPLOAD_PER_MIN || '30', 10);
 const PUBLIC_GATEWAY_BASE = process.env.PUBLIC_GATEWAY_BASE ||
   `https://ipfs.${process.env.SERVER_DOMAIN || 'localhost'}`;
+// v0.1.4 — Cache-Control max-age for /ipfs/:cid responses. Browsers honour
+// this; during dev/testing keep it short (e.g. 3600 = 1h) so pin expiry is
+// observable without incognito tricks. Production default 86400 (1 day).
+const GATEWAY_CACHE_MAX_AGE = parseInt(process.env.GATEWAY_CACHE_MAX_AGE || '86400', 10);
 
 if (!IPFS_GATE_HIVE_ACCOUNT) {
   console.error('FATAL: IPFS_GATE_HIVE_ACCOUNT not set. Refusing to start.');
@@ -386,7 +390,10 @@ app.get('/ipfs/:cid', async (req, res) => {
     }
     const upstream = await kubo.cat(cid);
     res.set('Content-Type', 'application/octet-stream');
-    res.set('Cache-Control', 'public, max-age=86400');
+    // Cache-Control max-age is env-configurable (v0.1.4). Default 86400 (1 day)
+    // for production; recommend 3600 or less during dev/testing so pin expiry
+    // is visible without browser cache lying. Set GATEWAY_CACHE_MAX_AGE in .env.
+    res.set('Cache-Control', `public, max-age=${GATEWAY_CACHE_MAX_AGE}`);
     // Stream the response
     upstream.body.pipeTo(new WritableStream({
       write(chunk) { res.write(Buffer.from(chunk)); },

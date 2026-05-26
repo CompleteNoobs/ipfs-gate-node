@@ -16,8 +16,12 @@ A standalone, Hive-payment-gated IPFS pinning service. Same architectural philos
 
 ## Current Version
 
-- **Software**: pre-v0.1 (planning complete, code not yet written)
+- **Software**: v0.1.3 — production-ready, first-client (v4call) integration complete. Three sub-revisions shipped during the 2026-05-25 first-VPS + first-client testing pass:
+  - **v0.1.1** — `parseInt` → `parseFloat` for `DEFAULT_TTL_DAYS` (sweeper-test setting `0.001` was silently truncating to 0).
+  - **v0.1.2** — Removed the redundant `payload.from` check in `hive-verify.js` that always failed (Hive-Engine's `tokens/transfer` contractPayload has no `from` field — the sender is in the wrapping custom_json's `required_auths`, which `extractTokenTransferOp` already validates). Added `PUBLIC_GATEWAY_BASE` to `.env.example` (was undocumented; defaulted to `https://ipfs.localhost`). Added `ttl_days` to the `/reserve` response so clients can render the actual cost dynamically.
+  - **v0.1.3** — Hard sidechain confirmation. The previous balance-check after `/upload` payment was useless for catching under-balanced senders: escrow's existing balance already exceeded the per-payment amount, so the check passed even when 0 actually landed. Replaced with `verifyHiveEngineSidechain(txId)` that polls `api.hive-engine.com/rpc/blockchain getTransactionInfo` for authoritative success/fail, then HARD-rejects the upload (cancels reservation, no pin) if sidechain rejected. Surfaces the actual sidechain error to the client. Closes the "file pinned for free when under-paid" bypass.
 - **Federation protocol**: N/A (federation deferred to v0.3+)
+- **Production state**: live at `https://ipfs.completenoobs.com/`. First end-to-end paid encrypted upload landed on 2026-05-25 (cnoobz → testin + guest33). All v0.1 surface area exercised against real Hive accounts on real Hive-Engine: payment-required, under-payment rejection, encrypted upload, gateway fetch, expiry, persistence, bystander privacy.
 
 ## What v0.1 ships
 
