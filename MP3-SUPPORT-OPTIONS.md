@@ -3,7 +3,7 @@
 > Research + recommendation only. No code changed. Investigated against
 > ipfs-gate as committed at `3f2a4a8` (v0.1.x). Audience: noob (project
 > owner). Companion to `feature_plans/mp3-room-attachment-briefing.md`
-> on the v4call side.
+> on the v4call side .
 
 ---
 
