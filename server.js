@@ -40,6 +40,16 @@ const PUBLIC_GATEWAY_BASE = process.env.PUBLIC_GATEWAY_BASE ||
 // this; during dev/testing keep it short (e.g. 3600 = 1h) so pin expiry is
 // observable without incognito tricks. Production default 86400 (1 day).
 const GATEWAY_CACHE_MAX_AGE = parseInt(process.env.GATEWAY_CACHE_MAX_AGE || '86400', 10);
+// v0.2 — freshness window for signed user-API requests (replay protection on
+// /uploads/by-user + /uploads/delete). The signed message embeds a unix-second
+// timestamp; requests outside ±SKEW are rejected.
+const SIGNED_REQUEST_MAX_SKEW_SEC = parseInt(process.env.SIGNED_REQUEST_MAX_SKEW_SEC || '300', 10);
+// v0.2 — MIME types we will NOT serve inline on PUBLIC CIDs, even when claimed.
+// These can host active content that would execute on the gate's own origin
+// (stored-XSS). Public uploads of these types are forced to octet-stream +
+// attachment disposition. Encrypted CIDs are always octet-stream regardless.
+const PUBLIC_INLINE_DENY = new Set(['text/html', 'application/xhtml+xml', 'image/svg+xml']);
+const MIME_RE = /^[a-z0-9][a-z0-9.+-]*\/[a-z0-9][a-z0-9.+-]*$/i;
 
 if (!IPFS_GATE_HIVE_ACCOUNT) {
   console.error('FATAL: IPFS_GATE_HIVE_ACCOUNT not set. Refusing to start.');
@@ -102,6 +112,44 @@ function isoFromMs(ms) {
   return ms ? new Date(ms).toISOString() : null;
 }
 
+/**
+ * Verify a signed user-API request (no on-chain payment to anchor identity, so
+ * this is the sole auth gate). Three checks, all must pass:
+ *   1. ts is within ±SIGNED_REQUEST_MAX_SKEW_SEC of now (replay window).
+ *   2. sig is a valid Hive signature over `message` by `pubkey`.
+ *   3. pubkey is a CURRENT posting key of `account` on Hive (binds key→account).
+ * Throws { code:'bad_request'|'unauthorized' } on failure; resolves on success.
+ */
+async function verifySignedUserRequest({ account, ts, pubkey, sig, message }) {
+  if (typeof account !== 'string' || !/^[a-z0-9][a-z0-9.\-]*$/.test(account)) {
+    throw Object.assign(new Error('valid hive_account required'), { code: 'bad_request' });
+  }
+  const tsNum = Number(ts);
+  if (!Number.isInteger(tsNum)) {
+    throw Object.assign(new Error('ts (unix seconds) required'), { code: 'bad_request' });
+  }
+  if (typeof pubkey !== 'string' || typeof sig !== 'string' || !pubkey || !sig) {
+    throw Object.assign(new Error('pubkey and sig required'), { code: 'bad_request' });
+  }
+  const skew = Math.abs(Math.floor(Date.now() / 1000) - tsNum);
+  if (skew > SIGNED_REQUEST_MAX_SKEW_SEC) {
+    throw Object.assign(new Error('request timestamp outside freshness window'), { code: 'unauthorized' });
+  }
+  if (!envelope.verifyHiveSig(message, sig, pubkey)) {
+    throw Object.assign(new Error('signature verification failed'), { code: 'unauthorized' });
+  }
+  let postingKeys;
+  try {
+    postingKeys = await hive.getAccountPostingPubkeys(account);
+  } catch (e) {
+    // Fail closed: if Hive is unreachable we cannot prove key ownership.
+    throw Object.assign(new Error(`could not verify account keys: ${e.message}`), { code: 'unprocessable_entity' });
+  }
+  if (!postingKeys.includes(pubkey)) {
+    throw Object.assign(new Error('pubkey is not a current posting key for this account'), { code: 'unauthorized' });
+  }
+}
+
 // ─── Rate limiters ──────────────────────────────────────────────────────────
 
 const reserveLimiter = rateLimit({
@@ -120,6 +168,14 @@ const uploadLimiter = rateLimit({
   handler: (req, res) => respondError(res, 'rate_limited', 'too many /upload requests')
 });
 
+const userApiLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: parseInt(process.env.RATE_LIMIT_USER_API_PER_MIN || '60', 10),
+  standardHeaders: true,
+  legacyHeaders: false,
+  handler: (req, res) => respondError(res, 'rate_limited', 'too many requests')
+});
+
 // ─── Multer for ciphertext uploads ──────────────────────────────────────────
 
 const upload = multer({
@@ -132,9 +188,10 @@ const upload = multer({
 app.get('/', (req, res) => {
   res.json({
     service: 'ipfs-gate',
-    version: '0.1.0-dev',
+    version: '0.2.0-dev',
     operator: IPFS_GATE_HIVE_ACCOUNT,
-    payment: { currency: PAYMENT_CURRENCY, amount: PAYMENT_AMOUNT, max_size_mb: MAX_FILE_SIZE_MB, ttl_days: DEFAULT_TTL_DAYS }
+    payment: { currency: PAYMENT_CURRENCY, amount: PAYMENT_AMOUNT, max_size_mb: MAX_FILE_SIZE_MB, ttl_days: DEFAULT_TTL_DAYS },
+    features: { public_uploads: true, uploads_tab: true }
   });
 });
 
@@ -146,15 +203,23 @@ app.get('/', (req, res) => {
 app.post('/reserve', reserveLimiter, (req, res) => {
   try {
     const { uploader, size_bytes } = req.body || {};
+    // v0.2 — optional upload mode. 'encrypted' (default) = ciphertext, served
+    // as octet-stream (unchanged). 'public' = plaintext, shareable link served
+    // with the claimed MIME. Same reserve→pay→upload billing for both.
+    const mode = (req.body && req.body.mode) || 'encrypted';
     if (typeof uploader !== 'string' || !Number.isInteger(size_bytes)) {
       return respondError(res, 'bad_request', 'uploader (string) and size_bytes (integer) required');
     }
+    if (mode !== 'encrypted' && mode !== 'public') {
+      return respondError(res, 'bad_request', "mode must be 'encrypted' or 'public'");
+    }
 
-    const r = quota.createReservation(uploader.toLowerCase(), size_bytes);
+    const r = quota.createReservation(uploader.toLowerCase(), size_bytes, mode);
 
     res.json({
       reservation_id: r.id,
       expires_at: isoFromMs(r.expires_at),
+      mode,
       payment: {
         currency: PAYMENT_CURRENCY,
         amount: String(PAYMENT_AMOUNT),
@@ -178,6 +243,10 @@ app.post('/reserve', reserveLimiter, (req, res) => {
 app.post('/upload', uploadLimiter, upload.single('ciphertext'), async (req, res) => {
   try {
     const { reservation_id, tx_id, uploader_pubkey, upload_proof_sig } = req.body || {};
+    // v0.2 — public uploads carry a claimed plaintext MIME (rendering hint only,
+    // never a security input — see GET /ipfs/:cid hardening). `kind` is v4call's
+    // kind_hint, accepted for audit but not otherwise used by the gate.
+    const claimedMime = (req.body && req.body.mime) || null;
 
     if (!reservation_id || !tx_id || !uploader_pubkey || !upload_proof_sig) {
       return respondError(res, 'bad_request', 'reservation_id, tx_id, uploader_pubkey, upload_proof_sig all required');
@@ -207,6 +276,18 @@ app.post('/upload', uploadLimiter, upload.single('ciphertext'), async (req, res)
     }
 
     const uploader = r.uploader;
+
+    // 1b. Resolve upload mode from the (paid) reservation and validate the
+    //     claimed MIME for public uploads BEFORE doing any Hive payment work,
+    //     so malformed requests are rejected cheaply.
+    const mode = r.mode || 'encrypted';
+    let mime = null;
+    if (mode === 'public') {
+      if (typeof claimedMime !== 'string' || !MIME_RE.test(claimedMime) || claimedMime.length > 255) {
+        return respondError(res, 'bad_request', 'public upload requires a valid `mime` field');
+      }
+      mime = claimedMime.toLowerCase();
+    }
 
     // 2. Banned-account check (banlist could've been added between reserve and upload)
     if (quota.isAccountBanned(uploader)) {
@@ -320,13 +401,16 @@ app.post('/upload', uploadLimiter, upload.single('ciphertext'), async (req, res)
       return respondError(res, 'legal_takedown', 'this CID is blocked on this server');
     }
 
-    // 10. Create pin record + mark reservation uploaded
+    // 10. Create pin record + mark reservation uploaded. mode/mime were
+    //     resolved up-front (before payment work) from the paid reservation.
     const pin = quota.createPin({
       cid,
       uploader,
       size_bytes: sizeBytes,
       payment_id: payment.id,
-      ttl_days: DEFAULT_TTL_DAYS
+      ttl_days: DEFAULT_TTL_DAYS,
+      mode,
+      mime
     });
     quota.markReservationUploaded(reservation_id, pin.id);
 
@@ -385,11 +469,26 @@ app.get('/ipfs/:cid', async (req, res) => {
     if (quota.isCidBlocked(cid)) {
       return respondError(res, 'legal_takedown', 'this CID has been removed');
     }
-    if (!quota.hasActivePinForCid(cid)) {
+    const serve = quota.getServeInfoForCid(cid);
+    if (!serve) {
       return respondError(res, 'not_found', 'CID not pinned here');
     }
     const upstream = await kubo.cat(cid);
-    res.set('Content-Type', 'application/octet-stream');
+
+    // v0.2 — content-type. Encrypted CIDs are opaque ciphertext → octet-stream.
+    // Public CIDs are served with their claimed MIME so links render directly,
+    // EXCEPT active-content types (html/svg/...), which are forced to download
+    // so a public link can't become stored-XSS on the gate's own origin. The
+    // claimed MIME is a rendering hint, never trusted for a security decision.
+    res.set('X-Content-Type-Options', 'nosniff');
+    if (serve.mode === 'public' && serve.mime && MIME_RE.test(serve.mime) && !PUBLIC_INLINE_DENY.has(serve.mime)) {
+      res.set('Content-Type', serve.mime);
+    } else {
+      res.set('Content-Type', 'application/octet-stream');
+      if (serve.mode === 'public') {
+        res.set('Content-Disposition', 'attachment');
+      }
+    }
     // Cache-Control max-age is env-configurable (v0.1.4). Default 86400 (1 day)
     // for production; recommend 3600 or less during dev/testing so pin expiry
     // is visible without browser cache lying. Set GATEWAY_CACHE_MAX_AGE in .env.
@@ -402,6 +501,106 @@ app.get('/ipfs/:cid', async (req, res) => {
       console.warn(`[server] gateway stream failed for ${cid}: ${e.message}`);
       try { res.end(); } catch (_) {}
     });
+  } catch (e) {
+    return handleError(res, e);
+  }
+});
+
+// ─── Signed user endpoints (Hive posting-key auth, no payment) ───────────────
+// These let a user manage their OWN uploads. Unlike /upload there is no
+// on-chain payment to anchor identity, so the signed request IS the auth — see
+// verifySignedUserRequest (proves the supplied pubkey is the account's posting
+// key on Hive, not just that some key signed).
+
+/**
+ * GET /uploads/by-user
+ * Query: hive_account, ts (unix seconds), pubkey, sig
+ * Signed message: ipfs-gate:list-uploads:v1:<hive_account>:<ts>
+ * Returns the caller's pinned uploads + (shared-disk) quota snapshot.
+ */
+app.get('/uploads/by-user', userApiLimiter, async (req, res) => {
+  try {
+    const account = String(req.query.hive_account || '').toLowerCase();
+    const ts = req.query.ts;
+    const pubkey = req.query.pubkey;
+    const sig = req.query.sig;
+
+    const message = `ipfs-gate:list-uploads:v1:${account}:${ts}`;
+    await verifySignedUserRequest({ account, ts, pubkey, sig, message });
+
+    const disk = quota.getDiskUsage();
+    const rows = quota.listUploadsForAccount(account, 500, 0);
+    const uploads = rows.map(p => ({
+      cid: p.cid,
+      size_bytes: p.size_bytes,
+      mime: p.mime || null,
+      mode: p.mode || 'encrypted',
+      kind: null,
+      uploaded_at: isoFromMs(p.created_at),
+      expires_at: isoFromMs(p.expires_at),
+      pinned: p.status === 'active',
+      status: p.status,
+      public_url: (p.mode === 'public') ? `${PUBLIC_GATEWAY_BASE}/ipfs/${p.cid}` : null
+    }));
+
+    res.json({
+      hive_account: account,
+      quota: {
+        // NOTE: there is no per-account byte cap in v0.2 — these are the
+        // SHARED gate-disk figures. quota_scope makes that explicit so the
+        // client renders an honest "X of Y (shared)" label.
+        quota_scope: 'shared_disk',
+        used_bytes: disk.used_bytes,
+        limit_bytes: disk.limit_bytes,
+        available_bytes: disk.available_bytes,
+        pending_count: quota.getAccountPendingCount(account)
+      },
+      uploads
+    });
+  } catch (e) {
+    return handleError(res, e);
+  }
+});
+
+/**
+ * POST /uploads/delete
+ * Body: { cid, hive_account, ts (unix seconds), pubkey, sig }
+ * Signed message: ipfs-gate:delete-pin:v1:<cid>:<hive_account>:<ts>
+ * Unpins ONLY the caller's pin row(s) for the CID. Kubo-unpins + GCs only when
+ * no active pin remains for the CID (multi-pin-record dedup model).
+ */
+app.post('/uploads/delete', userApiLimiter, async (req, res) => {
+  try {
+    const { cid } = req.body || {};
+    const account = String((req.body && req.body.hive_account) || '').toLowerCase();
+    const ts = req.body && req.body.ts;
+    const pubkey = req.body && req.body.pubkey;
+    const sig = req.body && req.body.sig;
+
+    if (typeof cid !== 'string' || !cid) {
+      return respondError(res, 'bad_request', 'cid required');
+    }
+
+    const message = `ipfs-gate:delete-pin:v1:${cid}:${account}:${ts}`;
+    await verifySignedUserRequest({ account, ts, pubkey, sig, message });
+
+    const result = quota.removePinForUploader(cid, account);
+    if (result.removed === 0) {
+      return respondError(res, 'not_found', 'no active upload for this account + cid');
+    }
+
+    if (result.fully_unpinned) {
+      try {
+        await kubo.unpin(cid);
+        await kubo.gc();
+      } catch (e) {
+        // Row is already freed in the DB; a stale Kubo pin is harmless (the next
+        // sweeper GC will reclaim it). Log + report fully_unpinned honestly.
+        console.warn(`[uploads/delete] kubo unpin/gc failed for ${cid}: ${e.message}`);
+      }
+    }
+
+    res.json({ ok: true, cid, removed: result.removed, fully_unpinned: result.fully_unpinned });
   } catch (e) {
     return handleError(res, e);
   }
