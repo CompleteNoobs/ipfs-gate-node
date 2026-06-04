@@ -63,6 +63,11 @@ if (!ADMIN_KEY) {
 
 const app = express();
 app.disable('x-powered-by');
+// Behind nginx (one proxy hop), so the client IP is in X-Forwarded-For. Without
+// this, express-rate-limit throws ERR_ERL_UNEXPECTED_X_FORWARDED_FOR and would
+// otherwise key every request off the nginx container IP. '1' = trust the first
+// proxy only (don't blindly trust a client-spoofed XFF chain).
+app.set('trust proxy', 1);
 app.use(cors({ origin: CORS_ORIGIN }));
 app.use(express.json({ limit: '64kb' }));
 
@@ -895,7 +900,7 @@ async function boot() {
   sweeper.start();
 
   app.listen(PORT, BIND_HOST, () => {
-    console.log(`ipfs-gate v0.1 listening on ${BIND_HOST}:${PORT}`);
+    console.log(`ipfs-gate v0.2 listening on ${BIND_HOST}:${PORT}`);
     console.log(`  operator account: @${IPFS_GATE_HIVE_ACCOUNT}`);
     console.log(`  payment: ${PAYMENT_AMOUNT} ${PAYMENT_CURRENCY} per upload (≤${MAX_FILE_SIZE_MB}MB, ${DEFAULT_TTL_DAYS}-day TTL)`);
     console.log(`  CORS origin: ${CORS_ORIGIN}`);
