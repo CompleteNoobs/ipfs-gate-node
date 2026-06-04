@@ -38,6 +38,35 @@ So this report is really about two separate questions:
 
 ---
 
+## Kickoff — Phase 1 (MP3), ready to start (2026-06-04)
+
+**Chosen path: ship MP3 on the v4call side now; gate stays as-is.** Per
+the headline finding, MP3 needs zero gate code. Ordered first steps:
+
+1. **(gate, optional) size cap.** Keep `MAX_FILE_SIZE_MB=10` for voice
+   notes / short MP3s, OR bump it in `.env` if you want longer audio.
+   One-line config + `docker compose down/up`. No code.
+2. **(v4call) file picker** — `accept="image/jpeg"` →
+   `accept="image/jpeg,audio/mpeg"` in `public/index.html`.
+3. **(v4call) `mimeToKind(mime)` helper** — replaces the two hardcoded
+   `'image'` literals; maps MIME → kind_hint; falls back to `'file'`;
+   special-case `image/svg+xml → 'file'` (XSS downgrade).
+4. **(v4call) `addAttachmentBubble` audio branch** — `kind_hint==='audio'`
+   → `<audio controls src=objectURL>`; image path unchanged; else locked
+   card.
+5. **Test end-to-end** — same flow as v0.16.16 testing (production
+   servers vs ipfs.completenoobs.com) but with an MP3 instead of a JPEG;
+   confirm encrypt → pay → pin → recipient inline `<audio>` playback →
+   federated delivery (content-agnostic, should "just work").
+
+The **well-designed v0.2 gate change** (allowlist claim / audit fields /
+expose menu on `GET /`) remains **optional and later** — see the bottom
+sections. It is not required for Phase 1. The **v0.3 prepaid two-part
+tariff** is the next gate milestone after MP3 — see
+`PRICING-V0.3-DESIGN-NOTES.md` §12 for that build order.
+
+---
+
 ## Current state — what the gate does today, point by point
 
 ### 1. Where is the JPEG-only check?

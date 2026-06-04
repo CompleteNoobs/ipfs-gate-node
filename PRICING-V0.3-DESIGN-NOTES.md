@@ -1,13 +1,26 @@
 # ipfs-gate v0.3 — Pricing model design notes (two-part tariff + prepaid balance + token discount)
 
-> Design note only — NO code yet. Captures the pricing model worked out
-> with noob across a "just talk" thread (2026-06-02 → 2026-06-03).
-> Companion to `MP3-SUPPORT-OPTIONS.md`. Audience: the gate session that
-> implements v0.3, and noob for review/testing.
+> **Status: DESIGN LOCKED — pricing rollout is the current task
+> (2026-06-04).** Captures the pricing model worked out with noob across a
+> "just talk" thread (2026-06-02 → 2026-06-04). Companion to
+> `MP3-SUPPORT-OPTIONS.md`.
 >
-> **Sequencing:** this lands in **v0.3, AFTER MP3 ships and tests
-> correctly** (MP3 needs zero gate change — see MP3-SUPPORT-OPTIONS.md).
-> Do not start this until MP3 is verified in production.
+> **Multi-format attachments are DONE and working** (uncommitted build
+> from another thread): MP3, MP4, PDF, tar, text — encrypted over WSS
+> (not Nostr yet) — **plus public unencrypted upload-and-share-by-link.**
+> The remaining piece is **pricing**: replace the flat "1 TEST per
+> upload" with the two-part tariff and gather data on a small test pool.
+>
+> **Sequencing (updated):** start with **§12.5 — the lean rollout
+> (dynamic per-upload pricing FIRST, prepaid ledger LATER)**, not the full
+> §12 build. For a small test pool, the formula on the existing per-upload
+> flow gets data flowing with a fraction of the build. The prepaid balance
+> is a friction-killer for scale, deferred until the rate is validated.
+>
+> **Public uploads changed one assumption — see §2b (egress).** Every
+> number here assumed encrypted, low-fan-out files; public link-sharing
+> can be high-fan-out, which introduces a bandwidth cost the storage-only
+> formula doesn't price. Measure before pricing it.
 >
 > **Purpose:** noob learns by seeing it applied + tested. This model is
 > deliberately simple so it can be deployed, used, and measured — the
@@ -75,6 +88,37 @@ Big files → the storage term takes over. The two-part tariff
 auto-adjusts from a 2MB photo to a 900MB distro with one rule. This is
 *why* size can be ignored for chat attachments but matters for large
 uploads — the formula handles both.
+
+---
+
+## 2b. Public uploads change the cost model — the egress axis
+
+**New as of 2026-06-04:** the gate now also serves **public, unencrypted
+upload-and-share-by-link** files, alongside the encrypted WSS attachments.
+This breaks an assumption baked into every number above.
+
+The formula prices **storage** (`bytes × days`) and ignores bandwidth —
+which was correct for **encrypted, low-fan-out** files (a DM attachment
+goes to one or two recipients, fetched a couple of times; egress is
+negligible). **Public link-sharing can be high-fan-out:** anyone with the
+link can fetch repeatedly. One popular public 50MB file can cost more in
+**egress** than a hundred private attachments — a cost the storage-only
+formula doesn't see.
+
+**Do not pre-price this — measure it first.** At test-pool scale egress
+may stay trivial. The discipline:
+- **Track per public CID:** fetch count + egress bytes over time (see §9).
+- **Decide only when data shows it matters.** Options then: a higher rate
+  for `is_public` uploads, a per-file bandwidth cap, or a shorter default
+  TTL for public files. Pick from evidence, not fear.
+- **Moderation note:** public files are more *reachable* than encrypted
+  blobs (illegal content shareable by link). The existing
+  ban/takedown/blocklist already covers this — no new mechanism needed,
+  just awareness that the public link widens the surface.
+
+Carry an `is_public` flag through pricing + logging so the two cost
+models (private storage-bound vs public egress-bound) can be analysed
+separately.
 
 ---
 
@@ -313,19 +357,38 @@ cost predictable; operator absorbs token volatility).
 
 ## 9. What to test / data to gather (the point of shipping this)
 
-1. **Size distribution** of real uploads — confirms whether the size term
-   ever wakes up in practice or files stay tiny.
-2. **Package mix** — do users pick short or long TTLs? Informs the
-   sub-linear time discount (if everyone picks 1-month, the rate may be
-   too generous).
-3. **Top-up sizes + balance behavior** — do users conserve or burn? Reads
-   willingness-to-pay without asking (the prepaid-balance advantage).
-4. **Discount uptake** — how many stake the token, how much, does it move
-   the token's market price (the layer-2 signal).
-5. **Refund requests** — frequency + size; validates the unspent-only rule.
+**Log per upload, from day one** (cheap now, painful to backfill):
+`size_bytes`, `kind` (mp3/mp4/pdf/tar/text/…), `package`/`ttl_days`,
+`price_charged`, `uploader`, `timestamp`, and **`is_public`** (encrypted
+vs public-link — so the two cost models are analysable separately, §2b).
+For public CIDs also track **fetch count + egress bytes over time** (the
+egress axis). At the lean stage (§12.5) this is a simple usage-log table;
+once the balance ledger exists (§8) most of it lives there.
+
+**Extracting price signal from free testers — the fixed-allowance
+trick.** A tester spending tokens that cost them nothing reveals UX, not
+willingness-to-pay. So **give each tester a fixed TEST allowance and watch
+conserve-vs-burn:** conserving = "feels expensive," burning = "feels
+cheap, can charge more." This is the closest thing to real WTP a small
+friendly pool can give — better than asking.
+
+What to watch:
+1. **Size distribution** of real uploads — does the size term ever wake up
+   in practice (now that MP4/tar can be large), or do files stay tiny?
+2. **Package mix** — short or long TTLs? If everyone picks 1-month, the
+   rate may be too generous.
+3. **Conserve-vs-burn** per tester (the allowance trick above) — the WTP
+   read. (Post-prepaid: top-up sizes + balance behavior.)
+4. **Public egress reality check** — do public files actually rack up
+   bandwidth, or stay trivial? Decides whether §2b ever needs pricing.
+5. **Discount uptake** — how many hold/stake the token, how much, does it
+   move the token's market price (the layer-2 signal).
+6. **Refund requests** — frequency + size; validates the unspent-only rule.
 
 Treat all early numbers as **directional, first data point, expect to
 revise** — small N of friendly testers is not a representative market.
+The goal of the test pool is to prove the mechanism + catch wildly-off
+pricing, NOT to derive a perfect rate. Precision tuning needs real scale.
 
 ---
 
@@ -355,5 +418,98 @@ spend-only) → unspent own-topup balance is refundable; spent packages and
 gifted credit are not.** Two tunable price knobs, one multiplication, all
 auto-adjusting from a 2MB photo to a 900MB distro.
 
-*Captured 2026-06-03. No code written. Implement after MP3 verifies in
-production.*
+---
+
+## 12.5 Rollout on the small test pool — the lean path (START HERE)
+
+**For a small test pool, do NOT build the full §12 ledger first.** The
+unknown is the *rate*; the prepaid balance is a known, deferrable
+convenience. Build the *formula* on top of the **existing per-upload
+payment flow** and start gathering data with a fraction of the work.
+
+**Milestone 3a — dynamic per-upload pricing (small build, do this first):**
+1. **Pricing function + packages** — `price = access_fee + rate × GB ×
+   days`; package → `ttl_days`. (= §12 step 3.)
+2. **Make `/reserve`'s amount dynamic** — return the computed price for
+   the file's size + chosen package, instead of the flat `PAYMENT_AMOUNT`.
+   The existing `reserve → pay → upload` flow is unchanged in shape; only
+   the *amount* becomes variable. **No prepaid ledger, no schema change.**
+3. **Price in TEST at 1:1** with the HBD-equivalent numbers — skip the
+   live HBD→TEST market conversion entirely (TEST isn't trading yet;
+   nothing to convert). The conversion layer comes only when TEST has a
+   real market price.
+4. **Carry `is_public`** through pricing + the usage log (§2b, §9).
+5. **Instrument logging** (§9 field list) + **hand each tester a fixed
+   TEST allowance** (the conserve-vs-burn WTP read).
+6. **Expose the menu on `GET /`** (packages, `access_fee`, `storage_rate`,
+   `max_size_mb`) so the v4call picker reads it live. (= §12 step 5.)
+
+Milestone 3a is deployable + measurable on its own. Run it, watch the
+data (§9), tune `access_fee` + `rate`, sanity-check public egress.
+
+**Milestone 3b — prepaid balance (the friction-killer), LATER:** build
+the full §12 (schema → top-up → balance debit → §6 discount → §6b credit
+sharing → §5 refund). Do this once the rate is validated AND per-file
+Keychain friction actually bites (more users / higher volume) — at small
+scale it's tolerable, so it waits.
+
+**Why this order:** validate the *rate* (the real unknown) before
+investing in the *ledger* (deferrable convenience). Less to build → data
+sooner → faster learning. §12 below is the full 3b build, kept intact.
+
+---
+
+## 12. Build order / kickoff (gate v0.3 — full prepaid build = Milestone 3b)
+
+> **Read §12.5 first.** For the small test pool, Milestone 3a (lean
+> dynamic pricing) comes before this. The steps below are the full
+> prepaid build; do them once the rate is validated.
+
+Ordered so each step is testable before the next. Each is a small,
+self-contained change — do not batch them.
+
+1. **Schema migration `002`.** Add three tables: `accounts`
+   (`hive_account` PK, `balance_hbd`, `updated_at`); `balance_ledger`
+   (append-only, with the `origin` tag — §8); `allowances` (sponsor
+   model — §6b). Additive only; existing tables untouched. *Test:*
+   migration runs clean on a copy of prod DB.
+2. **Top-up flow.** Detect an on-chain transfer with a top-up memo →
+   credit `accounts.balance_hbd` + ledger row (`kind='topup'`,
+   `origin='topup'`). Reuse the existing payment-verify + sidechain-
+   confirm path; tx_id UNIQUE still guards replay. *Test:* a real
+   top-up lands and shows in the balance.
+3. **Pricing function + packages.** `price = access_fee + rate × GB ×
+   days` (§2); package → `ttl_days` lookup (§3). Add a `/quote` (or
+   extend `/reserve`) that returns the computed price for a given size +
+   package. *Test:* the 900MB worked examples in §2 reproduce exactly.
+4. **Balance debit at upload.** `/upload` checks balance ≥ price, debits
+   atomically (ledger `kind='upload'`), then proceeds to pin. Per-upload
+   on-chain tx is no longer required. Insufficient balance → clean
+   reject before pin work. *Test:* one top-up funds several uploads, no
+   Keychain per file.
+5. **Expose on `GET /`.** Add `packages`, `access_fee`, `storage_rate`,
+   `max_size_mb` to the `/` payload so v4call's picker reads them live
+   (avoids the file-picker going stale). *Test:* `curl /` shows the menu.
+6. **Token discount.** Stake/hold lookup (cached ~5 min), apply to the
+   storage part with the access-fee floor (§6). `DISCOUNT_REQUIRE_STAKED`
+   toggle (default `false` for testing). *Test:* hold N tokens → N% off,
+   capped at 33%, floor preserved.
+7. **Credit sharing.** Gift endpoint (atomic ledger move, Hive-signed)
+   then soft sponsor allowance (§6b). Tag credit `origin` so refunds can
+   block gifted cash-out. *Test:* foo gifts bar, bar uploads on it; bar
+   cannot refund gifted credit.
+8. **Refund endpoint.** Unspent **own-topup** balance only → on-chain
+   transfer back; min-threshold + status-lock (§5). *Test:* refund
+   returns exact unspent topup; spent packages + gifted credit refused.
+9. **Admin views.** Balance + ledger inspection per account; float total.
+10. **v4call side** (separate session): package picker UI, balance
+    display, top-up flow, then gift/sponsor UI. Reads the menu from
+    `GET /` (step 5).
+
+Steps 1–5 are the minimum viable prepaid two-part tariff (deployable +
+measurable on their own). 6–10 layer on once the core is proven.
+
+*Captured 2026-06-03; rollout strategy added 2026-06-04. Multi-format +
+public upload are DONE (uncommitted, another thread). No pricing code
+written yet. **Start with §12.5 Milestone 3a** (lean dynamic pricing on
+the existing per-upload flow), not §12 step 1.*
