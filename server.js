@@ -16,6 +16,7 @@ const hive = require('./hive-verify');
 const moderation = require('./moderation');
 const sweeper = require('./sweeper');
 const kubo = require('./backends/kubo');
+const pricing = require('./pricing');
 
 // ─── Config ─────────────────────────────────────────────────────────────────
 
@@ -28,8 +29,11 @@ const ADMIN_KEY = process.env.ADMIN_KEY || '';
 const PAYMENT_CURRENCY = process.env.PAYMENT_CURRENCY || 'CNOOBS';
 const PAYMENT_AMOUNT = process.env.PAYMENT_AMOUNT || '1';
 const IPFS_GATE_HIVE_ACCOUNT = (process.env.IPFS_GATE_HIVE_ACCOUNT || '').toLowerCase();
-// parseFloat allows fractional days for testing (e.g. 0.001 ≈ 86s)
+// parseFloat allows fractional days for testing (e.g. 0.001 ≈ 86s). In the v1
+// claim model this is only the DEFAULT duration when a /reserve omits
+// hours_requested — the authoritative timer is the claim's expiry_ts.
 const DEFAULT_TTL_DAYS = parseFloat(process.env.DEFAULT_TTL_DAYS || '7');
+const DEFAULT_HOURS = Math.max(pricing.MIN_HOURS, Math.round(DEFAULT_TTL_DAYS * 24));
 const MAX_FILE_SIZE_MB = parseInt(process.env.MAX_FILE_SIZE_MB || '10', 10);
 const MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024;
 const RATE_LIMIT_RESERVE = parseInt(process.env.RATE_LIMIT_RESERVE_PER_MIN || '30', 10);
@@ -155,6 +159,47 @@ async function verifySignedUserRequest({ account, ts, pubkey, sig, message }) {
   }
 }
 
+/**
+ * Settle one already-cancelled (or expired) claim: compute the pro-rata refund,
+ * record it in the durable refund ledger, and attempt the on-chain broadcast.
+ * NEVER throws — the claim is closed regardless; the refund row carries
+ * sent / pending / failed / skipped so the operator can see + retry. Returns a
+ * small summary. 'pending' is the key-optional gate path (no IPFS_GATE_ACTIVE_KEY).
+ */
+async function settleClaimRefund(claim, reason = 'cancel') {
+  const refund = pricing.calculateRefund(claim, Date.now());
+  const memo = `ipfs-gate:refund:${claim.claim_id}`;
+
+  if (!refund.amount || refund.amount <= 0) {
+    quota.recordRefund({
+      claim_id: claim.claim_id, to_account: claim.owner, amount: 0,
+      currency: claim.currency, memo, status: 'skipped',
+      reason: `${reason}: nothing refundable (consumed/dust)`
+    });
+    return { amount: 0, status: 'skipped', hours_refunded: refund.hours_refunded };
+  }
+
+  const rec = quota.recordRefund({
+    claim_id: claim.claim_id, to_account: claim.owner, amount: refund.amount,
+    currency: claim.currency, memo, status: 'pending', reason
+  });
+
+  try {
+    const sent = await hive.sendRefund({ to: claim.owner, amount: refund.amount, currency: claim.currency, memo });
+    quota.markRefundSettled(rec.refund_id, 'sent', sent.tx_id);
+    return { amount: refund.amount, status: 'sent', tx_id: sent.tx_id, refund_id: rec.refund_id };
+  } catch (e) {
+    if (e.code === 'no_refund_key') {
+      // Leave the row 'pending' — operator settles manually (key-optional gate).
+      console.warn(`[refund] ${rec.refund_id} pending (no escrow key): ${refund.amount} ${claim.currency} → @${claim.owner}`);
+      return { amount: refund.amount, status: 'pending', refund_id: rec.refund_id };
+    }
+    quota.markRefundSettled(rec.refund_id, 'failed', null);
+    console.error(`[refund] ${rec.refund_id} broadcast failed: ${e.message}`);
+    return { amount: refund.amount, status: 'failed', refund_id: rec.refund_id, error: e.message };
+  }
+}
+
 // ─── Rate limiters ──────────────────────────────────────────────────────────
 
 const reserveLimiter = rateLimit({
@@ -193,17 +238,36 @@ const upload = multer({
 app.get('/', (req, res) => {
   res.json({
     service: 'ipfs-gate',
-    version: '0.2.0-dev',
+    version: '1.0.0-dev',
     operator: IPFS_GATE_HIVE_ACCOUNT,
-    payment: { currency: PAYMENT_CURRENCY, amount: PAYMENT_AMOUNT, max_size_mb: MAX_FILE_SIZE_MB, ttl_days: DEFAULT_TTL_DAYS },
-    features: { public_uploads: true, uploads_tab: true }
+    // v1 claim model: cost is computed per upload (size × time × copies). The
+    // flat `amount` is retired — clients must POST /reserve with size_bytes (and
+    // optional hours_requested/copies) to get a quote. `currency`, `max_size_mb`
+    // and the default duration stay advertised here for the picker UI.
+    payment: {
+      model: 'claim-mb-hour',
+      currency: PAYMENT_CURRENCY,
+      max_size_mb: MAX_FILE_SIZE_MB,
+      default_hours: DEFAULT_HOURS,
+      ttl_days: DEFAULT_TTL_DAYS
+    },
+    pricing: {
+      rate_per_mb_hour: pricing.RATE_PER_MB_HOUR,
+      min_hours: pricing.MIN_HOURS,
+      mb_divisor: pricing.MB_DIVISOR,
+      node_count: pricing.NODE_COUNT
+    },
+    features: { public_uploads: true, uploads_tab: true, claim_model: true }
   });
 });
 
 /**
  * POST /reserve
- * Body: { uploader, size_bytes }
- * Returns: { reservation_id, expires_at, payment: { currency, amount, escrow_account, memo, ttl_days }, max_size_bytes }
+ * Body: { uploader, size_bytes, hours_requested?, copies?, mode? }
+ * v1 claim model: the gate computes a per-claim quote (size × time × copies) and
+ * returns it as payment.amount. hours_requested defaults to DEFAULT_HOURS; copies
+ * defaults to 1 (capped at NODE_COUNT). The flat-fee path is retired.
+ * Returns: { reservation_id, expires_at, mode, payment:{currency,amount,escrow_account,memo}, quote:{...}, max_size_bytes }
  */
 app.post('/reserve', reserveLimiter, (req, res) => {
   try {
@@ -219,7 +283,28 @@ app.post('/reserve', reserveLimiter, (req, res) => {
       return respondError(res, 'bad_request', "mode must be 'encrypted' or 'public'");
     }
 
-    const r = quota.createReservation(uploader.toLowerCase(), size_bytes, mode);
+    // Quote inputs. hours_requested / copies are optional; defaults keep a bare
+    // {uploader,size_bytes} request working (it just gets the default duration).
+    const rawHours = (req.body && req.body.hours_requested);
+    const hoursRequested = (rawHours === undefined || rawHours === null) ? DEFAULT_HOURS : Number(rawHours);
+    const rawCopies = (req.body && req.body.copies);
+    const copiesRequested = (rawCopies === undefined || rawCopies === null) ? 1 : Number(rawCopies);
+    if (!Number.isFinite(hoursRequested) || hoursRequested <= 0) {
+      return respondError(res, 'bad_request', 'hours_requested must be a positive number');
+    }
+
+    let quote;
+    try {
+      quote = pricing.calculateCost({ sizeBytes: size_bytes, hoursRequested, copies: copiesRequested });
+    } catch (e) {
+      return handleError(res, e);
+    }
+
+    const r = quota.createReservation(uploader.toLowerCase(), size_bytes, mode, {
+      hoursRequested: quote.billable_hrs,
+      copies: quote.copies,
+      quotedAmount: quote.total
+    });
 
     res.json({
       reservation_id: r.id,
@@ -227,10 +312,17 @@ app.post('/reserve', reserveLimiter, (req, res) => {
       mode,
       payment: {
         currency: PAYMENT_CURRENCY,
-        amount: String(PAYMENT_AMOUNT),
+        amount: String(quote.total),
         escrow_account: IPFS_GATE_HIVE_ACCOUNT,
-        memo: quota.getMemoForReservation(r.id),
-        ttl_days: DEFAULT_TTL_DAYS
+        memo: quota.getMemoForReservation(r.id)
+      },
+      quote: {
+        billable_mb: quote.billable_mb,
+        billable_hrs: quote.billable_hrs,
+        copies: quote.copies,
+        rate_per_mb_hour: quote.rate,
+        total: quote.total,
+        currency: PAYMENT_CURRENCY
       },
       max_size_bytes: quota.MAX_FILE_SIZE_BYTES
     });
@@ -318,14 +410,17 @@ app.post('/upload', uploadLimiter, upload.single('ciphertext'), async (req, res)
       return respondError(res, 'conflict', 'tx_id already used');
     }
 
-    // 5. Verify Hive payment (tx_id lookup + balance check)
+    // 5. Verify Hive payment (tx_id lookup + amount/memo/currency validation).
+    //    v1 claim model: the required amount is the per-claim QUOTE captured at
+    //    /reserve (size × time × copies), not a flat fee.
     const expectedMemo = quota.getMemoForReservation(reservation_id);
     let payResult;
     try {
       payResult = await hive.verifyPayment({
         tx_id,
         sender: uploader,
-        expectedMemo
+        expectedMemo,
+        expectedAmount: r.quoted_amount
       });
     } catch (e) {
       return handleError(res, e, 'unprocessable_entity');
@@ -406,18 +501,43 @@ app.post('/upload', uploadLimiter, upload.single('ciphertext'), async (req, res)
       return respondError(res, 'legal_takedown', 'this CID is blocked on this server');
     }
 
-    // 10. Create pin record + mark reservation uploaded. mode/mime were
-    //     resolved up-front (before payment work) from the paid reservation.
+    // 10. Derive the claim from the (paid) reservation's quote, then create the
+    //     pin (mirroring the claim's expiry_ts) + the order/claim atomically.
+    //     The claim's expiry_ts is the lifecycle authority; the pin row carries
+    //     the same timestamp so disk/serve accounting and the sweeper agree.
+    const hoursPaid = (r.hours_requested && r.hours_requested > 0) ? r.hours_requested : DEFAULT_HOURS;
+    const copies = pricing.cappedCopies(r.copies || 1);
+    const sizeMB = pricing.billableMB(sizeBytes);
+    const rateLocked = pricing.RATE_PER_MB_HOUR;
+    const startTs = quota.now();
+    const expiryTs = startTs + hoursPaid * pricing.HOUR_MS;
+
     const pin = quota.createPin({
       cid,
       uploader,
       size_bytes: sizeBytes,
       payment_id: payment.id,
-      ttl_days: DEFAULT_TTL_DAYS,
+      expires_at: expiryTs,
       mode,
       mime
     });
     quota.markReservationUploaded(reservation_id, pin.id);
+
+    const claim = quota.createOrderWithClaim({
+      cid,
+      owner: uploader,
+      pinId: pin.id,
+      paymentId: payment.id,
+      sizeBytes,
+      sizeMB,
+      rateLocked,
+      paidHours: hoursPaid,
+      copies,
+      amountPaid: payResult.paid,
+      currency: payResult.currency,
+      startTs,
+      expiryTs
+    });
 
     // 11. Dedup info (was there already an active pin for this CID before us?)
     const allActive = quota.getActivePinsForCid(cid);
@@ -433,7 +553,17 @@ app.post('/upload', uploadLimiter, upload.single('ciphertext'), async (req, res)
       expires_at: isoFromMs(pin.expires_at),
       gateway_url: `${PUBLIC_GATEWAY_BASE}/ipfs/${cid}`,
       deduped,
-      existing_expires_at
+      existing_expires_at,
+      claim_id: claim.claim_id,
+      order_id: claim.order_id,
+      claim: {
+        paid_hours: hoursPaid,
+        copies,
+        size_mb: sizeMB,
+        rate_per_mb_hour: rateLocked,
+        amount_paid: payResult.paid,
+        currency: payResult.currency
+      }
     });
   } catch (e) {
     return handleError(res, e);
@@ -589,12 +719,33 @@ app.post('/uploads/delete', userApiLimiter, async (req, res) => {
     const message = `ipfs-gate:delete-pin:v1:${cid}:${account}:${ts}`;
     await verifySignedUserRequest({ account, ts, pubkey, sig, message });
 
-    const result = quota.removePinForUploader(cid, account);
-    if (result.removed === 0) {
+    // v1 claim model: "delete my upload" = cancel the caller's active claim(s)
+    // on this CID → pro-rata refund. Fall back to the legacy pin-delete only for
+    // pre-claim rows (no claim row exists for the CID/owner).
+    const myActiveClaims = quota.getActiveClaimsForCid(cid).filter(c => c.owner === account);
+    let removed = 0;
+    let fullyUnpinned = false;
+    const refunds = [];
+
+    if (myActiveClaims.length > 0) {
+      for (const c of myActiveClaims) {
+        const r = quota.cancelClaim(c.claim_id, account);
+        removed++;
+        if (r.fully_unpinned) fullyUnpinned = true;
+        const refund = await settleClaimRefund(r.claim, 'user_deleted');
+        refunds.push({ claim_id: c.claim_id, ...refund });
+      }
+    } else {
+      const result = quota.removePinForUploader(cid, account);
+      removed = result.removed;
+      fullyUnpinned = result.fully_unpinned;
+    }
+
+    if (removed === 0) {
       return respondError(res, 'not_found', 'no active upload for this account + cid');
     }
 
-    if (result.fully_unpinned) {
+    if (fullyUnpinned) {
       try {
         await kubo.unpin(cid);
         await kubo.gc();
@@ -605,7 +756,49 @@ app.post('/uploads/delete', userApiLimiter, async (req, res) => {
       }
     }
 
-    res.json({ ok: true, cid, removed: result.removed, fully_unpinned: result.fully_unpinned });
+    res.json({ ok: true, cid, removed, fully_unpinned: fullyUnpinned, refunds });
+  } catch (e) {
+    return handleError(res, e);
+  }
+});
+
+/**
+ * POST /claims/cancel  (signed user request — Hive posting-key auth)
+ * Body: { claim_id, hive_account, ts (unix seconds), pubkey, sig }
+ * Signed message: ipfs-gate:cancel-claim:v1:<claim_id>:<hive_account>:<ts>
+ * Cancels the caller's OWN active claim early → pro-rata refund (PRICING-V1 §3)
+ * → unpins the CID iff no other active claim remains (last-funder unpin).
+ */
+app.post('/claims/cancel', userApiLimiter, async (req, res) => {
+  try {
+    const { claim_id } = req.body || {};
+    const account = String((req.body && req.body.hive_account) || '').toLowerCase();
+    const ts = req.body && req.body.ts;
+    const pubkey = req.body && req.body.pubkey;
+    const sig = req.body && req.body.sig;
+
+    if (typeof claim_id !== 'string' || !claim_id) {
+      return respondError(res, 'bad_request', 'claim_id required');
+    }
+
+    const message = `ipfs-gate:cancel-claim:v1:${claim_id}:${account}:${ts}`;
+    await verifySignedUserRequest({ account, ts, pubkey, sig, message });
+
+    // Atomic, status-locked cancel (quota.cancelClaim) — only one cancel wins, so
+    // the refund settled below can't double-pay on a concurrent cancel.
+    const { claim, fully_unpinned } = quota.cancelClaim(claim_id, account);
+    const refund = await settleClaimRefund(claim, 'cancel');
+
+    if (fully_unpinned) {
+      try {
+        await kubo.unpin(claim.cid);
+        await kubo.gc();
+      } catch (e) {
+        console.warn(`[claims/cancel] kubo unpin/gc failed for ${claim.cid}: ${e.message}`);
+      }
+    }
+
+    res.json({ ok: true, claim_id, cid: claim.cid, fully_unpinned, refund });
   } catch (e) {
     return handleError(res, e);
   }
@@ -900,9 +1093,10 @@ async function boot() {
   sweeper.start();
 
   app.listen(PORT, BIND_HOST, () => {
-    console.log(`ipfs-gate v0.2 listening on ${BIND_HOST}:${PORT}`);
+    console.log(`ipfs-gate v1 (claim model) listening on ${BIND_HOST}:${PORT}`);
     console.log(`  operator account: @${IPFS_GATE_HIVE_ACCOUNT}`);
-    console.log(`  payment: ${PAYMENT_AMOUNT} ${PAYMENT_CURRENCY} per upload (≤${MAX_FILE_SIZE_MB}MB, ${DEFAULT_TTL_DAYS}-day TTL)`);
+    console.log(`  pricing: ${pricing.RATE_PER_MB_HOUR} ${PAYMENT_CURRENCY} / MB-hour, min ${pricing.MIN_HOURS}h, ${pricing.NODE_COUNT} node(s), ≤${MAX_FILE_SIZE_MB}MB`);
+    console.log(`  refunds: ${process.env.IPFS_GATE_ACTIVE_KEY ? 'auto (escrow key set)' : 'MANUAL — IPFS_GATE_ACTIVE_KEY unset, refunds recorded pending'}`);
     console.log(`  CORS origin: ${CORS_ORIGIN}`);
   });
 }

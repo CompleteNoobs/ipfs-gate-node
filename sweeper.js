@@ -1,8 +1,10 @@
-// ipfs-gate v0.1 — sweeper.
+// ipfs-gate v1 — sweeper / reconcile loop.
 // Periodic background job that:
 //   1. Marks expired reservations as 'expired'
-//   2. Marks expired active pins as 'expired'
-//   3. Unpins from Kubo + GCs any CIDs that now have no active pin records
+//   2. Expires CLAIMS past their timer (the v1 lifecycle authority) + their pins
+//   3. Expires any legacy pins past their own clock
+//   4. Unpins from Kubo + GCs any CIDs that now have no active pin records
+//      (last-funder unpin; Stage 1b will promote a dormant backstop here instead)
 //
 // Runs every SWEEPER_INTERVAL_MS (default 60s).
 
@@ -22,8 +24,8 @@ async function runOnce() {
   running = true;
   try {
     const result = quota.sweep();
-    if (result.expired_reservations || result.expired_pins || result.cids_to_unpin.length) {
-      console.log(`[sweeper] expired_reservations=${result.expired_reservations} expired_pins=${result.expired_pins} cids_to_unpin=${result.cids_to_unpin.length}`);
+    if (result.expired_reservations || result.expired_claims || result.expired_pins || result.cids_to_unpin.length) {
+      console.log(`[sweeper] expired_reservations=${result.expired_reservations} expired_claims=${result.expired_claims} expired_pins=${result.expired_pins} cids_to_unpin=${result.cids_to_unpin.length}`);
     }
 
     if (result.cids_to_unpin.length > 0) {
