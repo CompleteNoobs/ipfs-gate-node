@@ -4,6 +4,8 @@
 const quota = require('./quota');
 
 const ADMIN_ID = 'operator'; // single-admin for v0.1
+// Default offender refund policy on a forced takedown when the request omits one.
+const DEFAULT_REFUND_POLICY = (process.env.REFUND_POLICY === 'none') ? 'none' : 'prorata';
 
 function audit({ action, target_type, target, reason, metadata }) {
   const db = quota.open();
@@ -24,11 +26,16 @@ function audit({ action, target_type, target, reason, metadata }) {
 }
 
 /**
- * Ban a Hive account.
- * Cascade-marks all their active pins as 'banned'.
- * Returns { pins_affected, cids_to_unpin, moderation_log_id }.
- * Caller must then unpin from Kubo for cids_to_unpin (where no active pin remains).
- * Refund logic NOT executed here — caller handles based on refund_policy.
+ * Ban a Hive account — IDENTITY kill (cohosting §7). Voids ALL the user's claims
+ * (active + dormant) and marks their active pins 'banned', then reconciles each
+ * CID they actively hosted: the file SURVIVES if ANOTHER user has a backstop on
+ * it (FIFO baton-pass), and is only unpinned if nobody else funds it. The content
+ * itself is NOT banned (use takedown for that).
+ *
+ * Returns { voided_claims, pins_affected, cids_to_unpin, activated, refund_policy,
+ * moderation_log_id }. Refund execution is the CALLER's job (server settles each
+ * voided claim per refund_policy — the banned user is not innocent). cids_to_unpin
+ * = CIDs with no funder left; caller kubo-unpins + GCs.
  */
 function banAccount({ hive_account, reason, refund_policy }) {
   if (!hive_account) throw Object.assign(new Error('hive_account required'), { code: 'bad_request' });
@@ -48,40 +55,53 @@ function banAccount({ hive_account, reason, refund_policy }) {
       VALUES (?, ?, ?, ?, ?, NULL, NULL)
     `).run(account, t, ADMIN_ID, reason, refund_policy);
 
-    // Collect affected pins for refund calculation BEFORE marking them banned
-    const affectedPins = db.prepare(`
-      SELECT id, cid, size_bytes, payment_id, expires_at, created_at
-      FROM pins WHERE uploader = ? AND status = 'active'
-    `).all(account);
+    // Collect the user's claims to void (active + dormant) BEFORE voiding — the
+    // pre-void rows drive the refund math in the caller.
+    const voidedClaims = db.prepare(
+      "SELECT * FROM claims WHERE owner = ? AND state IN ('active','dormant')"
+    ).all(account);
+
+    db.prepare(
+      "UPDATE claims SET state = 'cancelled' WHERE owner = ? AND state IN ('active','dormant')"
+    ).run(account);
 
     const upd = db.prepare(`
       UPDATE pins SET status = 'banned', status_changed_at = ?, status_reason = ?
       WHERE uploader = ? AND status = 'active'
     `).run(t, reason, account);
 
+    // Reconcile each CID the user actively hosted: another user's queued backstop
+    // takes the baton (file survives); unpin only where nobody else funds it.
+    // The banned user's own backstops were just voided, so they can't be promoted.
+    const activeCids = [...new Set(voidedClaims.filter(c => c.state === 'active').map(c => c.cid))];
+    const cidsToUnpin = [];
+    const activated = [];
+    for (const cid of activeCids) {
+      const rec = quota.reconcileCidAfterEnd(cid);
+      if (rec.activated) activated.push(rec.activated);
+      else if (rec.unpin) cidsToUnpin.push(cid);
+    }
+
     const mlId = audit({
       action: 'ban',
       target_type: 'account',
       target: account,
       reason,
-      metadata: { refund_policy, pins_affected: upd.changes }
+      metadata: { refund_policy, pins_affected: upd.changes, claims_voided: voidedClaims.length, backstops_activated: activated.length }
     });
 
-    return { affectedPins, pins_affected: upd.changes, moderation_log_id: mlId };
+    return { voidedClaims, pins_affected: upd.changes, cidsToUnpin, activated, moderation_log_id: mlId };
   });
 
-  const { affectedPins, pins_affected, moderation_log_id } = tx.immediate();
-
-  // Build cids_to_unpin list (CIDs with no remaining active pin)
-  const cids_to_unpin = [];
-  const seen = new Set();
-  for (const p of affectedPins) {
-    if (seen.has(p.cid)) continue;
-    seen.add(p.cid);
-    if (!quota.hasActivePinForCid(p.cid)) cids_to_unpin.push(p.cid);
-  }
-
-  return { pins_affected, cids_to_unpin, affected_pin_records: affectedPins, moderation_log_id };
+  const r = tx.immediate();
+  return {
+    voided_claims: r.voidedClaims,
+    pins_affected: r.pins_affected,
+    cids_to_unpin: r.cidsToUnpin,
+    activated: r.activated,
+    refund_policy,
+    moderation_log_id: r.moderation_log_id
+  };
 }
 
 function unbanAccount({ hive_account }) {
@@ -101,13 +121,20 @@ function unbanAccount({ hive_account }) {
 }
 
 /**
- * Takedown a single CID. Marks all active pin records as 'takedown' and adds
- * the CID to the blocklist so it can't be re-uploaded.
- * Returns { pins_affected, moderation_log_id }.
+ * Takedown a single CID — CONTENT kill (cohosting §7). Adds the CID to the
+ * permanent banned-CID registry (blocked at /upload + backstop-pledge so it
+ * cannot reappear under any user), voids the active claim(s) AND the entire
+ * dormant backstop queue, and marks pins 'takedown'. The bytes are always
+ * unpinned by the caller (content kill — no backstop survives).
+ *
+ * Returns { voided_claims, pins_affected, refund_policy, moderation_log_id }.
+ * Refund execution is the CALLER's job (server settles each voided claim: active
+ * host/offender per refund_policy; dormant backstoppers = innocent → full refund).
  */
-function takedownCid({ cid, reason }) {
+function takedownCid({ cid, reason, refund_policy }) {
   if (!cid) throw Object.assign(new Error('cid required'), { code: 'bad_request' });
   if (!reason) throw Object.assign(new Error('reason required'), { code: 'bad_request' });
+  const policy = ['none', 'prorata'].includes(refund_policy) ? refund_policy : DEFAULT_REFUND_POLICY;
   const db = quota.open();
   const tx = db.transaction(() => {
     const t = quota.now();
@@ -116,6 +143,14 @@ function takedownCid({ cid, reason }) {
         (cid, blocked_at, blocked_by, reason, unblocked_at, unblocked_by)
       VALUES (?, ?, ?, ?, NULL, NULL)
     `).run(cid, t, ADMIN_ID, reason);
+
+    // Void the active claim(s) AND the whole dormant backstop queue for the CID.
+    const voidedClaims = db.prepare(
+      "SELECT * FROM claims WHERE cid = ? AND state IN ('active','dormant')"
+    ).all(cid);
+    db.prepare(
+      "UPDATE claims SET state = 'cancelled' WHERE cid = ? AND state IN ('active','dormant')"
+    ).run(cid);
 
     const upd = db.prepare(`
       UPDATE pins SET status = 'takedown', status_changed_at = ?, status_reason = ?
@@ -127,12 +162,18 @@ function takedownCid({ cid, reason }) {
       target_type: 'cid',
       target: cid,
       reason,
-      metadata: { pins_affected: upd.changes }
+      metadata: { pins_affected: upd.changes, claims_voided: voidedClaims.length, refund_policy: policy }
     });
 
-    return { pins_affected: upd.changes, moderation_log_id: mlId };
+    return { voidedClaims, pins_affected: upd.changes, moderation_log_id: mlId, refund_policy: policy };
   });
-  return tx.immediate();
+  const r = tx.immediate();
+  return {
+    voided_claims: r.voidedClaims,
+    pins_affected: r.pins_affected,
+    refund_policy: r.refund_policy,
+    moderation_log_id: r.moderation_log_id
+  };
 }
 
 function untakedownCid({ cid }) {

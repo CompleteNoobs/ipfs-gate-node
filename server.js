@@ -166,45 +166,68 @@ async function verifySignedUserRequest({ account, ts, pubkey, sig, message }) {
  * sent / pending / failed / skipped so the operator can see + retry. Returns a
  * small summary. 'pending' is the key-optional gate path (no IPFS_GATE_ACTIVE_KEY).
  */
-async function settleClaimRefund(claim, reason = 'cancel') {
-  // A DORMANT backstop cancelled before it ever activated gets full escrow back
-  // minus BACKSTOP_CANCEL_FEE_PCT (cohosting §6). An ACTIVE claim gets pro-rata.
-  // (claim is the pre-flip row, so claim.state still reflects what it WAS.)
-  const isDormant = claim.state === 'dormant';
-  const refund = isDormant
-    ? pricing.calculateDormantRefund(claim)
-    : pricing.calculateRefund(claim, Date.now());
-  const effReason = isDormant ? 'dormant_cancel' : reason;
+/**
+ * Record a refund of `amount` to claim.owner in the durable ledger and attempt
+ * the on-chain broadcast. NEVER throws. Returns { amount, status, ... } where
+ * status ∈ sent | pending | failed | skipped. `pending` is the key-optional path
+ * (no IPFS_GATE_ACTIVE_KEY → operator settles manually). Shared by every refund
+ * path (user cancel + admin force-action).
+ */
+async function broadcastRefund(claim, amount, reason) {
   const memo = `ipfs-gate:refund:${claim.claim_id}`;
 
-  if (!refund.amount || refund.amount <= 0) {
+  if (!amount || amount <= 0) {
     quota.recordRefund({
       claim_id: claim.claim_id, to_account: claim.owner, amount: 0,
       currency: claim.currency, memo, status: 'skipped',
-      reason: `${effReason}: nothing refundable (consumed/dust)`
+      reason: `${reason}: nothing refundable (consumed/forfeit/dust)`
     });
     return { amount: 0, status: 'skipped' };
   }
 
   const rec = quota.recordRefund({
-    claim_id: claim.claim_id, to_account: claim.owner, amount: refund.amount,
-    currency: claim.currency, memo, status: 'pending', reason: effReason
+    claim_id: claim.claim_id, to_account: claim.owner, amount,
+    currency: claim.currency, memo, status: 'pending', reason
   });
 
   try {
-    const sent = await hive.sendRefund({ to: claim.owner, amount: refund.amount, currency: claim.currency, memo });
+    const sent = await hive.sendRefund({ to: claim.owner, amount, currency: claim.currency, memo });
     quota.markRefundSettled(rec.refund_id, 'sent', sent.tx_id);
-    return { amount: refund.amount, status: 'sent', tx_id: sent.tx_id, refund_id: rec.refund_id };
+    return { amount, status: 'sent', tx_id: sent.tx_id, refund_id: rec.refund_id };
   } catch (e) {
     if (e.code === 'no_refund_key') {
-      // Leave the row 'pending' — operator settles manually (key-optional gate).
-      console.warn(`[refund] ${rec.refund_id} pending (no escrow key): ${refund.amount} ${claim.currency} → @${claim.owner}`);
-      return { amount: refund.amount, status: 'pending', refund_id: rec.refund_id };
+      console.warn(`[refund] ${rec.refund_id} pending (no escrow key): ${amount} ${claim.currency} → @${claim.owner}`);
+      return { amount, status: 'pending', refund_id: rec.refund_id };
     }
     quota.markRefundSettled(rec.refund_id, 'failed', null);
     console.error(`[refund] ${rec.refund_id} broadcast failed: ${e.message}`);
-    return { amount: refund.amount, status: 'failed', refund_id: rec.refund_id, error: e.message };
+    return { amount, status: 'failed', refund_id: rec.refund_id, error: e.message };
   }
+}
+
+/**
+ * Settle a user-initiated cancel refund. DORMANT backstop → full escrow minus
+ * BACKSTOP_CANCEL_FEE_PCT (cohosting §6); ACTIVE claim → pro-rata. (claim is the
+ * pre-flip row, so claim.state still reflects what it WAS.)
+ */
+async function settleClaimRefund(claim, reason = 'cancel') {
+  const isDormant = claim.state === 'dormant';
+  const amount = isDormant
+    ? pricing.calculateDormantRefund(claim).amount
+    : pricing.calculateRefund(claim, Date.now()).amount;
+  return broadcastRefund(claim, amount, isDormant ? 'dormant_cancel' : reason);
+}
+
+/**
+ * Settle a refund for an ADMIN force-action (cohosting §7). innocent=true (a
+ * CID-ban backstopper) → full escrow no fee; otherwise per refund_policy.
+ */
+async function settleForcedRefund(claim, { policy = 'prorata', innocent = false } = {}) {
+  const amount = pricing.forcedRefundAmount(claim, { policy, innocent });
+  const reason = innocent
+    ? 'admin_void_innocent_backstop'
+    : (policy === 'none' ? 'admin_void_forfeit' : 'admin_void_prorata');
+  return broadcastRefund(claim, amount, reason);
 }
 
 // ─── Rate limiters ──────────────────────────────────────────────────────────
@@ -1093,7 +1116,16 @@ app.post('/admin/ban', requireAdmin, async (req, res) => {
     const { hive_account, reason, refund_policy } = req.body || {};
     const result = moderation.banAccount({ hive_account, reason, refund_policy });
 
-    // Unpin from Kubo (best-effort) for CIDs with no remaining active pin
+    // Settle refunds for the banned user's voided claims — per refund_policy.
+    // The banned user is NOT innocent (cohosting §7), so no full-refund override.
+    const refunds = { sent: 0, pending: 0, failed: 0, skipped: 0 };
+    for (const claim of result.voided_claims) {
+      const r = await settleForcedRefund(claim, { policy: result.refund_policy, innocent: false });
+      refunds[r.status] = (refunds[r.status] || 0) + 1;
+    }
+
+    // Unpin from Kubo (best-effort) for CIDs with no funder left (no other user's
+    // backstop took the baton).
     let unpinned = 0;
     for (const cid of result.cids_to_unpin) {
       try {
@@ -1107,15 +1139,13 @@ app.post('/admin/ban', requireAdmin, async (req, res) => {
       try { await kubo.gc(); } catch (e) { /* best-effort */ }
     }
 
-    // Refunds — v0.1 stub. refund_policy='prorata' is recorded but not auto-executed.
-    // Operator must do manual refunds + POST /admin/log-refund.
     res.json({
-      banned: hive_account.toLowerCase(),
+      banned: String(hive_account).toLowerCase(),
       pins_affected: result.pins_affected,
+      claims_voided: result.voided_claims.length,
+      backstops_activated: result.activated.length,
       cids_unpinned: unpinned,
-      refunds_issued: 0,
-      refunds_failed: 0,
-      refunds_pending: refund_policy === 'prorata' ? result.pins_affected : 0,
+      refunds,
       moderation_log_id: result.moderation_log_id
     });
   } catch (e) {
@@ -1135,8 +1165,21 @@ app.post('/admin/unban', requireAdmin, (req, res) => {
 
 app.post('/admin/takedown', requireAdmin, async (req, res) => {
   try {
-    const { cid, reason } = req.body || {};
-    const result = moderation.takedownCid({ cid, reason });
+    const { cid, reason, refund_policy } = req.body || {};
+    const result = moderation.takedownCid({ cid, reason, refund_policy });
+
+    // Settle refunds (cohosting §7): dormant backstoppers are INNOCENT third
+    // parties → full escrow, no fee; the active host/offender follows refund_policy.
+    const refunds = { sent: 0, pending: 0, failed: 0, skipped: 0 };
+    let backstoppers_refunded = 0;
+    for (const claim of result.voided_claims) {
+      const innocent = claim.state === 'dormant';
+      if (innocent) backstoppers_refunded++;
+      const r = await settleForcedRefund(claim, { policy: result.refund_policy, innocent });
+      refunds[r.status] = (refunds[r.status] || 0) + 1;
+    }
+
+    // Content kill — always unpin (the whole queue was voided; no backstop survives).
     let unpinned = false;
     try {
       await kubo.unpin(cid);
@@ -1148,6 +1191,10 @@ app.post('/admin/takedown', requireAdmin, async (req, res) => {
     res.json({
       cid,
       pins_affected: result.pins_affected,
+      claims_voided: result.voided_claims.length,
+      backstoppers_refunded,
+      refund_policy: result.refund_policy,
+      refunds,
       unpinned_from_kubo: unpinned,
       moderation_log_id: result.moderation_log_id
     });
