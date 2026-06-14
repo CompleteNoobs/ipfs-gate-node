@@ -167,21 +167,28 @@ async function verifySignedUserRequest({ account, ts, pubkey, sig, message }) {
  * small summary. 'pending' is the key-optional gate path (no IPFS_GATE_ACTIVE_KEY).
  */
 async function settleClaimRefund(claim, reason = 'cancel') {
-  const refund = pricing.calculateRefund(claim, Date.now());
+  // A DORMANT backstop cancelled before it ever activated gets full escrow back
+  // minus BACKSTOP_CANCEL_FEE_PCT (cohosting §6). An ACTIVE claim gets pro-rata.
+  // (claim is the pre-flip row, so claim.state still reflects what it WAS.)
+  const isDormant = claim.state === 'dormant';
+  const refund = isDormant
+    ? pricing.calculateDormantRefund(claim)
+    : pricing.calculateRefund(claim, Date.now());
+  const effReason = isDormant ? 'dormant_cancel' : reason;
   const memo = `ipfs-gate:refund:${claim.claim_id}`;
 
   if (!refund.amount || refund.amount <= 0) {
     quota.recordRefund({
       claim_id: claim.claim_id, to_account: claim.owner, amount: 0,
       currency: claim.currency, memo, status: 'skipped',
-      reason: `${reason}: nothing refundable (consumed/dust)`
+      reason: `${effReason}: nothing refundable (consumed/dust)`
     });
-    return { amount: 0, status: 'skipped', hours_refunded: refund.hours_refunded };
+    return { amount: 0, status: 'skipped' };
   }
 
   const rec = quota.recordRefund({
     claim_id: claim.claim_id, to_account: claim.owner, amount: refund.amount,
-    currency: claim.currency, memo, status: 'pending', reason
+    currency: claim.currency, memo, status: 'pending', reason: effReason
   });
 
   try {
@@ -733,7 +740,7 @@ app.post('/uploads/delete', userApiLimiter, async (req, res) => {
         removed++;
         if (r.fully_unpinned) fullyUnpinned = true;
         const refund = await settleClaimRefund(r.claim, 'user_deleted');
-        refunds.push({ claim_id: c.claim_id, ...refund });
+        refunds.push({ claim_id: c.claim_id, activated_backstop: r.activated || null, ...refund });
       }
     } else {
       const result = quota.removePinForUploader(cid, account);
@@ -785,8 +792,10 @@ app.post('/claims/cancel', userApiLimiter, async (req, res) => {
     await verifySignedUserRequest({ account, ts, pubkey, sig, message });
 
     // Atomic, status-locked cancel (quota.cancelClaim) — only one cancel wins, so
-    // the refund settled below can't double-pay on a concurrent cancel.
-    const { claim, fully_unpinned } = quota.cancelClaim(claim_id, account);
+    // the refund settled below can't double-pay on a concurrent cancel. Cancelling
+    // an ACTIVE claim may promote a queued backstop (FIFO) instead of unpinning;
+    // cancelling a DORMANT backstop just voids the pledge (escrow-minus-fee refund).
+    const { claim, fully_unpinned, activated, was_dormant } = quota.cancelClaim(claim_id, account);
     const refund = await settleClaimRefund(claim, 'cancel');
 
     if (fully_unpinned) {
@@ -798,7 +807,280 @@ app.post('/claims/cancel', userApiLimiter, async (req, res) => {
       }
     }
 
-    res.json({ ok: true, claim_id, cid: claim.cid, fully_unpinned, refund });
+    res.json({
+      ok: true, claim_id, cid: claim.cid,
+      was_dormant: !!was_dormant,
+      fully_unpinned,
+      activated_backstop: activated || null,
+      refund
+    });
+  } catch (e) {
+    return handleError(res, e);
+  }
+});
+
+// ─── Backstop (co-hosting safety-net) ────────────────────────────────────────
+// A backstop is a prepaid, dormant claim on an already-hosted CID that activates
+// (FIFO) only if the file would otherwise be deleted (cohosting-backstop.md). It
+// adds no bytes (leans on the existing copy), so it needs no disk reservation —
+// just pay into escrow and the gate records the dormant claim. Replay-guarded by
+// payments.tx_id UNIQUE (no reservation needed). The pledger pays into escrow now;
+// the escrow is consumed only across the stretch the backstop is the live host.
+
+/**
+ * GET /backstop/quote?cid=<cid>&hours=<h>&copies=<c>
+ * Quote the cost to backstop an already-hosted CID. Pay this amount to
+ * payment.escrow_account with payment.memo, then POST /backstop/pledge.
+ */
+app.get('/backstop/quote', userApiLimiter, (req, res) => {
+  try {
+    const cid = String(req.query.cid || '');
+    const hours = (req.query.hours === undefined) ? DEFAULT_HOURS : Number(req.query.hours);
+    const copies = (req.query.copies === undefined) ? 1 : Number(req.query.copies);
+    if (!cid) return respondError(res, 'bad_request', 'cid required');
+    if (quota.isCidBlocked(cid)) return respondError(res, 'legal_takedown', 'this CID is blocked on this server');
+
+    const active = quota.getActivePinsForCid(cid);
+    if (active.length === 0) {
+      return respondError(res, 'not_found', 'CID is not currently hosted here — you can only backstop a live file');
+    }
+    const sizeBytes = active[0].size_bytes;
+    const quote = pricing.calculateCost({ sizeBytes, hoursRequested: hours, copies });
+
+    res.json({
+      cid,
+      mode: 'backstop',
+      payment: {
+        currency: PAYMENT_CURRENCY,
+        amount: String(quote.total),
+        escrow_account: IPFS_GATE_HIVE_ACCOUNT,
+        memo: `ipfs-gate:backstop:${cid}`
+      },
+      quote: {
+        billable_mb: quote.billable_mb,
+        billable_hrs: quote.billable_hrs,
+        copies: quote.copies,
+        rate_per_mb_hour: quote.rate,
+        total: quote.total,
+        currency: PAYMENT_CURRENCY
+      },
+      queue_depth: quota.getDormantBackstopsForCid(cid).length
+    });
+  } catch (e) {
+    return handleError(res, e);
+  }
+});
+
+/**
+ * POST /backstop/pledge
+ * Body: { pledger, cid, hours_requested?, copies?, tx_id }
+ * Verifies the on-chain escrow payment (memo ipfs-gate:backstop:<cid>, sender =
+ * pledger, amount ≥ quote) and records a DORMANT backstop claim. It activates
+ * automatically (FIFO) when the CID's last active claim ends.
+ */
+app.post('/backstop/pledge', uploadLimiter, async (req, res) => {
+  try {
+    const { pledger, cid, tx_id } = req.body || {};
+    const hours = (req.body && req.body.hours_requested === undefined) ? DEFAULT_HOURS : Number(req.body.hours_requested);
+    const copies = (req.body && req.body.copies === undefined) ? 1 : Number(req.body.copies);
+    if (typeof pledger !== 'string' || !pledger || typeof cid !== 'string' || !cid || !tx_id) {
+      return respondError(res, 'bad_request', 'pledger, cid, tx_id required');
+    }
+    const account = pledger.toLowerCase();
+    if (quota.isAccountBanned(account)) return respondError(res, 'forbidden', 'pledger is banned');
+    if (quota.isCidBlocked(cid)) return respondError(res, 'legal_takedown', 'this CID is blocked on this server');
+
+    const active = quota.getActivePinsForCid(cid);
+    if (active.length === 0) {
+      return respondError(res, 'not_found', 'CID is not currently hosted here — you can only backstop a live file');
+    }
+    const sizeBytes = active[0].size_bytes;
+    const quote = pricing.calculateCost({ sizeBytes, hoursRequested: hours, copies });
+
+    if (quota.getPaymentByTxId(tx_id)) return respondError(res, 'conflict', 'tx_id already used');
+
+    const expectedMemo = `ipfs-gate:backstop:${cid}`;
+    let payResult;
+    try {
+      payResult = await hive.verifyPayment({ tx_id, sender: account, expectedMemo, expectedAmount: quote.total });
+    } catch (e) {
+      return handleError(res, e, 'unprocessable_entity');
+    }
+
+    let sc;
+    try {
+      sc = await hive.verifyHiveEngineSidechain(tx_id);
+    } catch (e) {
+      return respondError(res, 'unprocessable_entity', `Hive-Engine sidechain unreachable: ${e.message}`);
+    }
+    if (sc.confirmed === false) {
+      const detail = sc.reason === 'rejected'
+        ? ((sc.errors || []).join('; ') || 'sidechain rejected the transfer')
+        : 'sidechain did not confirm within the retry budget — try again in ~30s';
+      return respondError(res, 'unprocessable_entity', `Hive-Engine did not confirm: ${detail}`);
+    }
+
+    let payment;
+    try {
+      payment = quota.recordPayment({
+        tx_id, reservation_id: null, uploader: account,
+        currency: payResult.currency, amount: payResult.paid,
+        memo: expectedMemo, block_num: payResult.block_num, status: 'confirmed'
+      });
+    } catch (e) {
+      return handleError(res, e);
+    }
+
+    // Dormant claim: no pin, placeholder start/expiry (set on activation).
+    const tnow = quota.now();
+    const claim = quota.createOrderWithClaim({
+      cid, owner: account, pinId: null, paymentId: payment.id,
+      sizeBytes, sizeMB: quote.billable_mb, rateLocked: pricing.RATE_PER_MB_HOUR,
+      paidHours: quote.billable_hrs, copies: quote.copies,
+      amountPaid: payResult.paid, currency: payResult.currency,
+      startTs: tnow, expiryTs: tnow,
+      kind: 'backstop', state: 'dormant'
+    });
+
+    const queue = quota.getDormantBackstopsForCid(cid).map(c => c.claim_id);
+    res.json({
+      ok: true, claim_id: claim.claim_id, cid, kind: 'backstop', state: 'dormant',
+      pledged_hours: quote.billable_hrs, copies: quote.copies,
+      amount_escrowed: payResult.paid, currency: payResult.currency,
+      queue_position: queue.indexOf(claim.claim_id) + 1, queue_depth: queue.length
+    });
+  } catch (e) {
+    return handleError(res, e);
+  }
+});
+
+/**
+ * GET /backstop/queue?cid=<cid>
+ * Public during testing (cohosting §9) — shows the active funder + the FIFO
+ * backstop queue (identities + amounts) for debug visibility.
+ */
+app.get('/backstop/queue', (req, res) => {
+  try {
+    const cid = String(req.query.cid || '');
+    if (!cid) return respondError(res, 'bad_request', 'cid required');
+    const active = quota.getActiveClaimsForCid(cid).map(c => ({
+      claim_id: c.claim_id, owner: c.owner, kind: c.kind,
+      paid_hours: c.paid_hours, expires_at: isoFromMs(c.expiry_ts)
+    }));
+    const dormant = quota.getDormantBackstopsForCid(cid).map((c, i) => ({
+      position: i + 1, claim_id: c.claim_id, owner: c.owner,
+      pledged_hours: c.paid_hours, amount_escrowed: c.amount_paid, currency: c.currency
+    }));
+    res.json({
+      cid,
+      active,
+      backstop_queue: dormant,
+      total_pledged_hours: dormant.reduce((s, c) => s + c.pledged_hours, 0)
+    });
+  } catch (e) {
+    return handleError(res, e);
+  }
+});
+
+// ─── Extend / top-up (cohosting §8) ──────────────────────────────────────────
+// A live host pays more to push their OWN expiry_ts out, billed at the claim's
+// rate_locked (never the live rate). No new claim — just more hours.
+
+/**
+ * GET /claims/extend/quote?claim_id=<id>&hours=<h>
+ * Quote extra hours at the claim's locked rate. Pay then POST /claims/extend.
+ */
+app.get('/claims/extend/quote', userApiLimiter, (req, res) => {
+  try {
+    const claimId = String(req.query.claim_id || '');
+    const hours = (req.query.hours === undefined) ? 0 : Number(req.query.hours);
+    if (!claimId) return respondError(res, 'bad_request', 'claim_id required');
+    const claim = quota.getClaim(claimId);
+    if (!claim) return respondError(res, 'not_found', 'claim not found');
+    if (claim.state !== 'active') return respondError(res, 'conflict', `claim is ${claim.state}; only active claims can be extended`);
+
+    let extraHrs;
+    try { extraHrs = pricing.billableHours(hours); } catch (e) { return handleError(res, e); }
+    const cost = pricing.roundCoins(claim.size_mb * extraHrs * claim.rate_locked * claim.copies_requested);
+
+    res.json({
+      claim_id: claimId,
+      payment: {
+        currency: claim.currency,
+        amount: String(cost),
+        escrow_account: IPFS_GATE_HIVE_ACCOUNT,
+        memo: `ipfs-gate:extend:${claimId}`
+      },
+      quote: {
+        billable_mb: claim.size_mb, extra_hrs: extraHrs, copies: claim.copies_requested,
+        rate_per_mb_hour: claim.rate_locked, total: cost, currency: claim.currency
+      }
+    });
+  } catch (e) {
+    return handleError(res, e);
+  }
+});
+
+/**
+ * POST /claims/extend
+ * Body: { claim_id, extra_hours, tx_id }
+ * Verifies the escrow payment (memo ipfs-gate:extend:<claim_id>, sender = the
+ * claim owner, amount ≥ quote at rate_locked) and pushes paid_hours + expiry_ts.
+ */
+app.post('/claims/extend', uploadLimiter, async (req, res) => {
+  try {
+    const { claim_id, tx_id } = req.body || {};
+    if (typeof claim_id !== 'string' || !claim_id || !tx_id) {
+      return respondError(res, 'bad_request', 'claim_id, extra_hours, tx_id required');
+    }
+    let extraHrs;
+    try { extraHrs = pricing.billableHours(req.body && req.body.extra_hours); } catch (e) { return handleError(res, e); }
+
+    const claim = quota.getClaim(claim_id);
+    if (!claim) return respondError(res, 'not_found', 'claim not found');
+    if (claim.state !== 'active') return respondError(res, 'conflict', `claim is ${claim.state}; only active claims can be extended`);
+    if (quota.isCidBlocked(claim.cid)) return respondError(res, 'legal_takedown', 'this CID is blocked on this server');
+
+    const cost = pricing.roundCoins(claim.size_mb * extraHrs * claim.rate_locked * claim.copies_requested);
+    if (quota.getPaymentByTxId(tx_id)) return respondError(res, 'conflict', 'tx_id already used');
+
+    const expectedMemo = `ipfs-gate:extend:${claim_id}`;
+    let payResult;
+    try {
+      payResult = await hive.verifyPayment({ tx_id, sender: claim.owner, expectedMemo, expectedAmount: cost });
+    } catch (e) {
+      return handleError(res, e, 'unprocessable_entity');
+    }
+
+    let sc;
+    try {
+      sc = await hive.verifyHiveEngineSidechain(tx_id);
+    } catch (e) {
+      return respondError(res, 'unprocessable_entity', `Hive-Engine sidechain unreachable: ${e.message}`);
+    }
+    if (sc.confirmed === false) {
+      const detail = sc.reason === 'rejected'
+        ? ((sc.errors || []).join('; ') || 'sidechain rejected the transfer')
+        : 'sidechain did not confirm within the retry budget — try again in ~30s';
+      return respondError(res, 'unprocessable_entity', `Hive-Engine did not confirm: ${detail}`);
+    }
+
+    try {
+      quota.recordPayment({
+        tx_id, reservation_id: null, uploader: claim.owner,
+        currency: payResult.currency, amount: payResult.paid,
+        memo: expectedMemo, block_num: payResult.block_num, status: 'confirmed'
+      });
+    } catch (e) {
+      return handleError(res, e);
+    }
+
+    const updated = quota.extendClaim(claim_id, claim.owner, extraHrs);
+    res.json({
+      ok: true, claim_id, added_hours: extraHrs,
+      paid_hours: updated.paid_hours, expires_at: isoFromMs(updated.expiry_ts),
+      amount_paid: payResult.paid, currency: payResult.currency
+    });
   } catch (e) {
     return handleError(res, e);
   }

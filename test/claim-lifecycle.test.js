@@ -153,7 +153,7 @@ test('cancelClaim guards: not found / wrong owner / double cancel', () => {
   assert.throws(() => quota.cancelClaim(claim_id, 'mallory'), /not your claim/);
 
   quota.cancelClaim(claim_id, 'eve');                                   // first cancel wins
-  assert.throws(() => quota.cancelClaim(claim_id, 'eve'), /not active|already closed/);  // second is rejected
+  assert.throws(() => quota.cancelClaim(claim_id, 'eve'), /cannot cancel|already closed/);  // second is rejected
 });
 
 test('refund ledger records pending then settles sent', () => {
