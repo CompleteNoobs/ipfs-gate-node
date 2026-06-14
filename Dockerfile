@@ -10,8 +10,13 @@ WORKDIR /app
 COPY package.json package-lock.json* ./
 RUN npm ci --omit=dev
 
-# App sources
-COPY server.js quota.js hive-verify.js envelope.js moderation.js sweeper.js ./
+# App sources.
+# Use a glob, NOT a hardcoded file list: an explicit list silently dropped
+# pricing.js (Stage 1a) + release-policy.js (Stage 3) from the image, so the new
+# server.js crash-looped on `Cannot find module './pricing'` → nginx 502. Globbing
+# every top-level module means future stages (Stage 6+) ship automatically.
+# (test/ is a subdir → not matched by *.js, so tests don't bloat the image.)
+COPY *.js ./
 COPY backends ./backends
 COPY migrations ./migrations
 
