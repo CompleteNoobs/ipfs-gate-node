@@ -17,6 +17,7 @@ const moderation = require('./moderation');
 const sweeper = require('./sweeper');
 const kubo = require('./backends/kubo');
 const pricing = require('./pricing');
+const releaseAuth = require('./release-policy');
 
 // ─── Config ─────────────────────────────────────────────────────────────────
 
@@ -285,7 +286,11 @@ app.get('/', (req, res) => {
       rate_per_mb_hour: pricing.RATE_PER_MB_HOUR,
       min_hours: pricing.MIN_HOURS,
       mb_divisor: pricing.MB_DIVISOR,
-      node_count: pricing.NODE_COUNT
+      node_count: pricing.getNodeCount(),
+      // copies selector range the gate offers (1..node_count) + the Cluster
+      // self-heal leeway. node_count=1 → backstop is the only co-host option.
+      copies_max: pricing.getNodeCount(),
+      replication_leeway: pricing.REPLICATION_LEEWAY
     },
     features: { public_uploads: true, uploads_tab: true, claim_model: true }
   });
@@ -350,6 +355,12 @@ app.post('/reserve', reserveLimiter, (req, res) => {
         billable_mb: quote.billable_mb,
         billable_hrs: quote.billable_hrs,
         copies: quote.copies,
+        // honest surfacing: if the client asked for more copies than the gate has
+        // nodes, the granted `copies` is capped — don't let that be silent.
+        copies_requested: Math.max(1, Math.floor(copiesRequested) || 1),
+        copies_capped: quote.copies < Math.max(1, Math.floor(copiesRequested) || 1),
+        node_count: pricing.getNodeCount(),
+        replication: pricing.replicationConfig(quote.copies),
         rate_per_mb_hour: quote.rate,
         total: quote.total,
         currency: PAYMENT_CURRENCY
@@ -414,6 +425,17 @@ app.post('/upload', uploadLimiter, upload.single('ciphertext'), async (req, res)
         return respondError(res, 'bad_request', 'public upload requires a valid `mime` field');
       }
       mime = claimedMime.toLowerCase();
+    }
+
+    // 1c. Optional release-authority policy (Stage 3). Validated up-front so a bad
+    //     policy is rejected before any payment work. Defaults to owner_only.
+    let releasePolicyObj = null;
+    if (req.body && req.body.release_policy) {
+      let parsed;
+      try { parsed = JSON.parse(req.body.release_policy); }
+      catch (e) { return respondError(res, 'bad_request', 'release_policy must be valid JSON'); }
+      try { releasePolicyObj = releaseAuth.normalizeReleasePolicy(parsed); }
+      catch (e) { return handleError(res, e); }
     }
 
     // 2. Banned-account check (banlist could've been added between reserve and upload)
@@ -566,7 +588,8 @@ app.post('/upload', uploadLimiter, upload.single('ciphertext'), async (req, res)
       amountPaid: payResult.paid,
       currency: payResult.currency,
       startTs,
-      expiryTs
+      expiryTs,
+      releasePolicy: releasePolicyObj
     });
 
     // 11. Dedup info (was there already an active pin for this CID before us?)
@@ -842,6 +865,90 @@ app.post('/claims/cancel', userApiLimiter, async (req, res) => {
   }
 });
 
+/**
+ * POST /claims/release  (signed user request — Hive posting-key auth)
+ * Body: { order_id, hive_account, ts (unix seconds), pubkey, sig }
+ * Signed message: ipfs-gate:release:v1:<order_id>:<hive_account>:<ts>
+ * A recipient (or the owner) consents to stop hosting. When the order's
+ * release_policy threshold is met (owner override / any_of / all_of), the order's
+ * active claim is ENDED → pro-rata refund to the owner → the §5 lifecycle runs
+ * (release ≠ deletion: a queued backstop still takes the baton).
+ */
+app.post('/claims/release', userApiLimiter, async (req, res) => {
+  try {
+    const { order_id } = req.body || {};
+    const account = String((req.body && req.body.hive_account) || '').toLowerCase();
+    const ts = req.body && req.body.ts;
+    const pubkey = req.body && req.body.pubkey;
+    const sig = req.body && req.body.sig;
+
+    if (typeof order_id !== 'string' || !order_id) {
+      return respondError(res, 'bad_request', 'order_id required');
+    }
+
+    const message = `ipfs-gate:release:v1:${order_id}:${account}:${ts}`;
+    await verifySignedUserRequest({ account, ts, pubkey, sig, message });
+
+    const order = quota.getOrder(order_id);
+    if (!order) return respondError(res, 'not_found', 'order not found');
+
+    let policy;
+    try { policy = JSON.parse(order.release_policy); } catch (e) { policy = { type: 'owner_only' }; }
+
+    const consented = quota.getReleaseConsents(order_id);
+    let decision;
+    try {
+      decision = releaseAuth.evaluateRelease({ policy, owner: order.owner, releaser: account, consented });
+    } catch (e) {
+      return handleError(res, e);
+    }
+
+    if (!decision.authorized) {
+      return respondError(res, 'forbidden', `@${account} is not authorised to release this order under its ${policy.type} policy`);
+    }
+    if (decision.records_consent) {
+      quota.recordReleaseConsent(order_id, account, sig);
+    }
+
+    // all_of still waiting for the rest of the set
+    if (!decision.ends) {
+      const addresses = (policy.addresses || []).map(a => String(a).toLowerCase());
+      const have = quota.getReleaseConsents(order_id);
+      return res.json({
+        ok: true, order_id, released: false, policy_type: policy.type,
+        consents: have, needed: addresses.length,
+        got: have.filter(a => addresses.includes(a)).length
+      });
+    }
+
+    // Threshold met → end the order's active claim (idempotent if already closed).
+    const activeClaim = quota.getActiveClaimForOrder(order_id);
+    if (!activeClaim) {
+      return res.json({ ok: true, order_id, released: true, ended: false, note: 'no active claim to end (already closed)' });
+    }
+
+    const { claim, fully_unpinned, activated } = quota.endActiveClaimForRelease(activeClaim.claim_id);
+    const refund = await settleClaimRefund(claim, 'released');
+
+    if (fully_unpinned) {
+      try {
+        await kubo.unpin(claim.cid);
+        await kubo.gc();
+      } catch (e) {
+        console.warn(`[claims/release] kubo unpin/gc failed for ${claim.cid}: ${e.message}`);
+      }
+    }
+
+    res.json({
+      ok: true, order_id, released: true, ended: true,
+      claim_id: claim.claim_id, cid: claim.cid, policy_type: policy.type,
+      fully_unpinned, activated_backstop: activated || null, refund
+    });
+  } catch (e) {
+    return handleError(res, e);
+  }
+});
+
 // ─── Backstop (co-hosting safety-net) ────────────────────────────────────────
 // A backstop is a prepaid, dormant claim on an already-hosted CID that activates
 // (FIFO) only if the file would otherwise be deleted (cohosting-backstop.md). It
@@ -883,6 +990,10 @@ app.get('/backstop/quote', userApiLimiter, (req, res) => {
         billable_mb: quote.billable_mb,
         billable_hrs: quote.billable_hrs,
         copies: quote.copies,
+        copies_requested: Math.max(1, Math.floor(copies) || 1),
+        copies_capped: quote.copies < Math.max(1, Math.floor(copies) || 1),
+        node_count: pricing.getNodeCount(),
+        replication: pricing.replicationConfig(quote.copies),
         rate_per_mb_hour: quote.rate,
         total: quote.total,
         currency: PAYMENT_CURRENCY
