@@ -1,12 +1,21 @@
 # ipfs-gate — Roadmap & Status
 
-> Updated 2026-05-26. Source of truth: this file + [CLAUDE.md](CLAUDE.md).
+> ⚠️ **Proof of concept — not for real use.** ipfs-gate (with sister projects [v4call](https://github.com/CompleteNoobs/v4call) and [nGate](https://github.com/CompleteNoobs/nGate)) is a **concept design build by independent builders** — not production software. Not safe to use, not recommended for general users; for developers reviewing the code who accept the risks. Treat it as a demo.
+
+> Updated 2026-06-14. Source of truth: this file + [CLAUDE.md](CLAUDE.md).
 > Full design history + reasoning lives in the brainstorm scratchpad at
 > `/home/noob/.claude/plans/question-i-have-you-groovy-hickey.md`.
+>
+> **Companion design docs (the current path — read these, not the old model):**
+> - [PRICING-V1-DESIGN-NOTES.md](PRICING-V1-DESIGN-NOTES.md) — **current** pricing model (claim-based, MB-hour). DESIGN LOCKED. Supersedes the archived two-part-tariff design.
+> - [ipfs-gate-cohosting-backstop.md](ipfs-gate-cohosting-backstop.md) — **current** co-hosting / backstop / refund / moderation model (the lifecycle that pricing sits on). DESIGN LOCKED.
+> - [IPFS-Gate-Scale-Plan.md](IPFS-Gate-Scale-Plan.md) — how the gate scales (Kubernetes is the chosen path for the concept build).
+> - `v4call-ipfs-gate-build-handover.md` — the Private Encrypted Hosting v1 → v2 build handover (source for the current direction below).
+> - [Archive.PRICING-V0.3-DESIGN-NOTES.md](Archive.PRICING-V0.3-DESIGN-NOTES.md) — ⚠️ **ARCHIVED / superseded** (two-part tariff + prepaid balance + token discount; never built). Kept for history only — **do not build from it**; ideas partly carried forward as optional later layers (see PRICING-V1 §11).
 
 ## Current status
 
-**v0.1.3 in production + v4call client integration complete.** Live at `https://ipfs.completenoobs.com/`. First end-to-end paid encrypted upload landed 2026-05-25. Sub-revisions:
+**v0.1.3 in production + first-client (v4call) integration complete and extended well past the original scope.** Live at `https://ipfs.completenoobs.com/`. First end-to-end paid encrypted upload landed 2026-05-25. Since then the v4call client grew multi-format attachments, DM attachments, public/plaintext upload-and-share, an uploads-management tab, and a Pinata bring-your-own storage backend (all on the v4call side — see "v4call integration — COMPLETE" below). **Next direction: Private Encrypted Hosting v1** (claim/order/pricing/release/proof-of-receipt — see "Current direction" below). Sub-revisions:
 
 | Version | Date | What |
 |---|---|---|
@@ -36,44 +45,84 @@ Seven real-deploy bugs found + fixed (all folded into `WalkThrough.wiki` Common 
 
 Plus two operator gotchas: leftover sweeper-test TTL of `0.001` masquerading as a pin-not-working bug, and `git reset --hard` clobbering operator-edited `nginx/ipfs-gate.conf` (workaround: backup before reset). Both documented.
 
-## 🎯 PREVIOUS MILESTONE (COMPLETE) — v4call client integration
+## ✅ v4call integration — COMPLETE (and extended)
 
-**This is the actual next work**, not another ipfs-gate version. Lives in the v4call repo, not here.
+The first-client integration shipped, then kept growing on the v4call side. All of the following are **done** (code lives in the v4call repo, `public/app.html`, not here):
 
-### Scope
-Add the sender + recipient UX in `~/CAI/v4call/public/index.html`:
+- **Encrypted room attachments** (v4call v0.16.16) — the original 📎 sender modal + recipient bubble + bystander view + away-notifications + history replay. jpeg-only at first.
+- **Multi-format attachments** (v4call v0.16.17–v0.16.24) — 15 MIME types across image / audio / video / pdf / text / archive; per-kind inline renderers; dynamic gate-advertised size cap; **DM attachments** (`dm-attachment*`); cross-server room attachments.
+- **Public / plaintext upload-and-share** (v4call v0.16.25) — the gate's `mode: 'public'` path (plaintext bytes + claimed MIME, served with `nosniff` + html/svg forced to download), shareable `GET /ipfs/<cid>` link. Gate feature flags: `public_uploads: true, uploads_tab: true` (see `GET /`).
+- **Uploads-management tab** (v4call v0.16.25) — signed `GET /uploads/by-user` + `POST /uploads/delete` (posting-key `signRaw`, `get_accounts` posting-auth membership check), gate-authoritative list + quota.
+- **Pinata bring-your-own backend** (v4call v0.16.26) — client-side alternative storage credential; bypasses the gate's pay→pin path entirely (orthogonal to gate pricing).
 
-**Sender side (in a v4call room):**
-- 📎 button in room chat header → opens upload modal
-- File picker (jpeg only for v0.1)
-- Recipient checkbox list of current room members (sender auto-included)
-- ipfs-gate URL picker with default + alternatives + custom-entry option
-- Cost preview ("≈ 1 CNOOBS for 7 days")
-- "🔒 Encrypt & Upload" button + optional "⚠ Upload Unencrypted (public)" with confirmation gate
-- Browser-side: AES-GCM encryption + per-recipient hivecrypt envelopes → POST `/reserve` → Hive Keychain `requestCustomJson` for CNOOBS transfer → POST `/upload`
-- On success: emit `room-attachment` socket event to v4call server
-
-**Recipient side (in a v4call room):**
-- `room-attachment` socket event handler in `public/index.html`
-- Inline chat bubble: sender + sig ✓ + size + expiry countdown
-- Auto-fetch ciphertext from `gateway_hint` + decrypt with own posting key
-- Render image thumbnail inline (jpeg only for v0.1)
-- Save-to-device button (Blob URL + anchor download)
-- Bystander view (locked bubble for room members not in per_recipient list)
-- Error states: bad sig / decryption fail / 404 from gateway / TTL expired
-
-**Server side (v4call):**
-- ~30 lines: route `room-attachment` events to room members (inherits existing room broadcast infrastructure)
+> The gate side that backs all this is **v0.1.3** plus the public-mode + uploads endpoints already in `server.js`. No further *gate version* was cut for the integration; the growth was client-side.
 
 ### Reference docs for the integration
-- `~/CAI/IPFS-Gate/CLAUDE.md` — wire format spec (inner blob + outer envelope), API endpoint shapes, signature canonical messages
-- `/home/noob/.claude/plans/question-i-have-you-groovy-hickey.md` — full design rationale for the recipient UX, the two-signature scheme, the dedup model, etc. Recipient UX section has the chat-bubble mockups.
-- `~/CAI/IPFS-Gate/envelope.js` — canonical-message helpers ready to be ported to browser JS for client-side use (`buildUploadProofMessage`, `buildEnvelopeSigInput`, etc.)
+- `CLAUDE.md` — wire format spec (inner blob + outer envelope), API endpoint shapes, signature canonical messages
+- `/home/noob/.claude/plans/question-i-have-you-groovy-hickey.md` — full design rationale for the recipient UX, the two-signature scheme, the dedup model
+- `envelope.js` — canonical-message helpers (`buildUploadProofMessage`, `buildEnvelopeSigInput`, …)
 
-### Estimated scope
-- ~200 lines client (HTML + CSS + sender modal + recipient bubble + handlers)
-- ~30 lines server (envelope routing — mostly inherits existing room broadcast pattern)
-- One focused session
+---
+
+## 🎯 CURRENT DIRECTION — Private Encrypted Hosting v1 (claim model)
+
+**The next real build**, per `v4call-ipfs-gate-build-handover.md`. Turns ipfs-gate
+from "pay-per-upload pinning" into **private file sharing with pay-per-use,
+user-controlled hosting**: foo encrypts a file to specific people's Hive keys,
+pays the gate to host it for a chosen time, recipients can prove receipt and
+(by policy) trigger early stop-hosting + refund. Privacy comes from
+**encryption, not hosting** (anyone can fetch the ciphertext; only wrapped Hive
+keys decrypt).
+
+**Guiding principle:** *v1 is the simplest case of v2.* One gate / one owner /
+one copy = federation with the numbers set to 1. Build the general shapes
+(order, claim, copies, rate-locked) now with trivial local values; v2
+(cross-operator federation) bolts on later instead of forcing a rewrite.
+
+### What's new vs what exists
+| Piece | State |
+|---|---|
+| Pinning, gateway, payment-verify, sweeper, moderation | ✅ exists (v0.1.3) |
+| Public + encrypted upload modes, uploads endpoints | ✅ exists |
+| **Claim + order schema** (with `kind`/`state` + v2 seams) | ❌ greenfield |
+| **Claim-based pricing engine** (MB-hour, decimal) | ❌ greenfield — see [PRICING-V1-DESIGN-NOTES.md](PRICING-V1-DESIGN-NOTES.md) |
+| **Backstop safety-net** (prepaid escrow, FIFO baton, refund) | ❌ greenfield — see [ipfs-gate-cohosting-backstop.md](ipfs-gate-cohosting-backstop.md) |
+| **Extend / top-up** an active claim | ❌ greenfield (now **in v1**) |
+| **Replication dial** (copies, capped at **live** `node_count`) | ❌ greenfield |
+| **Moderation × claims/escrow** (CID ban vs user ban, refund split) | ⚠️ moderation exists; the *interaction* is greenfield |
+| **Release authority** (owner_only / any_of / all_of) | ❌ greenfield |
+| **Encrypted multi-recipient upload / Reveal flow** (v4call) | ❌ greenfield |
+| **Proof-of-receipt** (per-recipient early-release rights) | ❌ greenfield |
+
+### Staged build plan (test one stage before the next)
+Stages 1–3 are pure gate backend (no UI, testable in isolation — safest start);
+Stages 4–6 are v4call-side, each adding one small gate endpoint.
+
+- **Stage 0 — Verify baseline.** Confirm pinning works, the v4call upload UI exists, and current Hive Keychain encode/decode/sign method names (`requestEncodeWithKeys` / decode / `requestSignBuffer`) against the live Keychain API *before* coding crypto. Output: a confirmed/flagged checklist.
+- **Stage 1a — Claim + pricing engine (gate).** Claim/order schema with v2 seams + `kind`/`state` fields; `calculateCost` (decimal MB-hour × copies, capped at live `node_count`); escrow; expiry sweep as target→reconcile; **last-claim unpin**; pro-rata refund-on-cancel for the single active claim. *Test: an active claim expires vs cancels; assert pro-rata refund + correct unpin timing.*
+- **Stage 1b — Backstop, escrow & extend (gate).** `kind=backstop`/`state=dormant`; prepay-into-escrow at pledge; **FIFO baton-pass** promotion on last-active-end; dormant-cancel full-refund **minus `BACKSTOP_CANCEL_FEE_PCT`**; **extend/top-up** (push own `expiry_ts` at `rate_locked`); **moderation interaction** (CID ban = content kill + permanent banned-CID registry + void queue; user ban = identity kill + baton-pass survival; forced voids = no cancel fee, backstoppers full-refund, offender per `refund_policy`). *Test: foo active + bar dormant backstop → expire foo → assert bar auto-activates & meters; a dormant-cancel before that returns escrow minus fee; a CID ban voids the queue + blocks re-upload + refunds backstoppers in full.* Full spec: [ipfs-gate-cohosting-backstop.md](ipfs-gate-cohosting-backstop.md).
+- **Stage 2 — Replication dial, capped (gate).** Expose **live** `node_count` (config in v1, cluster peer-count later); copies selector `1..node_count`; map to `replication_factor_max` (min = max − leeway, `disable_repinning=false`); cost × copies. *Test: node_count=1 offers only 1 (backstop is the only co-host option); mocked node_count=5 yields a 5/3 cluster config + 5× quote.*
+- **Stage 3 — Release authority (gate).** `release_policy`; recipients release via signed message; threshold met → ends the releasing order's claim (then the §5 lifecycle runs — **release ≠ deletion**: a queued backstop still takes the baton); owner-override on top. *Test: owner_only / any_of / all_of; all_of ends foo's claim only after last consent; a backstop then promotes; timer still expires if nobody consents.*
+- **Stage 4 — Encrypted upload, send side (v4call).** Random-key file encryption, multi-key wrap to recipient Hive keys, commitment salt inside the envelope, push to Stages 1–3 with recipient list + policies. *Test: upload to 3 recipients; ciphertext on IPFS, 3 wrapped keys, commitment stored, link returned.*
+- **Stage 5 — Reveal tab (v4call).** Paste link → fetch → unwrap with recipient key → decrypt → view/save. *Test: each recipient decrypts; a 4th non-listed account cannot.* (Tab name **locked: "Reveal".**)
+- **Stage 6 — Proof-of-receipt + recipient unpin rights (both).** Post-decrypt hash+sign, gate verifies against the stored commitment, writes a per-recipient receipt, lights that recipient's release right; all_of waits for the full set. *Test: a verified receipt unlocks exactly one recipient's release; all_of fires only after all receipts; a forged/unsigned proof is rejected.*
+
+### ✅ Stage-1 decisions — RESOLVED (2026-06-14)
+All locked; nothing blocking Stage 1a/1b. (Full reasoning in the two design docs.)
+- **Refund-on-cancel** — pro-rata for the single active claim; dormant backstop → escrow minus `BACKSTOP_CANCEL_FEE_PCT`; expiry → none. The old pro-rata-vs-dedup tension is **dissolved** (v1 has one active claim per CID, so no over-collection; parallel co-ownership deferred to multi-node). [cohosting §6](ipfs-gate-cohosting-backstop.md).
+- **MB unit** — **decimal** (`bytes / 1,000,000`). Confirmed.
+- **Extend / top-up** — **in v1** (own `expiry_ts`, `rate_locked`, refundable pro-rata).
+- **Tab name** — **"Reveal"**.
+- **Co-hosting on a single-node gate** — **backstop only**; §9-style parallel co-ownership dropped for v1.
+- **node_count** — a **live** value (config in v1, cluster peer-count later); copies capped to it at pledge.
+- **Moderation × escrow** — CID ban vs user ban defined; forced voids charge no cancel fee, refund backstoppers in full, offender per `refund_policy`. [cohosting §7](ipfs-gate-cohosting-backstop.md).
+
+### v2 — Federation (designed, DO NOT build yet)
+The claim model with scope widened one level: "owner holds a claim on a CID" →
+"gate hosts a CID." The three genuinely-new problems: **settlement** (money
+between operators), **verification** (proving a gate holds bytes — Stage 6
+prototypes this in reverse), **repair** (cross-operator self-heal). Storefront
+custodies escrow; "pay for the gap, not the overlap." Handover §15.
 
 ## v0.1 — scope
 
@@ -132,13 +181,20 @@ These are nice-to-haves that didn't block v0.1 but are worth doing once there's 
 
 ## v0.2+ futures (sketched, not committed)
 
+> **Note (2026-06-14):** these bullets predate the **claim-model direction**
+> above and the dedicated [pricing](PRICING-V1-DESIGN-NOTES.md) /
+> [scale](IPFS-Gate-Scale-Plan.md) docs. Treat them as a backlog of ideas, not
+> a committed sequence — where they overlap the claim model or those docs, the
+> docs win. The old "GB-hour" pricing line in particular is **superseded** by
+> the claim-based MB-hour model.
+
 ### v0.2 — multi-currency pricing + UX polish
 - Multi-currency picker (HBD, HIVE, SWAP.BTC, custom tokens) following v4call's `computePaymentOptions` pattern
-- GB-hour rate math + per-upload minimum fee (handle precision floor like v4call's `RATE_FLOOR`)
+- ~~GB-hour rate math~~ → **superseded**: pricing is now the claim-based MB-hour model ([PRICING-V1-DESIGN-NOTES.md](PRICING-V1-DESIGN-NOTES.md)). Per-upload minimum + precision-floor discipline (v4call's `RATE_FLOOR`) still apply.
 - Tighten CORS to allowlist of approved/paying origins
 - Streaming uploads for files >100MB
 - Better operator dashboard
-- `kind_hint` enum for non-image attachments
+- `kind_hint` enum for non-image attachments (largely covered by the multi-format work already shipped)
 
 ### v0.3 — federation (optional, opt-in)
 - Operator-to-operator Nostr-based discovery
@@ -151,10 +207,11 @@ These are nice-to-haves that didn't block v0.1 but are worth doing once there's 
 - Saves bandwidth on duplicate uploads across services
 
 ### v0.5+ — adapters + replication
-- Pinata adapter (drop-in backend for operators wanting external scale)
+> Scaling specifics now live in [IPFS-Gate-Scale-Plan.md](IPFS-Gate-Scale-Plan.md) (Kubernetes is the chosen path for the concept build); the copies/replication *pricing* dial lives in [PRICING-V1-DESIGN-NOTES.md](PRICING-V1-DESIGN-NOTES.md) §4.
+- Pinata adapter (drop-in backend for operators wanting external scale) — note a **client-side** Pinata BYO backend already shipped in v4call; this is the *gate-side* overflow adapter (PSA spec), a different thing
 - Filecoin / web3.storage cold-tier adapter ("keep forever" option)
-- Multi-host pin replication for paying customers ("host on N gates")
-- IPFS Cluster integration for multi-node operators
+- Multi-host pin replication for paying customers ("host on N gates") — the within-cluster form is the copies dial; the cross-operator form is v2 federation
+- IPFS Cluster integration for multi-node operators (raises `node_count` above 1)
 
 ### v0.5+ — donate-to-extend + watch-and-rescue
 - Bob donates X CNOOBS toward Alice's pin to extend its TTL (vs creating a new pin record)
@@ -201,13 +258,15 @@ These came up during brainstorm sessions and don't fit cleanly into a single ver
 - [x] First VPS deployment HTTPS-verified at `https://ipfs.completenoobs.com/`
 - [x] Four real-deploy bugs found + fixed + folded into wiki
 
-## v4call integration checklist (next milestone)
+## v4call integration checklist — COMPLETE
 
-- [ ] Read `~/CAI/v4call/public/index.html` to scope the file-picker button location and existing room-message rendering patterns
-- [ ] Browser-side: AES-GCM encryption helper + per-recipient hivecrypt envelopes
-- [ ] Sender modal HTML/CSS + file picker + recipient checkbox + ipfs-gate URL picker
-- [ ] `/reserve` → Keychain `requestCustomJson` → `/upload` flow in browser
-- [ ] `room-attachment` socket event handler (sender emit + recipient receive)
-- [ ] Recipient bubble: thumbnail render + save-to-device + bystander variant
-- [ ] Server-side: route the `room-attachment` event through existing room broadcast
-- [ ] End-to-end test: guest33 → noblemage real jpeg in a v4call room
+- [x] Browser-side: AES-GCM encryption helper + per-recipient hivecrypt envelopes
+- [x] Sender modal HTML/CSS + file picker + recipient checkbox + ipfs-gate URL picker
+- [x] `/reserve` → Keychain `requestCustomJson` → `/upload` flow in browser
+- [x] `room-attachment` socket event handler (sender emit + recipient receive)
+- [x] Recipient bubble: thumbnail render + save-to-device + bystander variant
+- [x] Server-side: route the `room-attachment` event through existing room broadcast
+- [x] End-to-end test: real encrypted jpeg in a v4call room (2026-05-25, cnoobz → testin + guest33)
+- [x] Extended: multi-format, DM attachments, public uploads, uploads tab, Pinata BYO (v4call v0.16.17–v0.16.26)
+
+> **Next build is the claim-model "Private Encrypted Hosting v1"** — see "Current direction" above for the staged plan (Stage 0 → 6) and the decisions to resolve first.

@@ -1,5 +1,7 @@
 # IPFS-Gate Scale Plan
 
+> ⚠️ **Proof of concept — not for real use.** IPFS-Gate (with sister projects v4call and nGate) is a **concept design build by independent builders**, *itself* "in active development and not recommended for production." Not safe to use, not recommended for general users — for developers reviewing the code who accept the risks. This doc plans how it would scale; it is not a promise that any of it is production-ready today.
+>
 > Status: **TALK ONLY — design doc, nothing committed or scheduled.** Written for cold resumption. Tool facts below were re-verified against current sources (June 2026), since the original chat notes were dated.
 >
 > Standing blocker: **v4call federation is the main quest.** This doc exists so the thinking doesn't get lost.
@@ -14,7 +16,7 @@ The original chat advice was directionally right but needed updating:
 |---|---|---|
 | **Kubo** | Actively developed, latest ~v0.41 (Apr 2026). Now has built-in `ipfs update`, gateway concurrency limits, much faster large-file adds. | ✅ Safe foundation. Keep current; Docker image `ipfs/kubo:release`. |
 | **IPFS Cluster** | v1.1.x. **Maintenance mode** — maintained, bugs fixed, but no major new features; dev effort moved elsewhere in the ecosystem. Production-proven at 50M+ pins / 20+ nodes (powered nft.storage & web3.storage). | ✅ Safe to depend on as-is. ⚠️ Don't bet on it growing new capabilities. |
-| **IPFS Operator (Kubernetes)** | Officially "in active development and **not recommended for production**" per IPFS docs. | ❌ Reinforces: skip K8s. |
+| **IPFS Operator (Kubernetes)** | Officially "in active development and **not recommended for production**" per IPFS docs. | ⚠️ Worth noting: *so are we.* IPFS-Gate is itself a **proof-of-concept / concept design build — also "in active development and not recommended for production."** On that footing the Operator's pre-prod status is not a dealbreaker. **Plan: use Kubernetes for scale** (see Stage 4), eyes open to its maturity. |
 | **Pinata** | Still exposes the standard **IPFS Pinning Service API** at `https://api.pinata.cloud/psa` (JWT auth), plus its own native API (pin-by-CID, file upload). | ✅ Pluggable overflow backend is viable. |
 | **Filebase** | Also implements the standard Pinning Service API. | ✅ One generic adapter can cover Pinata *and* Filebase. |
 | **Pinning Service API spec** | Vendor-agnostic OpenAPI spec; Kubo supports it natively via `ipfs pin remote`. | ✅ This is the seam to build against — not Pinata's proprietary API. |
@@ -111,9 +113,18 @@ This is Cluster's core feature — never script it by hand:
 
 **Skip:** full Prometheus/Grafana for one node. Ceremony without payoff.
 
-### Stage 4 — Kubernetes (probably never)
+### Stage 4 — Kubernetes (the chosen scale path)
 
-Verified: the official IPFS Operator is explicitly not production-ready. Beyond that, K8s for a solo operator with 2–5 nodes is a standing ops tax (control plane, storage classes, upgrade churn) purchased to get autoscaling that pin-storage doesn't need — storage nodes are *stateful and deliberate*, not stateless pods you scale on CPU. Compose + the add-a-node runbook covers dozens of nodes. Re-open only if node count or churn makes manual joins genuinely painful, and even then prefer plain StatefulSets + PVCs over the operator.
+**Decision: Kubernetes is the intended path for scaling IPFS-Gate.** The earlier "probably never" stance is retired.
+
+A fair-warning note that cuts both ways: the official IPFS Operator is documented as "in active development and **not recommended for production**." But IPFS-Gate is itself a **proof-of-concept / concept design build — also in active development and not recommended for production** — so we are not holding the Operator to a bar we don't meet ourselves. For a concept build whose whole point is to explore the design, adopting a still-maturing orchestration layer is consistent with the project's stage.
+
+Eyes-open caveats (still true — now things to manage rather than reasons to avoid):
+- K8s is a standing ops tax (control plane, storage classes, upgrade churn). For a tiny 2–5 node setup that tax can outweigh the benefit, so Compose + the add-a-node runbook stays the right tool **until** node count or churn makes manual joins genuinely painful.
+- Pin-storage nodes are *stateful and deliberate*, not stateless pods autoscaled on CPU — model them as **StatefulSets + PVCs**, not Deployments. Prefer plain StatefulSets first; reach for the IPFS Operator as it matures.
+- N copies only buy real safety if the N peers sit on **independent failure domains** — spread peers across hosts/regions or the replication factor promises more than it delivers.
+
+Net: scaling targets Kubernetes; start small on Compose, graduate to K8s (StatefulSets/PVCs first, the Operator as it matures) when a Section 3 trigger demands it.
 
 ---
 

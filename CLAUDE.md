@@ -1,6 +1,15 @@
 # CLAUDE.md — ipfs-gate Project Context
 
-> **Status: v0.1 first build is live.** Working software deployed to production VPS (Ubuntu 24.04). Code complete; the actual next milestone is **v4call client integration** (the sender modal + recipient bubble in v4call's `public/index.html`), NOT another ipfs-gate version. See `roadmap_status.md`.
+> ⚠️ **Proof of concept — not for real use.** ipfs-gate (with sister projects v4call and nGate) is a **concept design build by independent builders** — not production software, not safe to use, not recommended for general users; for developers reviewing the code who accept the risks. Treat it as a demo.
+
+> **Status (2026-06-14): v0.1.3 in production; first-client (v4call) integration COMPLETE and extended** (multi-format, DM, public uploads, uploads tab, Pinata BYO — all client-side in v4call). **The current build direction is "Private Encrypted Hosting v1"** — a claim/order model with a backstop safety-net, claim-based pricing, release authority, and proof-of-receipt. See `roadmap_status.md` "Current direction" for the staged plan (Stage 0 → 6).
+
+> **📐 Current-direction design docs (READ THESE — they are the live path; the older per-upload/pricing thinking is superseded):**
+> - `PRICING-V1-DESIGN-NOTES.md` — claim-based MB-hour pricing (DESIGN LOCKED).
+> - `ipfs-gate-cohosting-backstop.md` — co-hosting / backstop / refund / moderation lifecycle (DESIGN LOCKED).
+> - `IPFS-Gate-Scale-Plan.md` — scaling (Kubernetes is the chosen path).
+> - `v4call-ipfs-gate-build-handover.md` — the v1 → v2 build handover.
+> - `Archive.PRICING-V0.3-DESIGN-NOTES.md` — ⚠️ **ARCHIVED / superseded**, history only — do **not** build from it (two-part tariff + prepaid balance + token discount; never built). The "Pricing (v0.1)" `.env` block further down is the *shipped v0.1.3 flat per-upload* fee — accurate for what's deployed today, but superseded by the claim model for the v1 build.
 
 > **Brainstorm scratchpad** (full design history with every decision's reasoning): `/home/noob/.claude/plans/question-i-have-you-groovy-hickey.md`. Read this if you need to understand WHY a v0.1 decision was made — locked decisions are mirrored here in CLAUDE.md but the rationale lives in the plan file.
 

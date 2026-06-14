@@ -2,7 +2,7 @@
 
 A standalone, Hive-payment-gated IPFS pinning service. Think of it as nGate for IPFS hosting — anyone can run one, anyone can use one, payment and identity are handled via the Hive blockchain.
 
-> **⚠️ Pre-v0.1.** Planning and architecture complete; code not yet written. The first working build will support encrypted jpeg attachments inside [v4call](https://github.com/CompleteNoobs/v4call) rooms. See [roadmap_status.md](roadmap_status.md) for current progress.
+> ⚠️ **Proof of concept — not for real use.** IPFS-Gate, along with its sister projects [v4call](https://github.com/CompleteNoobs/v4call) and [nGate](https://github.com/CompleteNoobs/nGate), are **proof-of-concept builds by independent builders** — not production software. They are **not safe to use** and **not recommended for general users**. They are provided for developers who want to review the code and are willing to take the risks of an early, quickly-built concept. Treat everything as a demo, not a service.
 
 ## What it does
 
@@ -32,8 +32,9 @@ For v0.1, the integrating client is [v4call](https://github.com/CompleteNoobs/v4
 
 ## Status
 
-- **v0.1** (pre-build): planning + architecture **complete**, code not yet written. See [roadmap_status.md](roadmap_status.md).
-- **v0.2+**: features sketched but explicitly deferred. See roadmap.
+- **v0.1.3 — in production** at `https://ipfs.completenoobs.com/` (concept build; see the proof-of-concept warning above). First end-to-end paid encrypted upload landed 2026-05-25.
+- **First-client (v4call) integration — complete and extended**: multi-format attachments, DM attachments, public/plaintext upload-and-share, an uploads-management tab, and a Pinata bring-your-own storage backend (all client-side in v4call).
+- **Current build direction — "Private Encrypted Hosting v1"**: a claim/order model with a backstop safety-net, claim-based pricing, release authority, and proof-of-receipt. See [roadmap_status.md](roadmap_status.md) "Current direction" + the design docs below.
 
 ## Use cases (current and prospective)
 
@@ -67,5 +68,9 @@ MIT — see [LICENSE](LICENSE).
 
 ## Documentation
 
-- [roadmap_status.md](roadmap_status.md) — current progress, locked decisions, planned features
+- [roadmap_status.md](roadmap_status.md) — current progress, locked decisions, staged build plan
 - [CLAUDE.md](CLAUDE.md) — project context for AI coding assistants (and humans wanting a deep-dive)
+- [PRICING-V1-DESIGN-NOTES.md](PRICING-V1-DESIGN-NOTES.md) — **current** pricing model (claim-based, MB-hour)
+- [ipfs-gate-cohosting-backstop.md](ipfs-gate-cohosting-backstop.md) — **current** co-hosting / backstop / refund / moderation model
+- [IPFS-Gate-Scale-Plan.md](IPFS-Gate-Scale-Plan.md) — scaling path (Kubernetes)
+- [Archive.PRICING-V0.3-DESIGN-NOTES.md](Archive.PRICING-V0.3-DESIGN-NOTES.md) — ⚠️ **archived / superseded** (history only; do not build from it)
