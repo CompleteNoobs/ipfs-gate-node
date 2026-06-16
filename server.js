@@ -438,6 +438,19 @@ app.post('/upload', uploadLimiter, upload.single('ciphertext'), async (req, res)
       catch (e) { return handleError(res, e); }
     }
 
+    // 1d. Optional proof-of-receipt commitment (Stage 6). SHA-256(plaintext) the
+    //     sender commits to; stored on the order so a recipient can later prove
+    //     decryption (POST /claims/receipt). NOT in the public Reveal link, so a
+    //     bystander (ciphertext only) can't reproduce it. NULL for public uploads.
+    let receiptHash = null;
+    if (req.body && req.body.receipt_hash) {
+      const rh = String(req.body.receipt_hash).toLowerCase();
+      if (!/^[a-f0-9]{64}$/.test(rh)) {
+        return respondError(res, 'bad_request', 'receipt_hash must be a 64-char hex sha256');
+      }
+      receiptHash = rh;
+    }
+
     // 2. Banned-account check (banlist could've been added between reserve and upload)
     if (quota.isAccountBanned(uploader)) {
       return respondError(res, 'forbidden', 'uploader is banned');
@@ -589,7 +602,8 @@ app.post('/upload', uploadLimiter, upload.single('ciphertext'), async (req, res)
       currency: payResult.currency,
       startTs,
       expiryTs,
-      releasePolicy: releasePolicyObj
+      releasePolicy: releasePolicyObj,
+      receiptHash
     });
 
     // 11. Dedup info (was there already an active pin for this CID before us?)
@@ -943,6 +957,110 @@ app.post('/claims/release', userApiLimiter, async (req, res) => {
       ok: true, order_id, released: true, ended: true,
       claim_id: claim.claim_id, cid: claim.cid, policy_type: policy.type,
       fully_unpinned, activated_backstop: activated || null, refund
+    });
+  } catch (e) {
+    return handleError(res, e);
+  }
+});
+
+/**
+ * POST /claims/receipt  (Stage 6 — proof-of-receipt + release bridge)
+ * Body: { order_id, hive_account, ts (unix s), pubkey, sig, proof_hash }
+ * Signed message: ipfs-gate:receipt:v1:<order_id>:<hive_account>:<ts>:<proof_hash>
+ *
+ * proof_hash = SHA-256(decrypted plaintext). Only an account that actually
+ * decrypted the file can reproduce it (it is NOT in the public Reveal link), so a
+ * matching, posting-key-signed proof_hash proves decryption. We record the receipt
+ * (audit) AND fold it into the order's release authority exactly like /claims/release
+ * — a verified receipt IS a release consent. owner_only / not-a-listed-recipient
+ * receipts are still recorded but don't end hosting (the owner releases those).
+ */
+app.post('/claims/receipt', userApiLimiter, async (req, res) => {
+  try {
+    const { order_id } = req.body || {};
+    const account = String((req.body && req.body.hive_account) || '').toLowerCase();
+    const ts = req.body && req.body.ts;
+    const pubkey = req.body && req.body.pubkey;
+    const sig = req.body && req.body.sig;
+    const proofHash = String((req.body && req.body.proof_hash) || '').toLowerCase();
+
+    if (typeof order_id !== 'string' || !order_id) {
+      return respondError(res, 'bad_request', 'order_id required');
+    }
+    if (!/^[a-f0-9]{64}$/.test(proofHash)) {
+      return respondError(res, 'bad_request', 'proof_hash must be a 64-char hex sha256');
+    }
+
+    // proof_hash is bound INTO the signed message so it can't be swapped/replayed.
+    const message = `ipfs-gate:receipt:v1:${order_id}:${account}:${ts}:${proofHash}`;
+    await verifySignedUserRequest({ account, ts, pubkey, sig, message });
+
+    const order = quota.getOrder(order_id);
+    if (!order) return respondError(res, 'not_found', 'order not found');
+    if (!order.receipt_hash) {
+      return respondError(res, 'unprocessable_entity', 'this order has no receipt commitment (uploaded before proof-of-receipt, or a public upload) — receipts unsupported');
+    }
+
+    // Proof of decryption: the recipient must reproduce SHA-256(plaintext), which
+    // only an account holding the decrypted bytes can compute.
+    if (proofHash !== String(order.receipt_hash).toLowerCase()) {
+      return respondError(res, 'forbidden', 'proof does not match — you must actually decrypt the file to confirm receipt');
+    }
+
+    // Record the receipt (idempotent audit of who decrypted).
+    quota.recordReceipt(order_id, account, proofHash, sig);
+
+    // Bridge into release authority — a verified receipt is a release consent.
+    let policy;
+    try { policy = JSON.parse(order.release_policy); } catch (e) { policy = { type: 'owner_only' }; }
+    const consented = quota.getReleaseConsents(order_id);
+    let decision;
+    try {
+      decision = releaseAuth.evaluateRelease({ policy, owner: order.owner, releaser: account, consented });
+    } catch (e) {
+      return handleError(res, e);
+    }
+    const receiptList = quota.getReceipts(order_id).map(r => r.recipient);
+
+    // Decrypted, but not a release participant under this policy (owner_only, or
+    // not in addresses): receipt stands as audit, hosting is unchanged.
+    if (!decision.authorized) {
+      return res.json({
+        ok: true, order_id, receipt_recorded: true, released: false,
+        policy_type: policy.type, receipts: receiptList,
+        note: `receipt recorded; @${account} is not a release participant under the ${policy.type} policy`
+      });
+    }
+    if (decision.records_consent) {
+      quota.recordReleaseConsent(order_id, account, sig);
+    }
+
+    // all_of still waiting for the rest of the set.
+    if (!decision.ends) {
+      const addresses = (policy.addresses || []).map(a => String(a).toLowerCase());
+      const have = quota.getReleaseConsents(order_id);
+      return res.json({
+        ok: true, order_id, receipt_recorded: true, released: false, policy_type: policy.type,
+        consents: have, needed: addresses.length,
+        got: have.filter(a => addresses.includes(a)).length, receipts: receiptList
+      });
+    }
+
+    // Threshold met → end the order's active claim (same as /claims/release).
+    const activeClaim = quota.getActiveClaimForOrder(order_id);
+    if (!activeClaim) {
+      return res.json({ ok: true, order_id, receipt_recorded: true, released: true, ended: false, note: 'no active claim to end (already closed)', receipts: receiptList });
+    }
+    const { claim, fully_unpinned, activated } = quota.endActiveClaimForRelease(activeClaim.claim_id);
+    const refund = await settleClaimRefund(claim, 'released-via-receipt');
+    if (fully_unpinned) {
+      try { await kubo.unpin(claim.cid); await kubo.gc(); }
+      catch (e) { console.warn(`[claims/receipt] kubo unpin/gc failed for ${claim.cid}: ${e.message}`); }
+    }
+    res.json({
+      ok: true, order_id, receipt_recorded: true, released: true, ended: true,
+      claim_id: claim.claim_id, cid: claim.cid, policy_type: policy.type,
+      fully_unpinned, activated_backstop: activated || null, refund, receipts: receiptList
     });
   } catch (e) {
     return handleError(res, e);
