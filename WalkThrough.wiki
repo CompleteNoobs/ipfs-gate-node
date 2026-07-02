@@ -196,6 +196,17 @@ You should see a JSON response with disk, pin, payment, moderation, and kubo sta
 
 '''Note:''' an HTTP request (<code>http://...</code>) returns a 301 redirect to HTTPS. That's expected — nginx forces HTTPS for all real traffic. Use <code>curl -L</code> to follow the redirect or hit <code>https://</code> directly.
 
+=== The landing page ===
+
+Open <code>https://ipfs.your-domain.com/</code> in a '''browser''' and you get the standalone landing page (<code>public/index.html</code>) instead of the JSON — same URL, different <code>Accept</code> header. The page is a self-contained client for your gate: log in with a Hive account (Keychain or posting key), then
+
+* '''My Uploads''' — list and delete/unpin your files (same signed-request API v4call's Uploads → IPFS-Gate tab uses)
+* '''Private Send''' — encrypt a file in-browser to chosen Hive accounts, pay the gate, get a <code>v4reveal:</code> link
+* '''Public Upload''' — plaintext upload → shareable gateway link
+* '''Reveal''' — paste a <code>v4reveal:</code> link and decrypt it (links are interchangeable with v4call's Private Send / Reveal tabs)
+
+No configuration needed — the page talks to the gate it's served from by default. Payments always need the Hive Keychain browser extension (they're Active-key token transfers). If you see JSON in the browser instead of the page, your nginx config predates the <code>map $http_accept</code> block — re-copy <code>nginx/ipfs-gate.conf</code> from the repo (Step 4/6) and restart nginx.
+
 == Step 8: Schedule cert renewal ==
 
 Let's Encrypt certs expire after 90 days. Add a cron job for root:
