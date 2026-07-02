@@ -2,7 +2,7 @@
 
 This is a noob-friendly guide to standing up your own ipfs-gate server. It assumes you can SSH into a Linux box and follow recipes — no programming background needed.
 
-> '''Status:''' v0.1 first build. Working software but expect rough edges. Bugs found during real deployment get folded back into the [[#Common problems|Common Problems]] section below.
+> '''Status:''' v1 claim-model build. Working software but expect rough edges. Bugs found during real deployment get folded back into the [[#Common problems|Common Problems]] section below. Walkthrough last re-verified end-to-end on a fresh Vultr VPS (Ubuntu 24.04.4, 2GB RAM) on 2026-07-02 — every step below was executed as written unless noted.
 
 > '''Reference OS:''' Ubuntu Server 24.04 LTS (Noble). The recipes are tested on this OS specifically. Other distros (Ubuntu 22.04, Debian 12, etc.) will likely work but might have subtle differences. For reproducibility, stick to '''Ubuntu 24.04 LTS''' on a fresh VPS.
 
@@ -12,10 +12,10 @@ This is a noob-friendly guide to standing up your own ipfs-gate server. It assum
 
 A server that:
 * Accepts file uploads from web browsers
-* Charges users in CNOOBS (a Hive-Engine token) for hosting
+* Charges users in CNOOBS (a Hive-Engine token) for hosting — priced per MB-hour under the v1 claim model (size × time × copies, quoted at reserve time)
 * Stores the files on IPFS (the InterPlanetary File System — a peer-to-peer storage network)
 * Hands users back a "CID" (a fingerprint of their file) that they share with whoever they want to give the file to
-* Auto-deletes files after 7 days (configurable)
+* Auto-deletes files when their claim expires (default 7 days / 168 hours; duration is user-selectable per upload)
 
 You don't need to know how IPFS works internally. ipfs-gate sits in front of it, charges money, and unpins old files automatically.
 
@@ -26,7 +26,7 @@ You don't need to know how IPFS works internally. ipfs-gate sits in front of it,
 #* A '''public IP address''' and the ability to open ports 80 + 443
 # A '''domain name''' you control (e.g. <code>ipfs.v4call.com</code>). It must point at your VPS's IP via an A record. Set this up at your DNS provider '''before''' starting — Let's Encrypt needs the domain to resolve.
 # A '''dedicated Hive account''' for ipfs-gate (separate from any v4call account). [https://signup.hive.io Create one] if needed. Fund it with about '''2 HBD''' for refunds and Resource Credits.
-# The '''active private key''' for that Hive account (NOT the owner key, NOT the posting key — the active key). You will paste it into the server's <code>.env</code> file. Keep it secret.
+# ''(Optional)'' The '''active private key''' for that Hive account (NOT the owner key, NOT the posting key — the active key). If you paste it into the server's <code>.env</code> the gate issues refunds automatically; leave it out and the gate still runs, with refunds queued for you to settle manually (see Step 3). Keep it secret.
 
 If you don't have CNOOBS to test with, ask CompleteNoobs in v4call or contact via the Hive blockchain.
 
@@ -84,11 +84,15 @@ cp .env.example .env
 nano .env
 </pre>
 
-Fill in at minimum (the only three required fields):
+Fill in at minimum:
 
-* <code>IPFS_GATE_HIVE_ACCOUNT</code> — your dedicated Hive account name (e.g. <code>v4call-ipfs</code>)
-* <code>IPFS_GATE_ACTIVE_KEY</code> — its active private key (starts with <code>5...</code>)
-* <code>ADMIN_KEY</code> — pick a long random string. Generate one with <code>openssl rand -hex 32</code> from another terminal.
+* <code>IPFS_GATE_HIVE_ACCOUNT</code> — your dedicated Hive account name (e.g. <code>v4call-ipfs</code>). The only field the server hard-refuses to boot without.
+* <code>ADMIN_KEY</code> — pick a long random string. Generate one with <code>openssl rand -hex 32</code> from another terminal. (Ships as <code>change-me-to-something-random</code> — change it.)
+* <code>PUBLIC_GATEWAY_BASE</code> — <code>https://ipfs.your-domain.com</code> (your real domain). Required in production: without it, clients receive <code>https://ipfs.localhost</code> gateway links that download nothing (Common Problems #14).
+
+Optional but recommended:
+
+* <code>IPFS_GATE_ACTIVE_KEY</code> — the account's active private key (starts with <code>5...</code>). '''Key-optional since the v1 build:''' leave it blank and the gate still boots — refunds are recorded as <code>pending</code> in the refund ledger and you settle them manually (transfer + <code>/admin/log-refund</code>). The boot log confirms the mode with <code>refunds: MANUAL — IPFS_GATE_ACTIVE_KEY unset</code>. Set the key to enable automatic on-chain refunds. You can add it later: edit <code>.env</code>, then <code>docker compose down && docker compose up -d</code> (Common Problems #4).
 
 Sensible defaults to leave alone:
 
@@ -97,6 +101,7 @@ Sensible defaults to leave alone:
 * <code>DEFAULT_TTL_DAYS=7</code> — accepts fractions for testing (e.g. <code>0.001</code> ≈ 1.4 min)
 * <code>MAX_FILE_SIZE_MB=10</code> — per-upload cap
 * <code>KUBO_DHT_MODE=none</code> — private hosting; CID only servable from your own gateway. Set to <code>client</code> for public IPFS network availability
+* v1 pricing knobs (<code>PRICE_RATE_PER_MB_HOUR=1</code>, <code>PRICE_MIN_HOURS=1</code>, <code>NODE_COUNT=1</code>, …) — the shipped rate is a TEST-token placeholder, not a tuned price. Read <code>PRICING-V1-DESIGN-NOTES.md</code> before charging a token with real value. For scale: 1 CNOOBS/MB-hour means a 2MB file for the default 168h quotes at 336 CNOOBS.
 
 Save and exit (Ctrl-X, Y, Enter in nano).
 
@@ -118,6 +123,8 @@ Bring up the stack with HTTP only:
 docker compose up -d
 </pre>
 
+The first run builds the ipfs-gate image and pulls kubo + nginx — expect '''several minutes''' on a small VPS. If your SSH session drops mid-build (broken pipe), don't panic: the build continues server-side. Reconnect and run <code>docker compose ps</code> — you'll likely find everything already up. (Confirmed during the 2026-07-02 re-verification: the SSH session died during the build; the stack was healthy on reconnect.)
+
 Wait ~30 seconds for Kubo's first-boot identity generation. Then verify:
 
 <pre>
@@ -128,16 +135,26 @@ docker compose logs ipfs-gate | tail -20
 You should see lines like:
 
 <pre>
-[quota] schema_version = 1
-[server] kubo backend OK, version 0.41.0, used <N> bytes
+[quota] applied migration 001_initial.sql
+[quota] applied migration 002_uploads_tab.sql
+[quota] applied migration 003_claims.sql
+[quota] applied migration 004_release_consents.sql
+[quota] applied migration 005_receipts.sql
+[quota] schema_version = 5
+[server] kubo backend OK, version 0.42.0, used <N> bytes
 [sweeper] starting, interval = 60000ms
-ipfs-gate v0.1 listening on 0.0.0.0:3001
+ipfs-gate v1 (claim model) listening on 0.0.0.0:3001
   operator account: @your-hive-account
-  payment: 1 CNOOBS per upload (≤10MB, 7-day TTL)
+  pricing: 1 CNOOBS / MB-hour, min 1h, 1 node(s), ≤10MB
+  refunds: MANUAL — IPFS_GATE_ACTIVE_KEY unset, refunds recorded pending
   CORS origin: *
 </pre>
 
+(Exact version numbers drift; the <code>refunds: MANUAL</code> line only appears when you left <code>IPFS_GATE_ACTIVE_KEY</code> blank. The migration lines only print on first boot.)
+
 If you see <code>listening on 127.0.0.1:3001</code> instead, your <code>.env</code> has the old BIND_HOST. Fix it (Common Problems #6) before proceeding — the cert step needs HTTP serving to work.
+
+'''Don't try to verify with <code>curl http://your-domain/</code> at this stage.''' The shipped nginx config already 301-redirects all HTTP traffic (except the Let's Encrypt challenge path) to HTTPS — which doesn't exist until Step 6. A 301 pointing at a dead HTTPS URL is normal here, not a failure. Verify via the container logs above; certbot works regardless because <code>/.well-known/acme-challenge/</code> is exempt from the redirect.
 
 Now request the cert from Let's Encrypt:
 
@@ -154,6 +171,8 @@ docker run --rm -it \
 </pre>
 
 On success: <code>Successfully received certificate.</code> The cert files land in <code>data/letsencrypt/live/ipfs.your-domain.com/</code>.
+
+''(Running this from a script or non-interactive session? Drop the <code>-it</code> flags — the command needs no TTY and <code>docker run -it</code> errors without one. Verified 2026-07-02.)''
 
 If this fails with a DNS error, double-check that your domain's A record actually points at this VPS's IP (try <code>dig ipfs.your-domain.com</code> from a different machine).
 
@@ -180,11 +199,24 @@ From your laptop (NOT the VPS):
 curl https://ipfs.your-domain.com/
 </pre>
 
-Expected JSON response:
+Expected JSON response (v1 claim model — there is no flat <code>amount</code> any more; cost is quoted per upload at <code>/reserve</code>):
 
 <pre>
-{"service":"ipfs-gate","version":"0.1.0-dev","operator":"your-hive-account","payment":{"currency":"CNOOBS","amount":"1","max_size_mb":10,"ttl_days":7}}
+{"service":"ipfs-gate","version":"1.0.0-dev","operator":"your-hive-account",
+ "payment":{"model":"claim-mb-hour","currency":"CNOOBS","max_size_mb":10,"default_hours":168,"ttl_days":7},
+ "pricing":{"rate_per_mb_hour":1,"min_hours":1,"mb_divisor":1000000,"node_count":1,"copies_max":1,"replication_leeway":2},
+ "features":{"public_uploads":true,"uploads_tab":true,"claim_model":true}}
 </pre>
+
+Optional deeper smoke test — ask for a quote (no payment involved; the reservation self-expires after 5 minutes):
+
+<pre>
+curl -s -X POST -H 'Content-Type: application/json' \
+  -d '{"uploader":"your-hive-account","size_bytes":2000000}' \
+  https://ipfs.your-domain.com/reserve
+</pre>
+
+You should get back a <code>reservation_id</code>, a <code>payment</code> block with the memo to use, and a <code>quote</code> (2MB × 168h × 1 copy = 336 at the placeholder rate).
 
 Test the admin endpoint too (substitute your real ADMIN_KEY):
 
