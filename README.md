@@ -1,5 +1,19 @@
 # ipfs-gate
 
+> ## 🔀 ARCHIVED — ipfs-gate is being decoupled (2026-06-16)
+>
+> This monolith repo (final version **v0.1.3**, v1 Stages 0–6 complete, 43 tests green) is **archived**. Active
+> work has moved to:
+>
+> - **[ipfs-gate-node](https://github.com/CompleteNoobs/ipfs-gate-node)** — headless gateway / pinning / claims server (no money key)
+> - **[escrow-core](https://github.com/CompleteNoobs/escrow-core)** — shared custodial-escrow engine; the escrow
+>   logic proven here (`pricing.js` / `hive-verify.js` / `quota.js` / `release-policy.js`) is its source.
+>
+> Part of the wider v4call + ipfs-gate decoupling — see `handover-decoupling.md` in the `~/CAI` project root.
+> This repo stays for reference/history. **Do not build new features here.**
+
+---
+
 A standalone, Hive-payment-gated IPFS pinning service. Think of it as nGate for IPFS hosting — anyone can run one, anyone can use one, payment and identity are handled via the Hive blockchain.
 
 > ⚠️ **Proof of concept — not for real use.** IPFS-Gate, along with its sister projects [v4call](https://github.com/CompleteNoobs/v4call) and [nGate](https://github.com/CompleteNoobs/nGate), are **proof-of-concept builds by independent builders** — not production software. They are **not safe to use** and **not recommended for general users**. They are provided for developers who want to review the code and are willing to take the risks of an early, quickly-built concept. Treat everything as a demo, not a service.
