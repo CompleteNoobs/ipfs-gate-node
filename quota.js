@@ -367,7 +367,8 @@ function createOrderWithClaim({
   cid, owner, pinId = null, paymentId,
   sizeBytes, sizeMB, rateLocked, paidHours, copies = 1,
   amountPaid, currency, startTs, expiryTs,
-  kind = 'original', state = 'active', releasePolicy = null, receiptHash = null
+  kind = 'original', state = 'active', releasePolicy = null, receiptHash = null,
+  pledgeOrder = null, pledgeBudget = null
 }) {
   return db.transaction(() => {
     const t = now();
@@ -379,20 +380,35 @@ function createOrderWithClaim({
       VALUES (?, ?, ?, ?, ?, ?, 'open')
     `).run(orderId, cid, owner, JSON.stringify(releasePolicy || { type: 'owner_only' }), receiptHash, t);
 
+    // Guardians get their FIFO slot + budget stamped at pledge time. Assigned
+    // inside this transaction so two concurrent pledges can't share a slot.
+    if (kind === 'guardian' && pledgeOrder == null) pledgeOrder = nextPledgeOrder(cid);
+    if (kind === 'guardian' && pledgeBudget == null) pledgeBudget = amountPaid;
+
     db.prepare(`
       INSERT INTO claims
         (claim_id, order_id, cid, owner, host_gate, pin_id, size_bytes, size_mb,
          rate_locked, paid_hours, copies_requested, kind, state,
-         amount_paid, currency, payment_id, start_ts, expiry_ts, created_ts)
-      VALUES (?, ?, ?, ?, 'self', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         amount_paid, currency, payment_id, start_ts, expiry_ts, created_ts,
+         pledge_order, pledge_budget)
+      VALUES (?, ?, ?, ?, 'self', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       claimId, orderId, cid, owner, pinId, sizeBytes, sizeMB,
       rateLocked, paidHours, copies, kind, state,
-      amountPaid, currency, paymentId, startTs, expiryTs, t
+      amountPaid, currency, paymentId, startTs, expiryTs, t,
+      pledgeOrder, pledgeBudget
     );
 
-    return { order_id: orderId, claim_id: claimId };
+    return { order_id: orderId, claim_id: claimId, pledge_order: pledgeOrder };
   }).immediate();
+}
+
+/** Next FIFO pledge slot for a CID (1-based, monotonic — cancelled guardians keep theirs). */
+function nextPledgeOrder(cid) {
+  const row = db.prepare(
+    "SELECT COALESCE(MAX(pledge_order), 0) + 1 AS next FROM claims WHERE cid = ? AND kind = 'guardian'"
+  ).get(cid);
+  return row.next;
 }
 
 function getClaim(claimId) {
@@ -443,7 +459,7 @@ function getReceipts(orderId) {
 
 /**
  * End an ACTIVE claim because its release threshold was met (Stage 3). Same
- * mechanics as a cancel — expire the pin, then reconcile so a queued backstop
+ * mechanics as a cancel — expire the pin, then reconcile so a queued guardian
  * takes the baton (release ≠ deletion) — but NO owner check (the release policy,
  * not ownership, authorised this; the server validates it before calling). The
  * pro-rata refund to the owner is settled by the caller. Returns
@@ -470,13 +486,14 @@ function endActiveClaimForRelease(claimId) {
   }).immediate();
 }
 
-// FIFO order (by pledge time) — the head dormant backstop activates first.
-// rowid (insertion order) is the tiebreaker so two pledges in the same ms still
-// promote in the true order they were recorded.
-function getDormantBackstopsForCid(cid) {
-  return db.prepare(
-    "SELECT * FROM claims WHERE cid = ? AND state = 'dormant' AND kind = 'backstop' ORDER BY created_ts ASC, rowid ASC"
-  ).all(cid);
+// FIFO — strictly pledge order (guardian spec §4): the head dormant guardian
+// activates first. pledge_order is the durable slot; created_ts/rowid remain as
+// tiebreakers for any legacy row the 006 backfill missed.
+function getDormantGuardiansForCid(cid) {
+  return db.prepare(`
+    SELECT * FROM claims WHERE cid = ? AND state = 'dormant' AND kind = 'guardian'
+    ORDER BY COALESCE(pledge_order, 1e18) ASC, created_ts ASC, rowid ASC
+  `).all(cid);
 }
 
 function listClaimsForOwner(owner) {
@@ -484,11 +501,60 @@ function listClaimsForOwner(owner) {
 }
 
 // Most-recent pin row for a CID (active OR expired) — used to copy size/mode/mime
-// onto the new pin when a backstop is promoted (the bytes are still in Kubo).
+// onto the new pin when a guardian is promoted or an own-copy claim is created
+// (the bytes are still in Kubo either way).
 function getLatestPinInfoForCid(cid) {
   return db.prepare(
     'SELECT size_bytes, mode, mime FROM pins WHERE cid = ? ORDER BY created_at DESC LIMIT 1'
   ).get(cid) || null;
+}
+
+/**
+ * "Already hosted" snapshot for a CID (guardian spec §3) — what a later
+ * uploader sees before choosing own-copy vs guardian. null when not hosted.
+ *   { hosted_until, active_hosts, guardian_queue_depth, size_bytes }
+ */
+function alreadyHostedForCid(cid) {
+  const active = getActivePinsForCid(cid);
+  if (active.length === 0) return null;
+  return {
+    hosted_until: Math.max(...active.map(p => p.expires_at)),
+    active_hosts: active.length,
+    guardian_queue_depth: getDormantGuardiansForCid(cid).length,
+    size_bytes: active[0].size_bytes
+  };
+}
+
+/**
+ * Create an ACTIVE own-copy claim on an already-hosted CID (guardian spec §2/§3
+ * "Host my own copy") — an independent funder with its own pin row, timer and
+ * refund. No byte transfer: the bytes are already in Kubo, so this only writes
+ * DB rows (same mechanics as a guardian promotion). The pin row over-counts
+ * physical disk (Kubo dedups the bytes) — deliberate, matches the multi-pin-
+ * record accounting model since v0.1. Throws not_found when the CID has no live
+ * host (an own copy backs a live file; a dead CID needs a real /upload).
+ */
+function createOwnCopyClaim({ cid, owner, paymentId, paidHours, copies = 1, rateLocked, amountPaid, currency }) {
+  return db.transaction(() => {
+    const info = getLatestPinInfoForCid(cid);
+    if (!hasActivePinForCid(cid) || !info) {
+      throw Object.assign(new Error('CID is not currently hosted here'), { code: 'not_found' });
+    }
+    const t = now();
+    const expiryTs = t + paidHours * 60 * 60 * 1000;
+    const pinRes = db.prepare(`
+      INSERT INTO pins (cid, uploader, size_bytes, payment_id, created_at, expires_at, status, mode, mime)
+      VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?)
+    `).run(cid, owner, info.size_bytes, paymentId, t, expiryTs, info.mode || 'encrypted', info.mime || null);
+
+    const created = createOrderWithClaim({
+      cid, owner, pinId: pinRes.lastInsertRowid, paymentId,
+      sizeBytes: info.size_bytes, sizeMB: Math.max(1, Math.ceil(info.size_bytes / 1000000)),
+      rateLocked, paidHours, copies, amountPaid, currency,
+      startTs: t, expiryTs, kind: 'own_copy', state: 'active'
+    });
+    return { ...created, pin_id: pinRes.lastInsertRowid, start_ts: t, expiry_ts: expiryTs };
+  }).immediate();
 }
 
 /**
@@ -517,21 +583,24 @@ function extendClaim(claimId, owner, extraHours) {
 }
 
 /**
- * Reconcile a CID after one of its active claims ended (cohosting §5). MUST be
- * called inside an open transaction (sweep / cancelClaim already are). Returns:
+ * Reconcile a CID after one of its active claims ended (cohosting §5 /
+ * guardian spec §4: "delete the file" becomes "promote the next dormant
+ * guardian instead"). MUST be called inside an open transaction (sweep /
+ * cancelClaim already are). Returns:
  *   { unpin: bool, activated: claim_id|null }
- *   - another active claim still funds it → { unpin:false, activated:null }
- *   - no active claim BUT a dormant backstop queued → promote head (FIFO):
+ *   - another active claim still funds it (an own copy counts — a guardian
+ *     guards the FILE, not a person) → { unpin:false, activated:null }
+ *   - no active claim BUT a dormant guardian queued → promote head (FIFO):
  *     flip dormant→active, set start/expiry, create its pin → { unpin:false, activated }
  *   - nothing left → { unpin:true, activated:null }  (caller kubo-unpins + GCs)
- * The bytes stay in Kubo throughout — a promoted backstop reuses the existing
+ * The bytes stay in Kubo throughout — a promoted guardian reuses the existing
  * physical pin (we never unpin a CID that still has a funder), so activation only
  * writes DB rows, no re-pin.
  */
 function reconcileCidAfterEnd(cid) {
   if (hasActivePinForCid(cid)) return { unpin: false, activated: null };
 
-  const queue = getDormantBackstopsForCid(cid);
+  const queue = getDormantGuardiansForCid(cid);
   if (queue.length === 0) return { unpin: true, activated: null };
 
   const next = queue[0];
@@ -585,13 +654,14 @@ function cancelClaim(claimId, owner) {
       throw Object.assign(new Error('claim already closed'), { code: 'conflict' });
     }
 
-    // A dormant backstop holds no pin and isn't keeping the file alive — nothing
-    // to expire or reconcile. Its refund is escrow-minus-fee (caller computes).
+    // A dormant guardian holds no pin and isn't keeping the file alive — nothing
+    // to expire or reconcile. Its refund is the full escrow (caller computes;
+    // guardian spec §6 — optional operator fee via GUARDIAN_CANCEL_FEE_PCT).
     if (wasDormant) {
       return { claim, fully_unpinned: false, activated: null, was_dormant: true };
     }
 
-    // Active claim: expire its pin, then reconcile — a queued backstop may take
+    // Active claim: expire its pin, then reconcile — a queued guardian may take
     // the baton (FIFO) instead of the CID being unpinned.
     if (claim.pin_id) {
       db.prepare(`
@@ -641,7 +711,7 @@ function getRefund(refundId) {
  *
  * Reconcile is the Stage-1a subset of cohosting §5: when an active claim ends,
  * if no active claim remains the file is unpinned. (Stage 1b inserts the
- * "promote the next dormant backstop instead of unpinning" branch here.)
+ * "promote the next dormant guardian instead of unpinning" branch here.)
  */
 function sweep() {
   const t = now();
@@ -676,9 +746,9 @@ function sweep() {
       WHERE status = 'active' AND expires_at < ?
     `).run(t, t);
 
-    // 3. Reconcile every CID touched this tick (cohosting §5): if a dormant
-    //    backstop is queued, promote it (FIFO) instead of unpinning. cids_to_unpin
-    //    ends up holding only the CIDs with no funder left at all.
+    // 3. Reconcile every CID touched this tick (cohosting §5 / guardian §4): if
+    //    a dormant guardian is queued, promote it (FIFO) instead of unpinning.
+    //    cids_to_unpin ends up holding only the CIDs with no funder left at all.
     const candidates = db.prepare(`
       SELECT DISTINCT cid FROM pins
       WHERE status = 'expired' AND status_changed_at = ?
@@ -696,7 +766,7 @@ function sweep() {
       expired_reservations: expRes.changes,
       expired_claims: expiringClaims.length,
       expired_pins: expPin.changes,
-      activated_backstops: activated.length,
+      activated_guardians: activated.length,
       cids_to_unpin: cidsToUnpin
     };
   }).immediate();
@@ -743,12 +813,15 @@ module.exports = {
   countUploadsForAccount,
   // orders + claims (v1 claim model)
   createOrderWithClaim,
+  createOwnCopyClaim,
+  nextPledgeOrder,
   getClaim,
   getOrder,
   getActiveClaimForOrder,
   getActiveClaimsForCid,
-  getDormantBackstopsForCid,
+  getDormantGuardiansForCid,
   getLatestPinInfoForCid,
+  alreadyHostedForCid,
   listClaimsForOwner,
   cancelClaim,
   extendClaim,

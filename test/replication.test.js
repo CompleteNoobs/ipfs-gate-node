@@ -9,7 +9,7 @@ const assert = require('node:assert');
 const pricing = require('../pricing');
 
 test('copies are capped at node_count (single-node v1 offers only 1)', () => {
-  assert.equal(pricing.cappedCopies(5, 1), 1);   // 1-node gate → backstop is the only co-host
+  assert.equal(pricing.cappedCopies(5, 1), 1);   // 1-node gate → guardian is the only co-host
   assert.equal(pricing.cappedCopies(1, 1), 1);
   assert.equal(pricing.cappedCopies(5, 5), 5);   // 5-node cluster → up to 5
   assert.equal(pricing.cappedCopies(3, 5), 3);

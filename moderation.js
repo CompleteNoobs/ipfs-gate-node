@@ -28,7 +28,7 @@ function audit({ action, target_type, target, reason, metadata }) {
 /**
  * Ban a Hive account — IDENTITY kill (cohosting §7). Voids ALL the user's claims
  * (active + dormant) and marks their active pins 'banned', then reconciles each
- * CID they actively hosted: the file SURVIVES if ANOTHER user has a backstop on
+ * CID they actively hosted: the file SURVIVES if ANOTHER user has a guardian on
  * it (FIFO baton-pass), and is only unpinned if nobody else funds it. The content
  * itself is NOT banned (use takedown for that).
  *
@@ -70,9 +70,9 @@ function banAccount({ hive_account, reason, refund_policy }) {
       WHERE uploader = ? AND status = 'active'
     `).run(t, reason, account);
 
-    // Reconcile each CID the user actively hosted: another user's queued backstop
+    // Reconcile each CID the user actively hosted: another user's queued guardian
     // takes the baton (file survives); unpin only where nobody else funds it.
-    // The banned user's own backstops were just voided, so they can't be promoted.
+    // The banned user's own guardians were just voided, so they can't be promoted.
     const activeCids = [...new Set(voidedClaims.filter(c => c.state === 'active').map(c => c.cid))];
     const cidsToUnpin = [];
     const activated = [];
@@ -87,7 +87,7 @@ function banAccount({ hive_account, reason, refund_policy }) {
       target_type: 'account',
       target: account,
       reason,
-      metadata: { refund_policy, pins_affected: upd.changes, claims_voided: voidedClaims.length, backstops_activated: activated.length }
+      metadata: { refund_policy, pins_affected: upd.changes, claims_voided: voidedClaims.length, guardians_activated: activated.length }
     });
 
     return { voidedClaims, pins_affected: upd.changes, cidsToUnpin, activated, moderation_log_id: mlId };
@@ -122,14 +122,14 @@ function unbanAccount({ hive_account }) {
 
 /**
  * Takedown a single CID — CONTENT kill (cohosting §7). Adds the CID to the
- * permanent banned-CID registry (blocked at /upload + backstop-pledge so it
+ * permanent banned-CID registry (blocked at /upload + guardian-pledge so it
  * cannot reappear under any user), voids the active claim(s) AND the entire
- * dormant backstop queue, and marks pins 'takedown'. The bytes are always
- * unpinned by the caller (content kill — no backstop survives).
+ * dormant guardian queue, and marks pins 'takedown'. The bytes are always
+ * unpinned by the caller (content kill — no guardian survives).
  *
  * Returns { voided_claims, pins_affected, refund_policy, moderation_log_id }.
  * Refund execution is the CALLER's job (server settles each voided claim: active
- * host/offender per refund_policy; dormant backstoppers = innocent → full refund).
+ * host/offender per refund_policy; dormant guardians = innocent → full refund).
  */
 function takedownCid({ cid, reason, refund_policy }) {
   if (!cid) throw Object.assign(new Error('cid required'), { code: 'bad_request' });
@@ -144,7 +144,7 @@ function takedownCid({ cid, reason, refund_policy }) {
       VALUES (?, ?, ?, ?, NULL, NULL)
     `).run(cid, t, ADMIN_ID, reason);
 
-    // Void the active claim(s) AND the whole dormant backstop queue for the CID.
+    // Void the active claim(s) AND the whole dormant guardian queue for the CID.
     const voidedClaims = db.prepare(
       "SELECT * FROM claims WHERE cid = ? AND state IN ('active','dormant')"
     ).all(cid);

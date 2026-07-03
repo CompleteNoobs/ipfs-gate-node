@@ -2,7 +2,7 @@
 
 > ⚠️ **Proof of concept — not for real use.** ipfs-gate (with sister projects [v4call](https://github.com/CompleteNoobs/v4call) and [nGate](https://github.com/CompleteNoobs/nGate)) is a **concept design build by independent builders** — not production software. Not safe to use, not recommended for general users; for developers reviewing the code who accept the risks. Treat it as a demo.
 
-> Updated 2026-06-14. Source of truth: this file + [CLAUDE.md](CLAUDE.md).
+> Updated 2026-07-02. Source of truth: this file + [CLAUDE.md](CLAUDE.md).
 > Full design history + reasoning lives in the brainstorm scratchpad at
 > `/home/noob/.claude/plans/question-i-have-you-groovy-hickey.md`.
 >
@@ -110,6 +110,37 @@ Stages 4–6 are v4call-side, each adding one small gate endpoint.
 - ✅ **Stage 6 — Proof-of-receipt + recipient early-release (both) (done 2026-06-16).** Gate: migration `005_receipts.sql` (`orders.receipt_hash` + idempotent `receipts` table, schema_version=5); `/upload` stores `receipt_hash`; new signed `POST /claims/receipt` verifies the proof, records the receipt, and bridges into the existing `recordReleaseConsent`/`evaluateRelease` threshold (any_of ends on first, all_of after every recipient, owner_only/non-listed records-only). `test/receipt.test.js` — 7 tests; **43 green total.** Client: `✅ Confirm receipt` button on the Reveal card → signs `H(plaintext)` → POST. **⚠ Scheme note (don't regress this):** the gate stores `receipt_hash = SHA-256(plaintext)`, **NOT** the salted `commitment` that rides in the `v4reveal` link. That commitment is **public** (anyone holding the link has it + the salt), so presenting it proves nothing — a bystander could echo it. `H(plaintext)` is reproducible **only** by an account that actually decrypted (a bystander has just the ciphertext), and is never placed in the link. The signed message binds `proof_hash` so it can't be swapped/replayed. The salted commitment stays in the link solely for the recipient's *local* sender-attestation check (covered by the envelope sig). *Tested: verified receipt advances the right policy threshold; forged hash + unsigned proof rejected.*
 
 > **✅ Private Encrypted Hosting v1 is complete** (Stages 0–6) — encrypt-to-people → pay-to-host → Reveal → proof-of-receipt → policy-gated early release, across the one-gate model. v2 (cross-operator federation) is the designed-but-not-built next layer (§ below). Two small follow-ups noted during the build: an owner-facing receipt/consent dashboard (the gate returns `receipts: […]`, no UI yet), and EST-COST + a per-gate pricing-model line were added to all v4call upload modals.
+
+### ✅ Guardian feature — BUILT (2026-07-02)
+
+Multi-participant hosting of the same CID, per the Guardian dev-handover spec (v1, single gate).
+The Stage-1b "backstop" **is** the Guardian by its final name — the build renamed it and added the
+missing spec pieces. Gate-side complete, **53 tests green** (was 43); client UI (v4call) not built yet.
+
+- **Three roles locked** (spec §2): internal `kind` values `original | own_copy | guardian`
+  (migration `006_guardian.sql` rebuilds the claims CHECK; existing `backstop` rows rename in place).
+- **Claims gained `pledge_order` + `pledge_budget`** (spec §7) — FIFO slot stamped at pledge time
+  (strictly pledge order, spec §4), budget = escrow pledged; 006 backfills both for existing rows.
+  Migration proven by `test/guardian-migration.test.js` (hand-built v5 DB → real runner → asserts).
+- **Already-hosted detection** (spec §3 / §8 item 1): new `POST /check` (multipart, Kubo only-hash —
+  computes the CID without storing/pinning/paying, flags MUST match `pin()`'s) + `GET /status/:cid`
+  now returns `already_hosted` / `hosted_until` / `active_hosts` / `guardian_queue_depth`. `/upload`
+  auto-kinds the claim: CID already live → `own_copy`, else `original` (response carries `claim.kind`).
+- **Own copy** (spec §2/§3): `GET /claims/own-copy/quote` + `POST /claims/own-copy` — pay → verify
+  (memo `ipfs-gate:owncopy:<cid>`) → live independent claim + pin row on the existing bytes, **no
+  re-upload**. Quote surfaces `adds_redundancy` (`current_copies < node_count`) honestly.
+- **Guardian endpoints renamed**: `GET /guardian/quote` + `POST /guardian/pledge` (memo
+  `ipfs-gate:guardian:<cid>`) + `GET /guardian/queue`. Legacy `/backstop/*` routes stay as aliases
+  and verify the old `ipfs-gate:backstop:<cid>` memo, so a pledge started pre-upgrade still lands.
+- **Dormant-cancel refund is now FULL by default** (spec §6): `GUARDIAN_CANCEL_FEE_PCT=0` replaces
+  `BACKSTOP_CANCEL_FEE_PCT=1` (legacy env name honoured; admin voids always fee-free). Live-claim
+  pro-rata and expired-no-refund unchanged.
+- **Unchanged (already spec-conformant)**: FIFO baton-pass promotion on cancel AND expiry
+  (`reconcileCidAfterEnd` — a guardian guards the *file*, never fires while any live host remains,
+  incl. an own copy), extend/top-up at `rate_locked` delaying activation, moderation × escrow
+  (innocent guardians full refund).
+- **Still open (spec §10, product not code):** final UI microcopy for the "already hosted" notice +
+  guardian pledge flow — lands with the v4call client integration, which is the next step here.
 
 ### ✅ Stage-1 decisions — RESOLVED (2026-06-14)
 All locked; nothing blocking Stage 1a/1b. (Full reasoning in the two design docs.)

@@ -2,7 +2,7 @@
 
 > ⚠️ **Proof of concept — not for real use.** ipfs-gate (with sister projects v4call and nGate) is a **concept design build by independent builders** — not production software, not safe to use, not recommended for general users; for developers reviewing the code who accept the risks. Treat it as a demo.
 
-> **Status (2026-06-14): v0.1.3 in production; first-client (v4call) integration COMPLETE and extended** (multi-format, DM, public uploads, uploads tab, Pinata BYO — all client-side in v4call). **The current build direction is "Private Encrypted Hosting v1"** — a claim/order model with a backstop safety-net, claim-based pricing, release authority, and proof-of-receipt. See `roadmap_status.md` "Current direction" for the staged plan (Stage 0 → 6).
+> **Status (2026-07-02): v0.1.3 in production; v1 (Stages 0–6) COMPLETE; Guardian feature BUILT gate-side.** First-client (v4call) integration complete and extended (multi-format, DM, public uploads, uploads tab, Pinata BYO — all client-side in v4call). "Private Encrypted Hosting v1" — claim/order model, claim-based pricing, release authority, proof-of-receipt — shipped 2026-06-16. The **Guardian feature** (multi-participant hosting of the same CID: `original | own_copy | guardian` claim kinds, already-hosted detection via `POST /check`, own-copy claims without re-upload, FIFO guardian queue with `pledge_order`/`pledge_budget`, full dormant-cancel refund) landed 2026-07-02 per the Guardian dev-handover spec — the Stage-1b "backstop" was renamed to guardian (migration 006; `/backstop/*` routes remain as legacy aliases). See `roadmap_status.md` "Guardian feature" for the build record. Client UI for it is NOT built yet.
 
 > **📐 Current-direction design docs (READ THESE — they are the live path; the older per-upload/pricing thinking is superseded):**
 > - `PRICING-V1-DESIGN-NOTES.md` — claim-based MB-hour pricing (DESIGN LOCKED).
@@ -194,9 +194,12 @@ Full schema with DDL + indexes + hot-path queries: see plan file at `/home/noob/
 
 ### Public (no auth, CORS origin: '*')
 - `POST /reserve` — reserve quota, get reservation_id + payment instructions
-- `POST /upload` — upload ciphertext, get back CID
-- `GET /status/:cid` — check pin status
+- `POST /upload` — upload ciphertext, get back CID (claim kind auto-set: `own_copy` if the CID is already live-hosted, else `original`)
+- `POST /check` — Guardian feature: compute the CID (Kubo only-hash, nothing stored/paid) → already-hosted status + own-copy/guardian options
+- `GET /status/:cid` — pin status + `already_hosted`/`hosted_until`/`active_hosts`/`guardian_queue_depth`
 - `GET /ipfs/:cid` — IPFS gateway pass-through
+- `GET /claims/own-copy/quote`, `POST /claims/own-copy` — pay for an independent copy of an already-hosted CID (memo `ipfs-gate:owncopy:<cid>`, no re-upload)
+- `GET /guardian/quote`, `POST /guardian/pledge`, `GET /guardian/queue` — the dormant FIFO safety-net (memo `ipfs-gate:guardian:<cid>`); `/backstop/*` = legacy aliases (old memo)
 
 ### Admin (Bearer ADMIN_KEY)
 - `POST /admin/ban`, `POST /admin/unban`

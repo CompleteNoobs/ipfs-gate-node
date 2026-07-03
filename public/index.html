@@ -12,7 +12,10 @@
   for the gate:
     · My Uploads   — list / delete your pins        (GET /uploads/by-user, POST /uploads/delete)
     · Private Send — encrypt to Hive users, pay, get a v4reveal: link
-    · Public Upload— plaintext upload → shareable gateway link
+    · Public Upload— plaintext upload → shareable gateway link; if the file is
+                     already hosted (POST /check), offers Guardian (dormant FIFO
+                     pledge, POST /guardian/pledge) or an own copy
+                     (POST /claims/own-copy) instead of a blind re-upload
     · Reveal       — paste a v4reveal: link, decrypt in-browser, confirm receipt
 
   Wire-format + signature schemes are byte-identical to v4call desktop-app.html
@@ -255,6 +258,9 @@ footer { margin-top: 30px; font-size: 0.68rem; color: var(--muted); border-top: 
         <button id="pub-upload-btn" onclick="confirmPublicUpload()">🌐 Pay &amp; upload</button>
       </div>
       <div class="status" id="pub-status-note">Ready.</div>
+      <!-- Guardian feature: filled by renderHostedPanel() when POST /check says
+           the picked file's CID is already hosted on this gate. -->
+      <div id="pub-hosted-panel" class="result-box" style="display:none;"></div>
       <div id="pub-result" class="result-box" style="display:none;"></div>
     </div>
   </div>
@@ -1201,6 +1207,9 @@ function setPubStatus(text, isErr) {
 function onPubFilePick() {
   const f = (document.getElementById('pub-file-input').files || [])[0];
   const meta = document.getElementById('pub-file-meta');
+  // a new file means the old already-hosted answer no longer applies
+  document.getElementById('pub-hosted-panel').style.display = 'none';
+  hostedCid = null;
   if (!f) { meta.textContent = ''; return; }
   const mime = detectFileMime(f) || 'application/octet-stream';
   const warn = f.size > attachMaxBytes ? ` ⚠ over gate cap (${(attachMaxBytes / 1024 / 1024).toFixed(0)} MB)` : '';
@@ -1224,13 +1233,26 @@ function showPubResult(url) {
   });
   document.getElementById('pub-open-btn').addEventListener('click', () => window.open(url, '_blank', 'noopener'));
 }
-async function confirmPublicUpload() {
+async function confirmPublicUpload(skipHostedCheck) {
   const file = (document.getElementById('pub-file-input').files || [])[0];
   if (!file) { setPubStatus('Pick a file first.', true); return; }
   if (file.size > attachMaxBytes) { setPubStatus(`File too big — gate cap is ${(attachMaxBytes / 1024 / 1024).toFixed(0)} MB.`, true); return; }
   const btn = document.getElementById('pub-upload-btn');
   btn.disabled = true;
   try {
+    // Guardian feature: same bytes = same CID for public uploads, so ask the
+    // gate FIRST (free, nothing stored) whether this file is already hosted.
+    // If it is, offer own-copy / guardian instead of a blind re-upload.
+    if (!skipHostedCheck) {
+      setPubStatus('Checking whether this file is already hosted…');
+      const hosted = await gateCheckAlreadyHosted(file, getGateway());
+      if (hosted && hosted.already_hosted) {
+        renderHostedPanel(hosted, file);
+        setPubStatus('This file is already hosted here — pick an option below.');
+        return;
+      }
+    }
+    document.getElementById('pub-hosted-panel').style.display = 'none';
     const res = await uploadPublicFile(file, getGateway());
     recordCtx(res.cid, { filename: file.name, mime: res.mime, kind: mimeToKind(res.mime), context: 'public link' });
     showPubResult(res.url);
@@ -1241,6 +1263,108 @@ async function confirmPublicUpload() {
   } finally {
     btn.disabled = false;
   }
+}
+
+// ── Guardian feature (already-hosted → own copy / guardian) ──────────────────
+let hostedCid = null, hostedFileName = '';
+
+/** POST /check — best-effort: an old gate without it just means "proceed". */
+async function gateCheckAlreadyHosted(file, gatewayUrl) {
+  try {
+    const form = new FormData();
+    form.append('ciphertext', new Blob([new Uint8Array(await file.arrayBuffer())]), file.name);
+    const res = await fetch(`${gatewayUrl}/check`, { method: 'POST', body: form });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch (e) { return null; }
+}
+
+function setHostedStatus(text, isErr) {
+  const n = document.getElementById('hosted-status');
+  if (!n) return;
+  n.textContent = text || '';
+  n.className = 'status' + (isErr ? ' err' : '');
+}
+
+function renderHostedPanel(j, file) {
+  hostedCid = j.cid;
+  hostedFileName = file ? file.name : '';
+  const p = document.getElementById('pub-hosted-panel');
+  p.style.display = 'block';
+  const until = j.hosted_until ? new Date(j.hosted_until).toLocaleString() : '?';
+  p.innerHTML = `
+    <div style="font-size:0.78rem;margin-bottom:4px;"><b>📌 This file is already hosted on this gate.</b></div>
+    <div class="hint">Paid to stay up until <b>${escapeHtml(until)}</b> · ${Number(j.active_hosts) || 1} live host(s) · ${Number(j.guardian_queue_depth) || 0} guardian(s) queued. You don't have to re-upload — you can back the existing copy instead:</div>
+    <div class="row" style="margin-top:8px;align-items:center;">
+      <label class="field-label" style="margin:0;">Hours to fund</label>
+      <input type="number" id="hosted-hours" min="1" value="${gateDefaultHours}" style="width:90px;">
+    </div>
+    <div class="row" style="margin-top:8px;">
+      <button class="purple" onclick="becomeGuardian()">🛡 Become a Guardian</button>
+      <button onclick="hostOwnCopy()">📄 Host my own copy</button>
+      <button class="secondary" onclick="confirmPublicUpload(true)">⬆ Upload anyway</button>
+    </div>
+    <div class="hint" style="margin-top:6px;"><b>Guardian</b> = pledge a budget now, pay nothing unless the file would otherwise be dropped — you join a first-come queue and take over hosting only when the last live host ends (cancel while dormant = full refund). <b>Own copy</b> = pay now for your own independent copy — own timer, own refund, live immediately.</div>
+    <div class="status" id="hosted-status"></div>`;
+}
+
+async function becomeGuardian() {
+  if (!myUsername) { setHostedStatus('Log in first.', true); return; }
+  if (!hostedCid) { setHostedStatus('No CID — re-run the check.', true); return; }
+  const gw = getGateway();
+  const hours = Math.max(1, parseInt(document.getElementById('hosted-hours').value) || gateDefaultHours);
+  try {
+    setHostedStatus('Fetching guardian quote…');
+    const qRes = await fetch(`${gw}/guardian/quote?cid=${encodeURIComponent(hostedCid)}&hours=${hours}`);
+    const q = await qRes.json().catch(() => ({}));
+    if (!qRes.ok) throw new Error(q.message || `quote failed (${qRes.status})`);
+
+    setHostedStatus(`Pledging ${q.payment.amount} ${q.payment.currency} for ${q.quote.billable_hrs} h (Keychain)…`);
+    const txId = await keychainTransferGateToken({ to: q.payment.escrow_account, amount: q.payment.amount, memo: q.payment.memo, symbol: q.payment.currency });
+    if (!txId) throw new Error('payment cancelled or failed');
+
+    setHostedStatus('Waiting for tx to index (3s)…');
+    await new Promise(r => setTimeout(r, 3000));
+
+    const pRes = await fetch(`${gw}/guardian/pledge`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ pledger: myUsername, cid: hostedCid, hours_requested: hours, tx_id: txId })
+    });
+    const pj = await pRes.json().catch(() => ({}));
+    if (!pRes.ok) throw new Error(`${pj.message || pRes.status} — payment tx ${txId} may need operator review (orphan-payments).`);
+    setHostedStatus(`✓ You are Guardian #${pj.queue_position} of ${pj.queue_depth} for this file — pledged ${pj.pledged_hours} h (budget ${pj.amount_escrowed} ${pj.currency}). Dormant: you pay nothing more unless the file would otherwise drop; cancel any time for a full refund.`);
+  } catch (e) { setHostedStatus('⚠ ' + e.message, true); }
+}
+
+async function hostOwnCopy() {
+  if (!myUsername) { setHostedStatus('Log in first.', true); return; }
+  if (!hostedCid) { setHostedStatus('No CID — re-run the check.', true); return; }
+  const gw = getGateway();
+  const hours = Math.max(1, parseInt(document.getElementById('hosted-hours').value) || gateDefaultHours);
+  try {
+    setHostedStatus('Fetching own-copy quote…');
+    const qRes = await fetch(`${gw}/claims/own-copy/quote?cid=${encodeURIComponent(hostedCid)}&hours=${hours}`);
+    const q = await qRes.json().catch(() => ({}));
+    if (!qRes.ok) throw new Error(q.message || `quote failed (${qRes.status})`);
+
+    setHostedStatus(`Paying ${q.payment.amount} ${q.payment.currency} for ${q.quote.billable_hrs} h (Keychain)…`);
+    const txId = await keychainTransferGateToken({ to: q.payment.escrow_account, amount: q.payment.amount, memo: q.payment.memo, symbol: q.payment.currency });
+    if (!txId) throw new Error('payment cancelled or failed');
+
+    setHostedStatus('Waiting for tx to index (3s)…');
+    await new Promise(r => setTimeout(r, 3000));
+
+    const cRes = await fetch(`${gw}/claims/own-copy`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ owner: myUsername, cid: hostedCid, hours_requested: hours, tx_id: txId })
+    });
+    const cj = await cRes.json().catch(() => ({}));
+    if (!cRes.ok) throw new Error(`${cj.message || cRes.status} — payment tx ${txId} may need operator review (orphan-payments).`);
+    const until = cj.expires_at ? new Date(cj.expires_at).toLocaleString() : '?';
+    recordCtx(hostedCid, { filename: hostedFileName, context: 'own copy' });
+    setHostedStatus(`✓ Your own copy is live until ${until} (${cj.paid_hours} h paid, no re-upload needed). It survives regardless of what the other hosts do.`);
+    loadUploadsList();
+  } catch (e) { setHostedStatus('⚠ ' + e.message, true); }
 }
 async function uploadPublicFile(file, gatewayUrl) {
   const buf = new Uint8Array(await file.arrayBuffer());
@@ -1494,7 +1618,7 @@ async function confirmReceipt(env, fileBytes, btn, statusEl) {
     const j = await resp.json().catch(() => ({}));
     if (!resp.ok) { statusEl.textContent = '✗ ' + (j.message || j.error || `HTTP ${resp.status}`); if (btn) btn.disabled = false; return; }
     if (j.released && j.ended) {
-      statusEl.textContent = `✓ Receipt confirmed — hosting released early. ${j.fully_unpinned ? 'File unpinned.' : 'A backstop kept it alive.'} Owner refunded the unused time.`;
+      statusEl.textContent = `✓ Receipt confirmed — hosting released early. ${j.fully_unpinned ? 'File unpinned.' : 'A guardian kept it alive.'} Owner refunded the unused time.`;
       if (btn) btn.textContent = '✓ Released';
     } else if (j.released === false && typeof j.got === 'number') {
       statusEl.textContent = `✓ Receipt recorded — ${j.got}/${j.needed} recipients confirmed (all_of: waiting for the rest).`;

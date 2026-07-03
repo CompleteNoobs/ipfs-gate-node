@@ -1,7 +1,7 @@
 // ipfs-gate v1 — Stage 3 release-authority tests (node:test).
 // Pure policy evaluation (owner_only / any_of / all_of + owner override) AND the
 // DB lifecycle: a met threshold ENDS the owner's active claim, then the §5
-// lifecycle runs — release ≠ deletion, so a queued backstop still takes the baton;
+// lifecycle runs — release ≠ deletion, so a queued guardian still takes the baton;
 // and an unmet all_of never blocks the normal expiry timer.
 //
 //   node --test test/
@@ -45,15 +45,15 @@ function setupActiveClaim({ owner, cid, releasePolicy = null, sizeBytes = 5_000_
   return { claim_id, order_id, cid, owner };
 }
 
-function setupBackstop({ owner, cid, pledgedHours = 5, sizeBytes = 5_000_000 }) {
+function setupGuardian({ owner, cid, pledgedHours = 5, sizeBytes = 5_000_000 }) {
   const amount = pricing.calculateCost({ sizeBytes, hoursRequested: pledgedHours, copies: 1 }).total;
   const tx = newTx();
-  const payment = quota.recordPayment({ tx_id: tx, reservation_id: null, uploader: owner, currency: 'TEST', amount, memo: `ipfs-gate:backstop:${cid}`, block_num: 1, status: 'confirmed' });
+  const payment = quota.recordPayment({ tx_id: tx, reservation_id: null, uploader: owner, currency: 'TEST', amount, memo: `ipfs-gate:guardian:${cid}`, block_num: 1, status: 'confirmed' });
   const tnow = quota.now();
   const { claim_id } = quota.createOrderWithClaim({
     cid, owner, pinId: null, paymentId: payment.id, sizeBytes, sizeMB: pricing.billableMB(sizeBytes),
     rateLocked: pricing.RATE_PER_MB_HOUR, paidHours: pledgedHours, copies: 1, amountPaid: amount, currency: 'TEST',
-    startTs: tnow, expiryTs: tnow, kind: 'backstop', state: 'dormant'
+    startTs: tnow, expiryTs: tnow, kind: 'guardian', state: 'dormant'
   });
   return { claim_id, cid };
 }
@@ -91,12 +91,12 @@ test('all_of — ends only once EVERY listed recipient has consented', () => {
 
 // ─── DB lifecycle ────────────────────────────────────────────────────────────
 
-test('all_of release ends the claim only after the last consent, then a backstop promotes', () => {
+test('all_of release ends the claim only after the last consent, then a guardian promotes', () => {
   const cid = newCid();
   const r1 = u('recip'), r2 = u('recip');
   const policy = { type: 'all_of', addresses: [r1, r2] };
   const { claim_id, order_id, owner } = setupActiveClaim({ owner: u('alice'), cid, releasePolicy: policy });
-  const bar = setupBackstop({ owner: u('bob'), cid });
+  const bar = setupGuardian({ owner: u('bob'), cid });
 
   // r1 consents → not yet
   const d1 = releaseAuth.evaluateRelease({ policy, owner, releaser: r1, consented: quota.getReleaseConsents(order_id) });
@@ -113,12 +113,12 @@ test('all_of release ends the claim only after the last consent, then a backstop
   assert.equal(claim.claim_id, claim_id);
   assert.equal(quota.getClaim(claim_id).state, 'cancelled');  // released
   assert.equal(fully_unpinned, false);                        // release ≠ deletion
-  assert.equal(activated, bar.claim_id);                      // backstop took the baton
+  assert.equal(activated, bar.claim_id);                      // guardian took the baton
   assert.equal(quota.getClaim(bar.claim_id).state, 'active');
   assert.equal(quota.hasActivePinForCid(cid), true);          // file still alive
 });
 
-test('release with no backstop unpins the file', () => {
+test('release with no guardian unpins the file', () => {
   const cid = newCid();
   const { order_id } = setupActiveClaim({ owner: u('alice'), cid, releasePolicy: { type: 'owner_only' } });
   const { fully_unpinned, activated } = quota.endActiveClaimForRelease(quota.getActiveClaimForOrder(order_id).claim_id);

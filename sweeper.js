@@ -4,7 +4,7 @@
 //   2. Expires CLAIMS past their timer (the v1 lifecycle authority) + their pins
 //   3. Expires any legacy pins past their own clock
 //   4. Unpins from Kubo + GCs any CIDs that now have no active pin records
-//      (last-funder unpin; Stage 1b will promote a dormant backstop here instead)
+//      (last-funder unpin; Stage 1b will promote a dormant guardian here instead)
 //
 // Runs every SWEEPER_INTERVAL_MS (default 60s).
 

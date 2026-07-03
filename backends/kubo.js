@@ -75,6 +75,32 @@ async function pin(bytes) {
 }
 
 /**
+ * Compute the CID of bytes WITHOUT storing or pinning anything (Kubo's
+ * only-hash mode). Used by POST /check for already-hosted detection before the
+ * user pays. The cid-version/raw-leaves flags MUST stay identical to pin()'s,
+ * or the same bytes would hash to a different CID and detection breaks.
+ */
+async function cidOf(bytes) {
+  if (!Buffer.isBuffer(bytes)) {
+    throw Object.assign(new Error('cidOf() requires a Buffer'), { code: 'internal_error' });
+  }
+  const fd = new FormData();
+  fd.append('file', new Blob([bytes]), 'ciphertext.bin');
+  const qs = 'only-hash=true&pin=false&cid-version=1&raw-leaves=true&wrap-with-directory=false';
+  const res = await kuboFetch(`/api/v0/add?${qs}`, { body: fd });
+  const text = await res.text();
+  const firstLine = text.trim().split('\n').filter(Boolean).pop();
+  let parsed;
+  try { parsed = JSON.parse(firstLine || ''); } catch (e) {
+    throw Object.assign(new Error(`Kubo /add (only-hash) returned non-JSON: ${text.slice(0, 200)}`), { code: 'bad_gateway' });
+  }
+  if (!parsed.Hash) {
+    throw Object.assign(new Error(`Kubo /add (only-hash) returned no Hash: ${JSON.stringify(parsed)}`), { code: 'bad_gateway' });
+  }
+  return { cid: parsed.Hash };
+}
+
+/**
  * Unpin a CID. Idempotent — succeeds even if already unpinned.
  */
 async function unpin(cid) {
@@ -164,6 +190,7 @@ async function cat(cid) {
 
 module.exports = {
   pin,
+  cidOf,
   unpin,
   gc,
   exists,

@@ -207,8 +207,9 @@ async function broadcastRefund(claim, amount, reason) {
 }
 
 /**
- * Settle a user-initiated cancel refund. DORMANT backstop → full escrow minus
- * BACKSTOP_CANCEL_FEE_PCT (cohosting §6); ACTIVE claim → pro-rata. (claim is the
+ * Settle a user-initiated cancel refund (guardian spec §6). DORMANT guardian →
+ * FULL escrow (minus the optional GUARDIAN_CANCEL_FEE_PCT, default 0); ACTIVE
+ * claim (original / own_copy / activated guardian) → pro-rata. (claim is the
  * pre-flip row, so claim.state still reflects what it WAS.)
  */
 async function settleClaimRefund(claim, reason = 'cancel') {
@@ -221,12 +222,12 @@ async function settleClaimRefund(claim, reason = 'cancel') {
 
 /**
  * Settle a refund for an ADMIN force-action (cohosting §7). innocent=true (a
- * CID-ban backstopper) → full escrow no fee; otherwise per refund_policy.
+ * CID-ban guardian) → full escrow no fee; otherwise per refund_policy.
  */
 async function settleForcedRefund(claim, { policy = 'prorata', innocent = false } = {}) {
   const amount = pricing.forcedRefundAmount(claim, { policy, innocent });
   const reason = innocent
-    ? 'admin_void_innocent_backstop'
+    ? 'admin_void_innocent_guardian'
     : (policy === 'none' ? 'admin_void_forfeit' : 'admin_void_prorata');
   return broadcastRefund(claim, amount, reason);
 }
@@ -288,11 +289,18 @@ app.get('/', (req, res) => {
       mb_divisor: pricing.MB_DIVISOR,
       node_count: pricing.getNodeCount(),
       // copies selector range the gate offers (1..node_count) + the Cluster
-      // self-heal leeway. node_count=1 → backstop is the only co-host option.
+      // self-heal leeway. node_count=1 → guardian is the only co-host option.
       copies_max: pricing.getNodeCount(),
-      replication_leeway: pricing.REPLICATION_LEEWAY
+      replication_leeway: pricing.REPLICATION_LEEWAY,
+      guardian_cancel_fee_pct: pricing.GUARDIAN_CANCEL_FEE_PCT
     },
-    features: { public_uploads: true, uploads_tab: true, claim_model: true }
+    features: {
+      public_uploads: true, uploads_tab: true, claim_model: true,
+      // Guardian feature (multi-participant hosting of the same CID):
+      // POST /check (already-hosted detection), POST /claims/own-copy,
+      // GET|POST /guardian/* (the dormant-pledge queue).
+      guardian: true, own_copy: true, cid_check: true
+    }
   });
 });
 
@@ -570,6 +578,11 @@ app.post('/upload', uploadLimiter, upload.single('ciphertext'), async (req, res)
     //     pin (mirroring the claim's expiry_ts) + the order/claim atomically.
     //     The claim's expiry_ts is the lifecycle authority; the pin row carries
     //     the same timestamp so disk/serve accounting and the sweeper agree.
+    //     Guardian spec §2: if the CID is ALREADY live-hosted, this uploader is
+    //     not the original host — their claim is an independent own_copy (same
+    //     mechanics, distinct role). Checked before our own pin row lands.
+    const hostedBefore = quota.alreadyHostedForCid(cid);
+    const claimKind = hostedBefore ? 'own_copy' : 'original';
     const hoursPaid = (r.hours_requested && r.hours_requested > 0) ? r.hours_requested : DEFAULT_HOURS;
     const copies = pricing.cappedCopies(r.copies || 1);
     const sizeMB = pricing.billableMB(sizeBytes);
@@ -602,6 +615,7 @@ app.post('/upload', uploadLimiter, upload.single('ciphertext'), async (req, res)
       currency: payResult.currency,
       startTs,
       expiryTs,
+      kind: claimKind,
       releasePolicy: releasePolicyObj,
       receiptHash
     });
@@ -624,6 +638,7 @@ app.post('/upload', uploadLimiter, upload.single('ciphertext'), async (req, res)
       claim_id: claim.claim_id,
       order_id: claim.order_id,
       claim: {
+        kind: claimKind,
         paid_hours: hoursPaid,
         copies,
         size_mb: sizeMB,
@@ -639,6 +654,9 @@ app.post('/upload', uploadLimiter, upload.single('ciphertext'), async (req, res)
 
 /**
  * GET /status/:cid
+ * Guardian feature: also surfaces the "already hosted" snapshot (how long the
+ * file is paid to stay up + the co-hosting options) so a client that knows the
+ * CID can offer own-copy / guardian without uploading anything.
  */
 app.get('/status/:cid', (req, res) => {
   try {
@@ -646,16 +664,74 @@ app.get('/status/:cid', (req, res) => {
     if (quota.isCidBlocked(cid)) {
       return respondError(res, 'legal_takedown', 'this CID has been removed');
     }
-    const active = quota.getActivePinsForCid(cid);
-    if (active.length === 0) {
+    const hosted = quota.alreadyHostedForCid(cid);
+    if (!hosted) {
       return respondError(res, 'not_found', 'CID not pinned');
     }
-    const maxExpiry = Math.max(...active.map(p => p.expires_at));
     res.json({
       cid,
       pinned: true,
-      expires_at: isoFromMs(maxExpiry),
-      active_pin_count: active.length
+      already_hosted: true,
+      expires_at: isoFromMs(hosted.hosted_until),
+      hosted_until: isoFromMs(hosted.hosted_until),
+      active_pin_count: hosted.active_hosts,
+      active_hosts: hosted.active_hosts,
+      guardian_queue_depth: hosted.guardian_queue_depth
+    });
+  } catch (e) {
+    return handleError(res, e);
+  }
+});
+
+/**
+ * POST /check — already-hosted detection (guardian spec §3 / §8 item 1).
+ * multipart/form-data with a `ciphertext` file field (same field as /upload).
+ * Computes the CID via Kubo only-hash — nothing is stored, pinned or paid —
+ * and reports whether the file is already hosted here, how long it's paid to
+ * stay up, and the two co-hosting options (own copy / guardian). Clients call
+ * this FIRST, before /reserve + payment, so the user can choose to back the
+ * existing copy instead of re-uploading and re-paying from scratch.
+ */
+app.post('/check', uploadLimiter, upload.single('ciphertext'), async (req, res) => {
+  try {
+    if (!req.file || !req.file.buffer) {
+      return respondError(res, 'bad_request', 'ciphertext file field required');
+    }
+    if (req.file.buffer.length > MAX_FILE_SIZE_BYTES) {
+      return respondError(res, 'payload_too_large', `file exceeds ${MAX_FILE_SIZE_MB}MB`);
+    }
+
+    const { cid } = await kubo.cidOf(req.file.buffer);
+    if (quota.isCidBlocked(cid)) {
+      return respondError(res, 'legal_takedown', 'this CID is blocked on this server');
+    }
+
+    const hosted = quota.alreadyHostedForCid(cid);
+    if (!hosted) {
+      return res.json({ cid, already_hosted: false });
+    }
+
+    // Quote hints for both options at the default duration — the client re-quotes
+    // with the user's chosen hours via /claims/own-copy/quote / /guardian/quote.
+    const quote = pricing.calculateCost({ sizeBytes: hosted.size_bytes, hoursRequested: DEFAULT_HOURS, copies: 1 });
+    res.json({
+      cid,
+      already_hosted: true,
+      hosted_until: isoFromMs(hosted.hosted_until),
+      active_hosts: hosted.active_hosts,
+      guardian_queue_depth: hosted.guardian_queue_depth,
+      options: {
+        own_copy: {
+          description: 'Pay now for your own independent copy (own timer, own refund).',
+          quote_url: `/claims/own-copy/quote?cid=${encodeURIComponent(cid)}`,
+          default_quote: { hours: quote.billable_hrs, amount: quote.total, currency: PAYMENT_CURRENCY }
+        },
+        guardian: {
+          description: 'Pledge a budget that only spends if the file would otherwise be dropped; takes over hosting FIFO when the last live host ends.',
+          quote_url: `/guardian/quote?cid=${encodeURIComponent(cid)}`,
+          default_quote: { hours: quote.billable_hrs, amount: quote.total, currency: PAYMENT_CURRENCY }
+        }
+      }
     });
   } catch (e) {
     return handleError(res, e);
@@ -800,7 +876,7 @@ app.post('/uploads/delete', userApiLimiter, async (req, res) => {
         removed++;
         if (r.fully_unpinned) fullyUnpinned = true;
         const refund = await settleClaimRefund(r.claim, 'user_deleted');
-        refunds.push({ claim_id: c.claim_id, activated_backstop: r.activated || null, ...refund });
+        refunds.push({ claim_id: c.claim_id, activated_guardian: r.activated || null, ...refund });
       }
     } else {
       const result = quota.removePinForUploader(cid, account);
@@ -853,8 +929,8 @@ app.post('/claims/cancel', userApiLimiter, async (req, res) => {
 
     // Atomic, status-locked cancel (quota.cancelClaim) — only one cancel wins, so
     // the refund settled below can't double-pay on a concurrent cancel. Cancelling
-    // an ACTIVE claim may promote a queued backstop (FIFO) instead of unpinning;
-    // cancelling a DORMANT backstop just voids the pledge (escrow-minus-fee refund).
+    // an ACTIVE claim may promote a queued guardian (FIFO) instead of unpinning;
+    // cancelling a DORMANT guardian just voids the pledge (full-escrow refund).
     const { claim, fully_unpinned, activated, was_dormant } = quota.cancelClaim(claim_id, account);
     const refund = await settleClaimRefund(claim, 'cancel');
 
@@ -871,7 +947,7 @@ app.post('/claims/cancel', userApiLimiter, async (req, res) => {
       ok: true, claim_id, cid: claim.cid,
       was_dormant: !!was_dormant,
       fully_unpinned,
-      activated_backstop: activated || null,
+      activated_guardian: activated || null,
       refund
     });
   } catch (e) {
@@ -886,7 +962,7 @@ app.post('/claims/cancel', userApiLimiter, async (req, res) => {
  * A recipient (or the owner) consents to stop hosting. When the order's
  * release_policy threshold is met (owner override / any_of / all_of), the order's
  * active claim is ENDED → pro-rata refund to the owner → the §5 lifecycle runs
- * (release ≠ deletion: a queued backstop still takes the baton).
+ * (release ≠ deletion: a queued guardian still takes the baton).
  */
 app.post('/claims/release', userApiLimiter, async (req, res) => {
   try {
@@ -956,7 +1032,7 @@ app.post('/claims/release', userApiLimiter, async (req, res) => {
     res.json({
       ok: true, order_id, released: true, ended: true,
       claim_id: claim.claim_id, cid: claim.cid, policy_type: policy.type,
-      fully_unpinned, activated_backstop: activated || null, refund
+      fully_unpinned, activated_guardian: activated || null, refund
     });
   } catch (e) {
     return handleError(res, e);
@@ -1060,27 +1136,211 @@ app.post('/claims/receipt', userApiLimiter, async (req, res) => {
     res.json({
       ok: true, order_id, receipt_recorded: true, released: true, ended: true,
       claim_id: claim.claim_id, cid: claim.cid, policy_type: policy.type,
-      fully_unpinned, activated_backstop: activated || null, refund, receipts: receiptList
+      fully_unpinned, activated_guardian: activated || null, refund, receipts: receiptList
     });
   } catch (e) {
     return handleError(res, e);
   }
 });
 
-// ─── Backstop (co-hosting safety-net) ────────────────────────────────────────
-// A backstop is a prepaid, dormant claim on an already-hosted CID that activates
-// (FIFO) only if the file would otherwise be deleted (cohosting-backstop.md). It
-// adds no bytes (leans on the existing copy), so it needs no disk reservation —
-// just pay into escrow and the gate records the dormant claim. Replay-guarded by
-// payments.tx_id UNIQUE (no reservation needed). The pledger pays into escrow now;
-// the escrow is consumed only across the stretch the backstop is the live host.
+// ─── Guardian (co-hosting safety-net; UI label "Guardian") ──────────────────
+// A guardian is a prepaid, dormant claim on an already-hosted CID that activates
+// (FIFO — strictly pledge order) only if the file would otherwise be deleted
+// (guardian spec §4). It adds no bytes (leans on the existing copy), so it needs
+// no disk reservation — just pay into escrow and the gate records the dormant
+// claim. Replay-guarded by payments.tx_id UNIQUE. The pledged budget is consumed
+// only across the stretch the guardian is the live host; a dormant cancel
+// refunds it in full (spec §6).
+//
+// Routes live at /guardian/*; the pre-rename /backstop/* paths stay as aliases
+// (the alias quotes/verifies the legacy ipfs-gate:backstop:<cid> memo, so a
+// pledge started against an old quote still lands after an upgrade).
+
+function guardianQuoteHandler(memoPurpose) {
+  return (req, res) => {
+    try {
+      const cid = String(req.query.cid || '');
+      const hours = (req.query.hours === undefined) ? DEFAULT_HOURS : Number(req.query.hours);
+      const copies = (req.query.copies === undefined) ? 1 : Number(req.query.copies);
+      if (!cid) return respondError(res, 'bad_request', 'cid required');
+      if (quota.isCidBlocked(cid)) return respondError(res, 'legal_takedown', 'this CID is blocked on this server');
+
+      const hosted = quota.alreadyHostedForCid(cid);
+      if (!hosted) {
+        return respondError(res, 'not_found', 'CID is not currently hosted here — you can only guard a live file');
+      }
+      const quote = pricing.calculateCost({ sizeBytes: hosted.size_bytes, hoursRequested: hours, copies });
+
+      res.json({
+        cid,
+        mode: 'guardian',
+        hosted_until: isoFromMs(hosted.hosted_until),
+        payment: {
+          currency: PAYMENT_CURRENCY,
+          amount: String(quote.total),
+          escrow_account: IPFS_GATE_HIVE_ACCOUNT,
+          memo: `ipfs-gate:${memoPurpose}:${cid}`
+        },
+        quote: {
+          billable_mb: quote.billable_mb,
+          billable_hrs: quote.billable_hrs,
+          copies: quote.copies,
+          copies_requested: Math.max(1, Math.floor(copies) || 1),
+          copies_capped: quote.copies < Math.max(1, Math.floor(copies) || 1),
+          node_count: pricing.getNodeCount(),
+          replication: pricing.replicationConfig(quote.copies),
+          rate_per_mb_hour: quote.rate,
+          total: quote.total,
+          currency: PAYMENT_CURRENCY
+        },
+        queue_depth: hosted.guardian_queue_depth
+      });
+    } catch (e) {
+      return handleError(res, e);
+    }
+  };
+}
+
+function guardianPledgeHandler(memoPurpose) {
+  return async (req, res) => {
+    try {
+      const { pledger, cid, tx_id } = req.body || {};
+      const hours = (req.body && req.body.hours_requested === undefined) ? DEFAULT_HOURS : Number(req.body.hours_requested);
+      const copies = (req.body && req.body.copies === undefined) ? 1 : Number(req.body.copies);
+      if (typeof pledger !== 'string' || !pledger || typeof cid !== 'string' || !cid || !tx_id) {
+        return respondError(res, 'bad_request', 'pledger, cid, tx_id required');
+      }
+      const account = pledger.toLowerCase();
+      if (quota.isAccountBanned(account)) return respondError(res, 'forbidden', 'pledger is banned');
+      if (quota.isCidBlocked(cid)) return respondError(res, 'legal_takedown', 'this CID is blocked on this server');
+
+      const hosted = quota.alreadyHostedForCid(cid);
+      if (!hosted) {
+        return respondError(res, 'not_found', 'CID is not currently hosted here — you can only guard a live file');
+      }
+      const quote = pricing.calculateCost({ sizeBytes: hosted.size_bytes, hoursRequested: hours, copies });
+
+      if (quota.getPaymentByTxId(tx_id)) return respondError(res, 'conflict', 'tx_id already used');
+
+      const expectedMemo = `ipfs-gate:${memoPurpose}:${cid}`;
+      let payResult;
+      try {
+        payResult = await hive.verifyPayment({ tx_id, sender: account, expectedMemo, expectedAmount: quote.total });
+      } catch (e) {
+        return handleError(res, e, 'unprocessable_entity');
+      }
+
+      let sc;
+      try {
+        sc = await hive.verifyHiveEngineSidechain(tx_id);
+      } catch (e) {
+        return respondError(res, 'unprocessable_entity', `Hive-Engine sidechain unreachable: ${e.message}`);
+      }
+      if (sc.confirmed === false) {
+        const detail = sc.reason === 'rejected'
+          ? ((sc.errors || []).join('; ') || 'sidechain rejected the transfer')
+          : 'sidechain did not confirm within the retry budget — try again in ~30s';
+        return respondError(res, 'unprocessable_entity', `Hive-Engine did not confirm: ${detail}`);
+      }
+
+      let payment;
+      try {
+        payment = quota.recordPayment({
+          tx_id, reservation_id: null, uploader: account,
+          currency: payResult.currency, amount: payResult.paid,
+          memo: expectedMemo, block_num: payResult.block_num, status: 'confirmed'
+        });
+      } catch (e) {
+        return handleError(res, e);
+      }
+
+      // Dormant claim: no pin, placeholder start/expiry (set on activation).
+      // pledge_order (FIFO slot) + pledge_budget are stamped by the DB layer.
+      const tnow = quota.now();
+      const claim = quota.createOrderWithClaim({
+        cid, owner: account, pinId: null, paymentId: payment.id,
+        sizeBytes: hosted.size_bytes, sizeMB: quote.billable_mb, rateLocked: pricing.RATE_PER_MB_HOUR,
+        paidHours: quote.billable_hrs, copies: quote.copies,
+        amountPaid: payResult.paid, currency: payResult.currency,
+        startTs: tnow, expiryTs: tnow,
+        kind: 'guardian', state: 'dormant'
+      });
+
+      const queue = quota.getDormantGuardiansForCid(cid).map(c => c.claim_id);
+      res.json({
+        ok: true, claim_id: claim.claim_id, cid, kind: 'guardian', state: 'dormant',
+        pledged_hours: quote.billable_hrs, copies: quote.copies,
+        pledge_order: claim.pledge_order,
+        pledge_budget: payResult.paid,
+        amount_escrowed: payResult.paid, currency: payResult.currency,
+        queue_position: queue.indexOf(claim.claim_id) + 1, queue_depth: queue.length
+      });
+    } catch (e) {
+      return handleError(res, e);
+    }
+  };
+}
+
+function guardianQueueHandler(req, res) {
+  try {
+    const cid = String(req.query.cid || '');
+    if (!cid) return respondError(res, 'bad_request', 'cid required');
+    const active = quota.getActiveClaimsForCid(cid).map(c => ({
+      claim_id: c.claim_id, owner: c.owner, kind: c.kind,
+      paid_hours: c.paid_hours, expires_at: isoFromMs(c.expiry_ts)
+    }));
+    const dormant = quota.getDormantGuardiansForCid(cid).map((c, i) => ({
+      position: i + 1, pledge_order: c.pledge_order, claim_id: c.claim_id, owner: c.owner,
+      pledged_hours: c.paid_hours, pledge_budget: c.pledge_budget,
+      amount_escrowed: c.amount_paid, currency: c.currency
+    }));
+    res.json({
+      cid,
+      active,
+      guardian_queue: dormant,
+      total_pledged_hours: dormant.reduce((s, c) => s + c.pledged_hours, 0)
+    });
+  } catch (e) {
+    return handleError(res, e);
+  }
+}
 
 /**
- * GET /backstop/quote?cid=<cid>&hours=<h>&copies=<c>
- * Quote the cost to backstop an already-hosted CID. Pay this amount to
- * payment.escrow_account with payment.memo, then POST /backstop/pledge.
+ * GET /guardian/quote?cid=<cid>&hours=<h>&copies=<c>
+ * Quote the budget to guard an already-hosted CID. Pay this amount to
+ * payment.escrow_account with payment.memo, then POST /guardian/pledge.
+ *
+ * POST /guardian/pledge
+ * Body: { pledger, cid, hours_requested?, copies?, tx_id }
+ * Verifies the on-chain escrow payment (memo ipfs-gate:guardian:<cid>, sender =
+ * pledger, amount ≥ quote) and records a DORMANT guardian claim with the next
+ * FIFO pledge_order. It activates automatically when the CID's last live host
+ * ends (cancel or expiry) — never while any other live host remains.
+ *
+ * GET /guardian/queue?cid=<cid>
+ * Public during testing (cohosting §9) — the live hosts + the FIFO guardian
+ * queue (identities + budgets) for debug visibility.
  */
-app.get('/backstop/quote', userApiLimiter, (req, res) => {
+app.get('/guardian/quote', userApiLimiter, guardianQuoteHandler('guardian'));
+app.post('/guardian/pledge', uploadLimiter, guardianPledgeHandler('guardian'));
+app.get('/guardian/queue', guardianQueueHandler);
+// Legacy aliases (pre-Guardian naming) — same behaviour, legacy pledge memo.
+app.get('/backstop/quote', userApiLimiter, guardianQuoteHandler('backstop'));
+app.post('/backstop/pledge', uploadLimiter, guardianPledgeHandler('backstop'));
+app.get('/backstop/queue', guardianQueueHandler);
+
+// ─── Own copy (guardian spec §2/§3 "Host my own copy") ──────────────────────
+// A later user pays NOW for their own independent copy of an already-hosted
+// CID — own timer, own pro-rata refund, survives regardless of what anyone
+// else does. No byte transfer: the bytes are already in Kubo, so this is a
+// pay → verify → DB-rows flow, same as a guardian pledge but live immediately.
+
+/**
+ * GET /claims/own-copy/quote?cid=<cid>&hours=<h>&copies=<c>
+ * Quote an own-copy claim on an already-hosted CID. Pay to
+ * payment.escrow_account with payment.memo, then POST /claims/own-copy.
+ */
+app.get('/claims/own-copy/quote', userApiLimiter, (req, res) => {
   try {
     const cid = String(req.query.cid || '');
     const hours = (req.query.hours === undefined) ? DEFAULT_HOURS : Number(req.query.hours);
@@ -1088,21 +1348,26 @@ app.get('/backstop/quote', userApiLimiter, (req, res) => {
     if (!cid) return respondError(res, 'bad_request', 'cid required');
     if (quota.isCidBlocked(cid)) return respondError(res, 'legal_takedown', 'this CID is blocked on this server');
 
-    const active = quota.getActivePinsForCid(cid);
-    if (active.length === 0) {
-      return respondError(res, 'not_found', 'CID is not currently hosted here — you can only backstop a live file');
+    const hosted = quota.alreadyHostedForCid(cid);
+    if (!hosted) {
+      return respondError(res, 'not_found', 'CID is not currently hosted here — upload it via /reserve + /upload instead');
     }
-    const sizeBytes = active[0].size_bytes;
-    const quote = pricing.calculateCost({ sizeBytes, hoursRequested: hours, copies });
+    const quote = pricing.calculateCost({ sizeBytes: hosted.size_bytes, hoursRequested: hours, copies });
 
     res.json({
       cid,
-      mode: 'backstop',
+      mode: 'own_copy',
+      hosted_until: isoFromMs(hosted.hosted_until),
+      // A second copy is only real redundancy when the gate has a free node
+      // (current copies < node_count) — surfaced, never silently capped (§2).
+      node_count: pricing.getNodeCount(),
+      current_copies: hosted.active_hosts,
+      adds_redundancy: hosted.active_hosts < pricing.getNodeCount(),
       payment: {
         currency: PAYMENT_CURRENCY,
         amount: String(quote.total),
         escrow_account: IPFS_GATE_HIVE_ACCOUNT,
-        memo: `ipfs-gate:backstop:${cid}`
+        memo: `ipfs-gate:owncopy:${cid}`
       },
       quote: {
         billable_mb: quote.billable_mb,
@@ -1110,13 +1375,10 @@ app.get('/backstop/quote', userApiLimiter, (req, res) => {
         copies: quote.copies,
         copies_requested: Math.max(1, Math.floor(copies) || 1),
         copies_capped: quote.copies < Math.max(1, Math.floor(copies) || 1),
-        node_count: pricing.getNodeCount(),
-        replication: pricing.replicationConfig(quote.copies),
         rate_per_mb_hour: quote.rate,
         total: quote.total,
         currency: PAYMENT_CURRENCY
-      },
-      queue_depth: quota.getDormantBackstopsForCid(cid).length
+      }
     });
   } catch (e) {
     return handleError(res, e);
@@ -1124,34 +1386,33 @@ app.get('/backstop/quote', userApiLimiter, (req, res) => {
 });
 
 /**
- * POST /backstop/pledge
- * Body: { pledger, cid, hours_requested?, copies?, tx_id }
- * Verifies the on-chain escrow payment (memo ipfs-gate:backstop:<cid>, sender =
- * pledger, amount ≥ quote) and records a DORMANT backstop claim. It activates
- * automatically (FIFO) when the CID's last active claim ends.
+ * POST /claims/own-copy
+ * Body: { owner, cid, hours_requested?, copies?, tx_id }
+ * Verifies the on-chain payment (memo ipfs-gate:owncopy:<cid>, sender = owner,
+ * amount ≥ quote) and creates a LIVE own_copy claim + its own pin row on the
+ * already-hosted bytes. Independent lifecycle from day one.
  */
-app.post('/backstop/pledge', uploadLimiter, async (req, res) => {
+app.post('/claims/own-copy', uploadLimiter, async (req, res) => {
   try {
-    const { pledger, cid, tx_id } = req.body || {};
+    const { owner, cid, tx_id } = req.body || {};
     const hours = (req.body && req.body.hours_requested === undefined) ? DEFAULT_HOURS : Number(req.body.hours_requested);
     const copies = (req.body && req.body.copies === undefined) ? 1 : Number(req.body.copies);
-    if (typeof pledger !== 'string' || !pledger || typeof cid !== 'string' || !cid || !tx_id) {
-      return respondError(res, 'bad_request', 'pledger, cid, tx_id required');
+    if (typeof owner !== 'string' || !owner || typeof cid !== 'string' || !cid || !tx_id) {
+      return respondError(res, 'bad_request', 'owner, cid, tx_id required');
     }
-    const account = pledger.toLowerCase();
-    if (quota.isAccountBanned(account)) return respondError(res, 'forbidden', 'pledger is banned');
+    const account = owner.toLowerCase();
+    if (quota.isAccountBanned(account)) return respondError(res, 'forbidden', 'owner is banned');
     if (quota.isCidBlocked(cid)) return respondError(res, 'legal_takedown', 'this CID is blocked on this server');
 
-    const active = quota.getActivePinsForCid(cid);
-    if (active.length === 0) {
-      return respondError(res, 'not_found', 'CID is not currently hosted here — you can only backstop a live file');
+    const hosted = quota.alreadyHostedForCid(cid);
+    if (!hosted) {
+      return respondError(res, 'not_found', 'CID is not currently hosted here — upload it via /reserve + /upload instead');
     }
-    const sizeBytes = active[0].size_bytes;
-    const quote = pricing.calculateCost({ sizeBytes, hoursRequested: hours, copies });
+    const quote = pricing.calculateCost({ sizeBytes: hosted.size_bytes, hoursRequested: hours, copies });
 
     if (quota.getPaymentByTxId(tx_id)) return respondError(res, 'conflict', 'tx_id already used');
 
-    const expectedMemo = `ipfs-gate:backstop:${cid}`;
+    const expectedMemo = `ipfs-gate:owncopy:${cid}`;
     let payResult;
     try {
       payResult = await hive.verifyPayment({ tx_id, sender: account, expectedMemo, expectedAmount: quote.total });
@@ -1183,51 +1444,19 @@ app.post('/backstop/pledge', uploadLimiter, async (req, res) => {
       return handleError(res, e);
     }
 
-    // Dormant claim: no pin, placeholder start/expiry (set on activation).
-    const tnow = quota.now();
-    const claim = quota.createOrderWithClaim({
-      cid, owner: account, pinId: null, paymentId: payment.id,
-      sizeBytes, sizeMB: quote.billable_mb, rateLocked: pricing.RATE_PER_MB_HOUR,
+    const claim = quota.createOwnCopyClaim({
+      cid, owner: account, paymentId: payment.id,
       paidHours: quote.billable_hrs, copies: quote.copies,
-      amountPaid: payResult.paid, currency: payResult.currency,
-      startTs: tnow, expiryTs: tnow,
-      kind: 'backstop', state: 'dormant'
+      rateLocked: pricing.RATE_PER_MB_HOUR,
+      amountPaid: payResult.paid, currency: payResult.currency
     });
 
-    const queue = quota.getDormantBackstopsForCid(cid).map(c => c.claim_id);
     res.json({
-      ok: true, claim_id: claim.claim_id, cid, kind: 'backstop', state: 'dormant',
-      pledged_hours: quote.billable_hrs, copies: quote.copies,
-      amount_escrowed: payResult.paid, currency: payResult.currency,
-      queue_position: queue.indexOf(claim.claim_id) + 1, queue_depth: queue.length
-    });
-  } catch (e) {
-    return handleError(res, e);
-  }
-});
-
-/**
- * GET /backstop/queue?cid=<cid>
- * Public during testing (cohosting §9) — shows the active funder + the FIFO
- * backstop queue (identities + amounts) for debug visibility.
- */
-app.get('/backstop/queue', (req, res) => {
-  try {
-    const cid = String(req.query.cid || '');
-    if (!cid) return respondError(res, 'bad_request', 'cid required');
-    const active = quota.getActiveClaimsForCid(cid).map(c => ({
-      claim_id: c.claim_id, owner: c.owner, kind: c.kind,
-      paid_hours: c.paid_hours, expires_at: isoFromMs(c.expiry_ts)
-    }));
-    const dormant = quota.getDormantBackstopsForCid(cid).map((c, i) => ({
-      position: i + 1, claim_id: c.claim_id, owner: c.owner,
-      pledged_hours: c.paid_hours, amount_escrowed: c.amount_paid, currency: c.currency
-    }));
-    res.json({
-      cid,
-      active,
-      backstop_queue: dormant,
-      total_pledged_hours: dormant.reduce((s, c) => s + c.pledged_hours, 0)
+      ok: true, claim_id: claim.claim_id, order_id: claim.order_id, cid,
+      kind: 'own_copy', state: 'active',
+      paid_hours: quote.billable_hrs, copies: quote.copies,
+      expires_at: isoFromMs(claim.expiry_ts),
+      amount_paid: payResult.paid, currency: payResult.currency
     });
   } catch (e) {
     return handleError(res, e);
@@ -1354,7 +1583,7 @@ app.post('/admin/ban', requireAdmin, async (req, res) => {
     }
 
     // Unpin from Kubo (best-effort) for CIDs with no funder left (no other user's
-    // backstop took the baton).
+    // guardian took the baton).
     let unpinned = 0;
     for (const cid of result.cids_to_unpin) {
       try {
@@ -1372,7 +1601,7 @@ app.post('/admin/ban', requireAdmin, async (req, res) => {
       banned: String(hive_account).toLowerCase(),
       pins_affected: result.pins_affected,
       claims_voided: result.voided_claims.length,
-      backstops_activated: result.activated.length,
+      guardians_activated: result.activated.length,
       cids_unpinned: unpinned,
       refunds,
       moderation_log_id: result.moderation_log_id
@@ -1397,18 +1626,18 @@ app.post('/admin/takedown', requireAdmin, async (req, res) => {
     const { cid, reason, refund_policy } = req.body || {};
     const result = moderation.takedownCid({ cid, reason, refund_policy });
 
-    // Settle refunds (cohosting §7): dormant backstoppers are INNOCENT third
+    // Settle refunds (cohosting §7): dormant guardians are INNOCENT third
     // parties → full escrow, no fee; the active host/offender follows refund_policy.
     const refunds = { sent: 0, pending: 0, failed: 0, skipped: 0 };
-    let backstoppers_refunded = 0;
+    let guardians_refunded = 0;
     for (const claim of result.voided_claims) {
       const innocent = claim.state === 'dormant';
-      if (innocent) backstoppers_refunded++;
+      if (innocent) guardians_refunded++;
       const r = await settleForcedRefund(claim, { policy: result.refund_policy, innocent });
       refunds[r.status] = (refunds[r.status] || 0) + 1;
     }
 
-    // Content kill — always unpin (the whole queue was voided; no backstop survives).
+    // Content kill — always unpin (the whole queue was voided; no guardian survives).
     let unpinned = false;
     try {
       await kubo.unpin(cid);
@@ -1421,7 +1650,7 @@ app.post('/admin/takedown', requireAdmin, async (req, res) => {
       cid,
       pins_affected: result.pins_affected,
       claims_voided: result.voided_claims.length,
-      backstoppers_refunded,
+      guardians_refunded,
       refund_policy: result.refund_policy,
       refunds,
       unpinned_from_kubo: unpinned,

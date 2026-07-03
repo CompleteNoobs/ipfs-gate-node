@@ -18,8 +18,12 @@ const MIN_REFUND       = parseFloat(process.env.MIN_REFUND || '0.05');      // b
 // Universal precision floor — the v4call lesson: the gate must be able to actually
 // charge/refund at whatever precision it quotes, or funds round to 0 and stick.
 const RATE_FLOOR       = parseFloat(process.env.RATE_FLOOR || '0.001');
-// Stage-1b seam: documented now, consumed when backstops land. NOT used in 1a.
-const BACKSTOP_CANCEL_FEE_PCT = parseFloat(process.env.BACKSTOP_CANCEL_FEE_PCT || '1');
+// Guardian spec §6: a dormant guardian that never activated gets a FULL refund
+// (started nothing, used no disk) — so the fee DEFAULTS TO 0. The knob stays for
+// operators who want an anti-churn fee; the old BACKSTOP_ env name is honoured.
+const GUARDIAN_CANCEL_FEE_PCT = parseFloat(
+  process.env.GUARDIAN_CANCEL_FEE_PCT ?? process.env.BACKSTOP_CANCEL_FEE_PCT ?? '0'
+);
 
 const HOUR_MS = 60 * 60 * 1000;
 
@@ -119,12 +123,13 @@ function calculateRefund(claim, now = Date.now()) {
 }
 
 /**
- * Refund for a DORMANT backstop the pledger cancels before it ever activates.
- * Full escrow back minus BACKSTOP_CANCEL_FEE_PCT (anti-churn; cohosting §3/§6).
- * The fee applies ONLY to user-initiated dormant cancels — admin-forced voids
- * pass feePct=0 (cohosting §7). Returns { amount, fee, dust }.
+ * Refund for a DORMANT guardian the pledger cancels before it ever activates.
+ * Guardian spec §6: FULL escrow back (fee defaults to 0; GUARDIAN_CANCEL_FEE_PCT
+ * lets an operator charge an anti-churn cut). The fee applies ONLY to
+ * user-initiated dormant cancels — admin-forced voids pass feePct=0 (cohosting
+ * §7). Returns { amount, fee, dust }.
  */
-function calculateDormantRefund(claim, feePct = BACKSTOP_CANCEL_FEE_PCT) {
+function calculateDormantRefund(claim, feePct = GUARDIAN_CANCEL_FEE_PCT) {
   const escrow = Number(claim.amount_paid);
   if (!Number.isFinite(escrow) || escrow <= 0) return { amount: 0, fee: 0, dust: true };
   const fee = roundCoins(escrow * (Math.max(0, feePct) / 100));
@@ -135,7 +140,7 @@ function calculateDormantRefund(claim, feePct = BACKSTOP_CANCEL_FEE_PCT) {
 
 /**
  * Refund amount for a claim ended by an ADMIN force-action (cohosting §7).
- *   - innocent backstopper (CID ban voided an innocent third party's pledge)
+ *   - innocent guardian (CID ban voided an innocent third party's pledge)
  *       → FULL escrow back, no fee.
  *   - offender / banned-user's own claim, policy 'none'  → 0 (forfeit).
  *   - offender / banned-user's own claim, policy 'prorata':
@@ -169,6 +174,6 @@ module.exports = {
   REPLICATION_LEEWAY,
   MIN_REFUND,
   RATE_FLOOR,
-  BACKSTOP_CANCEL_FEE_PCT,
+  GUARDIAN_CANCEL_FEE_PCT,
   HOUR_MS
 };
