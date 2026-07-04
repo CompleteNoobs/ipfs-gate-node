@@ -232,6 +232,76 @@ async function settleForcedRefund(claim, { policy = 'prorata', innocent = false 
   return broadcastRefund(claim, amount, reason);
 }
 
+// ─── Whitelist fee exemption (WHITELIST-MODE-DESIGN-NOTES.md §4) ─────────────
+
+/**
+ * The account's live whitelist entry IF it is currently fee-exempt, else null.
+ * Recomputed fresh at every quote/pay call site — guardian pledge and own-copy
+ * bypass /reserve, so there's no stored flag to reuse there.
+ */
+function feeExemptEntryFor(account) {
+  if (!quota.whitelistModeEnabled()) return null;
+  const entry = quota.getWhitelistEntry(account);
+  return (entry && entry.fee_exempt) ? entry : null;
+}
+
+/**
+ * Verify an on-chain payment, OR — when feeExempt — skip verification entirely
+ * and record a synthetic zero-amount payment row so the FK-required
+ * pins.payment_id / claims.payment_id still resolve. The synthetic tx_id must
+ * still be globally unique (payments.tx_id UNIQUE) — callers namespace it off
+ * the purpose + cid + account + timestamp. Throws with a `code` the caller
+ * routes through handleError; the non-exempt path preserves the exact error
+ * behavior the pledge/own-copy routes had inline before this refactor.
+ */
+async function verifyOrSkipPayment({ feeExempt, tx_id, sender, expectedMemo, expectedAmount, syntheticTxId }) {
+  if (feeExempt) {
+    const payment = quota.recordPayment({
+      tx_id: syntheticTxId, reservation_id: null, uploader: sender,
+      currency: PAYMENT_CURRENCY, amount: 0, memo: expectedMemo,
+      block_num: null, status: 'confirmed'
+    });
+    return {
+      payResult: { tx_id: syntheticTxId, sender, paid: 0, currency: PAYMENT_CURRENCY, block_num: null },
+      payment
+    };
+  }
+
+  let payResult;
+  try {
+    payResult = await hive.verifyPayment({ tx_id, sender, expectedMemo, expectedAmount });
+  } catch (e) {
+    if (!e.code) e.code = 'unprocessable_entity';
+    throw e;
+  }
+
+  let sc;
+  try {
+    sc = await hive.verifyHiveEngineSidechain(tx_id);
+  } catch (e) {
+    throw Object.assign(
+      new Error(`Hive-Engine sidechain unreachable: ${e.message}`),
+      { code: 'unprocessable_entity' }
+    );
+  }
+  if (sc.confirmed === false) {
+    const detail = sc.reason === 'rejected'
+      ? ((sc.errors || []).join('; ') || 'sidechain rejected the transfer')
+      : 'sidechain did not confirm within the retry budget — try again in ~30s';
+    throw Object.assign(
+      new Error(`Hive-Engine did not confirm: ${detail}`),
+      { code: 'unprocessable_entity' }
+    );
+  }
+
+  const payment = quota.recordPayment({
+    tx_id, reservation_id: null, uploader: sender,
+    currency: payResult.currency, amount: payResult.paid,
+    memo: expectedMemo, block_num: payResult.block_num, status: 'confirmed'
+  });
+  return { payResult, payment };
+}
+
 // ─── Rate limiters ──────────────────────────────────────────────────────────
 
 const reserveLimiter = rateLimit({
@@ -336,9 +406,18 @@ app.post('/reserve', reserveLimiter, (req, res) => {
       return respondError(res, 'bad_request', 'hours_requested must be a positive number');
     }
 
+    // Whitelist fee exemption: quote at rate 0 for a fee-exempt account. The
+    // resulting quoted_amount=0 on the reservation is the signal /upload uses
+    // to skip on-chain payment verification. Surfaced in the response so the
+    // $0 is never silent (same philosophy as copies_capped).
+    const feeExempt = !!feeExemptEntryFor(uploader.toLowerCase());
+
     let quote;
     try {
-      quote = pricing.calculateCost({ sizeBytes: size_bytes, hoursRequested, copies: copiesRequested });
+      quote = pricing.calculateCost({
+        sizeBytes: size_bytes, hoursRequested, copies: copiesRequested,
+        ...(feeExempt ? { rate: 0 } : {})
+      });
     } catch (e) {
       return handleError(res, e);
     }
@@ -371,7 +450,8 @@ app.post('/reserve', reserveLimiter, (req, res) => {
         replication: pricing.replicationConfig(quote.copies),
         rate_per_mb_hour: quote.rate,
         total: quote.total,
-        currency: PAYMENT_CURRENCY
+        currency: PAYMENT_CURRENCY,
+        fee_exempt: feeExempt
       },
       max_size_bytes: quota.MAX_FILE_SIZE_BYTES
     });
@@ -394,8 +474,11 @@ app.post('/upload', uploadLimiter, upload.single('ciphertext'), async (req, res)
     // kind_hint, accepted for audit but not otherwise used by the gate.
     const claimedMime = (req.body && req.body.mime) || null;
 
-    if (!reservation_id || !tx_id || !uploader_pubkey || !upload_proof_sig) {
-      return respondError(res, 'bad_request', 'reservation_id, tx_id, uploader_pubkey, upload_proof_sig all required');
+    // tx_id is validated AFTER the reservation is loaded — a fee-exempt
+    // reservation (quoted_amount 0, whitelist mode) legitimately has no
+    // on-chain payment, so no tx_id to present.
+    if (!reservation_id || !uploader_pubkey || !upload_proof_sig) {
+      return respondError(res, 'bad_request', 'reservation_id, uploader_pubkey, upload_proof_sig all required');
     }
     if (!req.file || !req.file.buffer) {
       return respondError(res, 'bad_request', 'ciphertext file field required');
@@ -463,6 +546,20 @@ app.post('/upload', uploadLimiter, upload.single('ciphertext'), async (req, res)
     if (quota.isAccountBanned(uploader)) {
       return respondError(res, 'forbidden', 'uploader is banned');
     }
+    // 2b. Whitelist re-check (membership could've been revoked between reserve
+    //     and upload — same defensive pattern as the ban re-check above).
+    if (quota.whitelistModeEnabled() && !quota.isAccountWhitelisted(uploader)) {
+      return respondError(res, 'forbidden', 'this server is invite-only — uploader is no longer whitelisted');
+    }
+    // 2c. Fee exemption: a $0 quote captured at /reserve (quoted_amount 0) plus
+    //     a CURRENTLY fee-exempt whitelist entry means there is no on-chain
+    //     payment to verify — a synthetic zero-amount payment row is recorded
+    //     instead. Both conditions required: a paid-rate reservation is never
+    //     skipped just because the account became exempt afterwards.
+    const isFeeExempt = !!(feeExemptEntryFor(uploader) && r.quoted_amount === 0);
+    if (!isFeeExempt && !tx_id) {
+      return respondError(res, 'bad_request', 'tx_id required');
+    }
 
     // 3. Verify upload_proof_sig
     const ciphertextSha256Hex = envelope.sha256Hex(ciphertext);
@@ -477,78 +574,88 @@ app.post('/upload', uploadLimiter, upload.single('ciphertext'), async (req, res)
       return respondError(res, 'unauthorized', 'upload_proof_sig verification failed');
     }
 
+    // 4–6. Payment. Fee-exempt (whitelist) reservations skip the on-chain
+    //    verify entirely and record a synthetic zero-amount payment row (the
+    //    pins/claims FK still needs a payments row). The synthetic tx_id is
+    //    namespaced off the reservation_id — one payment per reservation, and
+    //    payments.tx_id UNIQUE stays the replay guard for both paths.
+    const expectedMemo = quota.getMemoForReservation(reservation_id);
+    const effectiveTxId = isFeeExempt ? `whitelist-free:upload:${reservation_id}` : tx_id;
+
     // 4. Replay protection (UNIQUE on payments.tx_id is the schema-level guarantee,
     //    but check here so we can return a clean error before doing Hive work)
-    if (quota.getPaymentByTxId(tx_id)) {
+    if (quota.getPaymentByTxId(effectiveTxId)) {
       return respondError(res, 'conflict', 'tx_id already used');
     }
 
-    // 5. Verify Hive payment (tx_id lookup + amount/memo/currency validation).
-    //    v1 claim model: the required amount is the per-claim QUOTE captured at
-    //    /reserve (size × time × copies), not a flat fee.
-    const expectedMemo = quota.getMemoForReservation(reservation_id);
     let payResult;
-    try {
-      payResult = await hive.verifyPayment({
-        tx_id,
-        sender: uploader,
-        expectedMemo,
-        expectedAmount: r.quoted_amount
-      });
-    } catch (e) {
-      return handleError(res, e, 'unprocessable_entity');
-    }
-
-    // Sidechain confirmation — HARD reject. v0.1.2 (and earlier) used a balance
-    // comparison which was useless: the escrow's existing balance always exceeded
-    // the per-payment amount, so an under-balanced sender whose transfer was
-    // rejected by the Hive-Engine sidechain still passed the check, and the file
-    // got pinned for free. v0.1.3 polls getTransactionInfo on the Hive-Engine
-    // blockchain RPC for an authoritative success/fail signal.
-    let paymentStatus = 'confirmed';
-    let sidechainResult;
-    try {
-      sidechainResult = await hive.verifyHiveEngineSidechain(tx_id);
-    } catch (e) {
-      console.error(`[server] sidechain RPC failed for ${tx_id}: ${e.message}`);
-      quota.markReservationCancelled(reservation_id);
-      return respondError(res, 'unprocessable_entity', `Hive-Engine sidechain unreachable: ${e.message}`);
-    }
-    if (sidechainResult.confirmed === false) {
-      quota.markReservationCancelled(reservation_id);
-      if (sidechainResult.reason === 'rejected') {
-        const detail = (sidechainResult.errors || []).join('; ') || 'sidechain rejected the transfer';
-        console.warn(`[server] sidechain rejected tx ${tx_id}: ${detail}`);
-        return respondError(res, 'unprocessable_entity', `Hive-Engine rejected the transfer: ${detail}`);
+    if (isFeeExempt) {
+      payResult = { tx_id: effectiveTxId, paid: 0, currency: PAYMENT_CURRENCY, block_num: null };
+    } else {
+      // 5. Verify Hive payment (tx_id lookup + amount/memo/currency validation).
+      //    v1 claim model: the required amount is the per-claim QUOTE captured at
+      //    /reserve (size × time × copies), not a flat fee.
+      try {
+        payResult = await hive.verifyPayment({
+          tx_id,
+          sender: uploader,
+          expectedMemo,
+          expectedAmount: r.quoted_amount
+        });
+      } catch (e) {
+        return handleError(res, e, 'unprocessable_entity');
       }
-      // 'pending' — exhausted retries; safer to reject than to pin a phantom payment
-      console.warn(`[server] sidechain still pending for tx ${tx_id} after retries`);
-      return respondError(res, 'unprocessable_entity', 'Hive-Engine sidechain did not confirm the transfer within the retry budget. Try uploading again in ~30s.');
-    }
-    // Belt-and-braces: also record balance for the audit log
-    try {
-      payResult.balance_after = await hive.getHiveEngineBalance(IPFS_GATE_HIVE_ACCOUNT, PAYMENT_CURRENCY);
-    } catch (e) {
-      console.warn(`[server] post-confirm balance read failed: ${e.message}`);
+
+      // Sidechain confirmation — HARD reject. v0.1.2 (and earlier) used a balance
+      // comparison which was useless: the escrow's existing balance always exceeded
+      // the per-payment amount, so an under-balanced sender whose transfer was
+      // rejected by the Hive-Engine sidechain still passed the check, and the file
+      // got pinned for free. v0.1.3 polls getTransactionInfo on the Hive-Engine
+      // blockchain RPC for an authoritative success/fail signal.
+      let sidechainResult;
+      try {
+        sidechainResult = await hive.verifyHiveEngineSidechain(tx_id);
+      } catch (e) {
+        console.error(`[server] sidechain RPC failed for ${tx_id}: ${e.message}`);
+        quota.markReservationCancelled(reservation_id);
+        return respondError(res, 'unprocessable_entity', `Hive-Engine sidechain unreachable: ${e.message}`);
+      }
+      if (sidechainResult.confirmed === false) {
+        quota.markReservationCancelled(reservation_id);
+        if (sidechainResult.reason === 'rejected') {
+          const detail = (sidechainResult.errors || []).join('; ') || 'sidechain rejected the transfer';
+          console.warn(`[server] sidechain rejected tx ${tx_id}: ${detail}`);
+          return respondError(res, 'unprocessable_entity', `Hive-Engine rejected the transfer: ${detail}`);
+        }
+        // 'pending' — exhausted retries; safer to reject than to pin a phantom payment
+        console.warn(`[server] sidechain still pending for tx ${tx_id} after retries`);
+        return respondError(res, 'unprocessable_entity', 'Hive-Engine sidechain did not confirm the transfer within the retry budget. Try uploading again in ~30s.');
+      }
+      // Belt-and-braces: also record balance for the audit log
+      try {
+        payResult.balance_after = await hive.getHiveEngineBalance(IPFS_GATE_HIVE_ACCOUNT, PAYMENT_CURRENCY);
+      } catch (e) {
+        console.warn(`[server] post-confirm balance read failed: ${e.message}`);
+      }
     }
 
     // 6. Record payment + mark reservation paid (atomic)
     let payment;
     try {
       payment = quota.recordPayment({
-        tx_id,
+        tx_id: effectiveTxId,
         reservation_id,
         uploader,
         currency: payResult.currency,
         amount: payResult.paid,
         memo: expectedMemo,
         block_num: payResult.block_num,
-        status: paymentStatus
+        status: 'confirmed'
       });
     } catch (e) {
       return handleError(res, e);
     }
-    quota.markReservationPaid(reservation_id, tx_id);
+    quota.markReservationPaid(reservation_id, effectiveTxId);
 
     // 7. Compute CID locally (defence: also verify against Kubo's response after pin)
     // For v0.1 we trust Kubo's returned CID since it's the same machine.
@@ -586,7 +693,10 @@ app.post('/upload', uploadLimiter, upload.single('ciphertext'), async (req, res)
     const hoursPaid = (r.hours_requested && r.hours_requested > 0) ? r.hours_requested : DEFAULT_HOURS;
     const copies = pricing.cappedCopies(r.copies || 1);
     const sizeMB = pricing.billableMB(sizeBytes);
-    const rateLocked = pricing.RATE_PER_MB_HOUR;
+    // Fee-exempt claims lock rate 0 — the charged rate and the persisted
+    // rate_locked must agree or a later pro-rata refund/extend would silently
+    // bill the real rate on a claim that was free.
+    const rateLocked = isFeeExempt ? 0 : pricing.RATE_PER_MB_HOUR;
     const startTs = quota.now();
     const expiryTs = startTs + hoursPaid * pricing.HOUR_MS;
 
@@ -1223,7 +1333,16 @@ function guardianQuoteHandler(memoPurpose) {
       if (!hosted) {
         return respondError(res, 'not_found', 'CID is not currently hosted here — you can only guard a live file');
       }
-      const quote = pricing.calculateCost({ sizeBytes: hosted.size_bytes, hoursRequested: hours, copies });
+      // Optional ?hive_account= lets a fee-exempt account see its real $0 up
+      // front instead of discovering the exemption at pay time. No signature —
+      // this is already a public GET, and membership isn't sensitive to the
+      // account asking about itself. POST /guardian/pledge recomputes it.
+      const quoteAccount = String(req.query.hive_account || '').toLowerCase();
+      const feeExempt = !!(quoteAccount && feeExemptEntryFor(quoteAccount));
+      const quote = pricing.calculateCost({
+        sizeBytes: hosted.size_bytes, hoursRequested: hours, copies,
+        ...(feeExempt ? { rate: 0 } : {})
+      });
 
       res.json({
         cid,
@@ -1245,7 +1364,8 @@ function guardianQuoteHandler(memoPurpose) {
           replication: pricing.replicationConfig(quote.copies),
           rate_per_mb_hour: quote.rate,
           total: quote.total,
-          currency: PAYMENT_CURRENCY
+          currency: PAYMENT_CURRENCY,
+          fee_exempt: feeExempt
         },
         queue_depth: hosted.guardian_queue_depth
       });
@@ -1261,8 +1381,8 @@ function guardianPledgeHandler(memoPurpose) {
       const { pledger, cid, tx_id } = req.body || {};
       const hours = (req.body && req.body.hours_requested === undefined) ? DEFAULT_HOURS : Number(req.body.hours_requested);
       const copies = (req.body && req.body.copies === undefined) ? 1 : Number(req.body.copies);
-      if (typeof pledger !== 'string' || !pledger || typeof cid !== 'string' || !cid || !tx_id) {
-        return respondError(res, 'bad_request', 'pledger, cid, tx_id required');
+      if (typeof pledger !== 'string' || !pledger || typeof cid !== 'string' || !cid) {
+        return respondError(res, 'bad_request', 'pledger, cid required');
       }
       const account = pledger.toLowerCase();
       if (quota.isAccountBanned(account)) return respondError(res, 'forbidden', 'pledger is banned');
@@ -1274,44 +1394,33 @@ function guardianPledgeHandler(memoPurpose) {
       }
       if (quota.isCidBlocked(cid)) return respondError(res, 'legal_takedown', 'this CID is blocked on this server');
 
+      // Fee exemption recomputed fresh — this route never saw /reserve, so
+      // there's no stored flag to trust. Exempt pledges need no tx_id.
+      const feeExempt = !!feeExemptEntryFor(account);
+      if (!feeExempt && !tx_id) {
+        return respondError(res, 'bad_request', 'tx_id required');
+      }
+
       const hosted = quota.alreadyHostedForCid(cid);
       if (!hosted) {
         return respondError(res, 'not_found', 'CID is not currently hosted here — you can only guard a live file');
       }
-      const quote = pricing.calculateCost({ sizeBytes: hosted.size_bytes, hoursRequested: hours, copies });
+      const quote = pricing.calculateCost({
+        sizeBytes: hosted.size_bytes, hoursRequested: hours, copies,
+        ...(feeExempt ? { rate: 0 } : {})
+      });
 
-      if (quota.getPaymentByTxId(tx_id)) return respondError(res, 'conflict', 'tx_id already used');
+      if (!feeExempt && quota.getPaymentByTxId(tx_id)) return respondError(res, 'conflict', 'tx_id already used');
 
       const expectedMemo = `ipfs-gate:${memoPurpose}:${cid}`;
-      let payResult;
+      let payResult, payment;
       try {
-        payResult = await hive.verifyPayment({ tx_id, sender: account, expectedMemo, expectedAmount: quote.total });
+        ({ payResult, payment } = await verifyOrSkipPayment({
+          feeExempt, tx_id, sender: account, expectedMemo, expectedAmount: quote.total,
+          syntheticTxId: `whitelist-free:${memoPurpose}:${cid}:${account}:${quota.now()}`
+        }));
       } catch (e) {
         return handleError(res, e, 'unprocessable_entity');
-      }
-
-      let sc;
-      try {
-        sc = await hive.verifyHiveEngineSidechain(tx_id);
-      } catch (e) {
-        return respondError(res, 'unprocessable_entity', `Hive-Engine sidechain unreachable: ${e.message}`);
-      }
-      if (sc.confirmed === false) {
-        const detail = sc.reason === 'rejected'
-          ? ((sc.errors || []).join('; ') || 'sidechain rejected the transfer')
-          : 'sidechain did not confirm within the retry budget — try again in ~30s';
-        return respondError(res, 'unprocessable_entity', `Hive-Engine did not confirm: ${detail}`);
-      }
-
-      let payment;
-      try {
-        payment = quota.recordPayment({
-          tx_id, reservation_id: null, uploader: account,
-          currency: payResult.currency, amount: payResult.paid,
-          memo: expectedMemo, block_num: payResult.block_num, status: 'confirmed'
-        });
-      } catch (e) {
-        return handleError(res, e);
       }
 
       // Dormant claim: no pin, placeholder start/expiry (set on activation).
@@ -1319,7 +1428,8 @@ function guardianPledgeHandler(memoPurpose) {
       const tnow = quota.now();
       const claim = quota.createOrderWithClaim({
         cid, owner: account, pinId: null, paymentId: payment.id,
-        sizeBytes: hosted.size_bytes, sizeMB: quote.billable_mb, rateLocked: pricing.RATE_PER_MB_HOUR,
+        sizeBytes: hosted.size_bytes, sizeMB: quote.billable_mb,
+        rateLocked: feeExempt ? 0 : pricing.RATE_PER_MB_HOUR,
         paidHours: quote.billable_hrs, copies: quote.copies,
         amountPaid: payResult.paid, currency: payResult.currency,
         startTs: tnow, expiryTs: tnow,
@@ -1412,7 +1522,13 @@ app.get('/claims/own-copy/quote', userApiLimiter, (req, res) => {
     if (!hosted) {
       return respondError(res, 'not_found', 'CID is not currently hosted here — upload it via /reserve + /upload instead');
     }
-    const quote = pricing.calculateCost({ sizeBytes: hosted.size_bytes, hoursRequested: hours, copies });
+    // Optional ?hive_account= — same honest $0 preview as /guardian/quote.
+    const quoteAccount = String(req.query.hive_account || '').toLowerCase();
+    const feeExempt = !!(quoteAccount && feeExemptEntryFor(quoteAccount));
+    const quote = pricing.calculateCost({
+      sizeBytes: hosted.size_bytes, hoursRequested: hours, copies,
+      ...(feeExempt ? { rate: 0 } : {})
+    });
 
     res.json({
       cid,
@@ -1437,7 +1553,8 @@ app.get('/claims/own-copy/quote', userApiLimiter, (req, res) => {
         copies_capped: quote.copies < Math.max(1, Math.floor(copies) || 1),
         rate_per_mb_hour: quote.rate,
         total: quote.total,
-        currency: PAYMENT_CURRENCY
+        currency: PAYMENT_CURRENCY,
+        fee_exempt: feeExempt
       }
     });
   } catch (e) {
@@ -1457,8 +1574,8 @@ app.post('/claims/own-copy', uploadLimiter, async (req, res) => {
     const { owner, cid, tx_id } = req.body || {};
     const hours = (req.body && req.body.hours_requested === undefined) ? DEFAULT_HOURS : Number(req.body.hours_requested);
     const copies = (req.body && req.body.copies === undefined) ? 1 : Number(req.body.copies);
-    if (typeof owner !== 'string' || !owner || typeof cid !== 'string' || !cid || !tx_id) {
-      return respondError(res, 'bad_request', 'owner, cid, tx_id required');
+    if (typeof owner !== 'string' || !owner || typeof cid !== 'string' || !cid) {
+      return respondError(res, 'bad_request', 'owner, cid required');
     }
     const account = owner.toLowerCase();
     if (quota.isAccountBanned(account)) return respondError(res, 'forbidden', 'owner is banned');
@@ -1468,6 +1585,13 @@ app.post('/claims/own-copy', uploadLimiter, async (req, res) => {
       return respondError(res, 'forbidden', 'this server is invite-only — owner is not whitelisted');
     }
     if (quota.isCidBlocked(cid)) return respondError(res, 'legal_takedown', 'this CID is blocked on this server');
+
+    // Fee exemption recomputed fresh — this route never saw /reserve, so
+    // there's no stored flag to trust. Exempt own-copies need no tx_id.
+    const feeExempt = !!feeExemptEntryFor(account);
+    if (!feeExempt && !tx_id) {
+      return respondError(res, 'bad_request', 'tx_id required');
+    }
 
     const hosted = quota.alreadyHostedForCid(cid);
     if (!hosted) {
@@ -1481,46 +1605,28 @@ app.post('/claims/own-copy', uploadLimiter, async (req, res) => {
     } catch (e) {
       return handleError(res, e);
     }
-    const quote = pricing.calculateCost({ sizeBytes: hosted.size_bytes, hoursRequested: hours, copies });
+    const quote = pricing.calculateCost({
+      sizeBytes: hosted.size_bytes, hoursRequested: hours, copies,
+      ...(feeExempt ? { rate: 0 } : {})
+    });
 
-    if (quota.getPaymentByTxId(tx_id)) return respondError(res, 'conflict', 'tx_id already used');
+    if (!feeExempt && quota.getPaymentByTxId(tx_id)) return respondError(res, 'conflict', 'tx_id already used');
 
     const expectedMemo = `ipfs-gate:owncopy:${cid}`;
-    let payResult;
+    let payResult, payment;
     try {
-      payResult = await hive.verifyPayment({ tx_id, sender: account, expectedMemo, expectedAmount: quote.total });
+      ({ payResult, payment } = await verifyOrSkipPayment({
+        feeExempt, tx_id, sender: account, expectedMemo, expectedAmount: quote.total,
+        syntheticTxId: `whitelist-free:owncopy:${cid}:${account}:${quota.now()}`
+      }));
     } catch (e) {
       return handleError(res, e, 'unprocessable_entity');
-    }
-
-    let sc;
-    try {
-      sc = await hive.verifyHiveEngineSidechain(tx_id);
-    } catch (e) {
-      return respondError(res, 'unprocessable_entity', `Hive-Engine sidechain unreachable: ${e.message}`);
-    }
-    if (sc.confirmed === false) {
-      const detail = sc.reason === 'rejected'
-        ? ((sc.errors || []).join('; ') || 'sidechain rejected the transfer')
-        : 'sidechain did not confirm within the retry budget — try again in ~30s';
-      return respondError(res, 'unprocessable_entity', `Hive-Engine did not confirm: ${detail}`);
-    }
-
-    let payment;
-    try {
-      payment = quota.recordPayment({
-        tx_id, reservation_id: null, uploader: account,
-        currency: payResult.currency, amount: payResult.paid,
-        memo: expectedMemo, block_num: payResult.block_num, status: 'confirmed'
-      });
-    } catch (e) {
-      return handleError(res, e);
     }
 
     const claim = quota.createOwnCopyClaim({
       cid, owner: account, paymentId: payment.id,
       paidHours: quote.billable_hrs, copies: quote.copies,
-      rateLocked: pricing.RATE_PER_MB_HOUR,
+      rateLocked: feeExempt ? 0 : pricing.RATE_PER_MB_HOUR,
       amountPaid: payResult.paid, currency: payResult.currency
     });
 
@@ -1584,8 +1690,8 @@ app.get('/claims/extend/quote', userApiLimiter, (req, res) => {
 app.post('/claims/extend', uploadLimiter, async (req, res) => {
   try {
     const { claim_id, tx_id } = req.body || {};
-    if (typeof claim_id !== 'string' || !claim_id || !tx_id) {
-      return respondError(res, 'bad_request', 'claim_id, extra_hours, tx_id required');
+    if (typeof claim_id !== 'string' || !claim_id) {
+      return respondError(res, 'bad_request', 'claim_id, extra_hours required');
     }
     let extraHrs;
     try { extraHrs = pricing.billableHours(req.body && req.body.extra_hours); } catch (e) { return handleError(res, e); }
@@ -1596,9 +1702,33 @@ app.post('/claims/extend', uploadLimiter, async (req, res) => {
     if (quota.isCidBlocked(claim.cid)) return respondError(res, 'legal_takedown', 'this CID is blocked on this server');
 
     const cost = pricing.roundCoins(claim.size_mb * extraHrs * claim.rate_locked * claim.copies_requested);
-    if (quota.getPaymentByTxId(tx_id)) return respondError(res, 'conflict', 'tx_id already used');
+    // Fee-exempt extend: a rate_locked=0 claim (only creatable via whitelist
+    // fee exemption) quotes 0 — demanding an on-chain tx of 0 would strand the
+    // exempt owner. Skip payment ONLY when the cost is 0 AND the claim's owner
+    // is STILL fee-exempt right now (payment-is-auth doesn't apply at $0, so
+    // the live whitelist entry is the gate instead).
+    const feeExempt = cost === 0 && !!feeExemptEntryFor(claim.owner);
+    if (!feeExempt && !tx_id) {
+      return respondError(res, 'bad_request', 'tx_id required');
+    }
+    if (!feeExempt && quota.getPaymentByTxId(tx_id)) return respondError(res, 'conflict', 'tx_id already used');
 
     const expectedMemo = `ipfs-gate:extend:${claim_id}`;
+    if (feeExempt) {
+      const syntheticTxId = `whitelist-free:extend:${claim_id}:${quota.now()}`;
+      quota.recordPayment({
+        tx_id: syntheticTxId, reservation_id: null, uploader: claim.owner,
+        currency: claim.currency, amount: 0, memo: expectedMemo,
+        block_num: null, status: 'confirmed'
+      });
+      const updated = quota.extendClaim(claim_id, claim.owner, extraHrs);
+      return res.json({
+        ok: true, claim_id, added_hours: extraHrs,
+        paid_hours: updated.paid_hours, expires_at: isoFromMs(updated.expiry_ts),
+        amount_paid: 0, currency: claim.currency, fee_exempt: true
+      });
+    }
+
     let payResult;
     try {
       payResult = await hive.verifyPayment({ tx_id, sender: claim.owner, expectedMemo, expectedAmount: cost });

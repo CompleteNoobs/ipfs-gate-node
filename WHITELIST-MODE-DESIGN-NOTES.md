@@ -174,6 +174,14 @@ fee_exempt account:  total_cost = billable_MB × billable_hrs × 0 × copies = 0
   claim's later pro-rata refund math silently charges the real rate on
   cancellation. Easy to miss, would only surface as a support ticket months
   later — call it out explicitly at implementation time.
+- **`POST /claims/extend`** *(amended at Stage-B build time — the original
+  lock claimed "no changes needed" and was wrong in one detail)*: `rate_locked`
+  being 0 makes the extend quote 0, but the route demanded an on-chain `tx_id`
+  unconditionally — an exempt owner would be stranded needing a $0 transfer.
+  Fixed: payment is skipped ONLY when the computed cost is 0 (only possible
+  via a rate-0, i.e. exempt-created, claim) AND the claim's owner is STILL
+  fee-exempt right now. Payment-is-auth doesn't apply at $0, so the live
+  whitelist entry is the gate instead.
 - **No special-case needed for refunds.** `amount_paid` is already `0` for an
   exempt claim, so the existing `pricing.forcedRefundAmount` naturally returns
   `0` on a later ban/takedown regardless of `policy`. Stated here as a
