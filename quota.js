@@ -712,14 +712,19 @@ function reconcileCidAfterEnd(cid) {
  * caller AFTER this returns — safe because only one cancel wins the status lock.
  *
  * Returns { claim, fully_unpinned }. Throws not_found / forbidden / conflict.
+ *
+ * opts.asAdmin (WHITELIST-MODE-DESIGN-NOTES.md §6): skips the ownership check
+ * for the admin delete-others'-pin route — the ONLY caller allowed to end a
+ * claim it doesn't own. Everything else (atomicity, status lock, reconcile)
+ * is identical; refund settlement stays the caller's job.
  */
-function cancelClaim(claimId, owner) {
+function cancelClaim(claimId, owner, { asAdmin = false } = {}) {
   return db.transaction(() => {
     const claim = getClaim(claimId);
     if (!claim) {
       throw Object.assign(new Error('claim not found'), { code: 'not_found' });
     }
-    if (claim.owner !== owner) {
+    if (!asAdmin && claim.owner !== owner) {
       throw Object.assign(new Error('not your claim'), { code: 'forbidden' });
     }
     if (claim.state !== 'active' && claim.state !== 'dormant') {

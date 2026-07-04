@@ -160,6 +160,52 @@ async function verifySignedUserRequest({ account, ts, pubkey, sig, message }) {
   }
 }
 
+// ─── Hive-account admin tier (WHITELIST-MODE-DESIGN-NOTES.md §5) ─────────────
+
+/**
+ * The Hive-account admin roster. Read at CALL time (same reasoning as
+ * quota.whitelistModeEnabled — env is fixed per container, but tests flip it
+ * in-process). Empty list = the tier is disabled and ADMIN_KEY is the only
+ * admin auth, exactly as before.
+ */
+function serverAdminHiveAccounts() {
+  return (process.env.SERVER_ADMIN_HIVE_ACCOUNTS || '')
+    .split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+}
+
+/**
+ * Dual admin auth: Bearer ADMIN_KEY (box owner, unconditional, all powers) OR
+ * a Hive-signed request from an account in SERVER_ADMIN_HIVE_ACCOUNTS (the
+ * narrower tier — only the routes that call this accept it). The signed
+ * message binds action AND target, so a signature authorising "ban bob" can't
+ * be replayed to ban alice:
+ *   ipfs-gate:admin-action:v1:<action>:<target>:<account>:<ts>
+ * Auth fields (admin_account/admin_ts/admin_pubkey/admin_sig) are deliberately
+ * distinct from each route's own primary fields — e.g. hive_account on
+ * /admin/ban is the ban TARGET, never the admin.
+ * Returns { adminId }: 'operator' for the Bearer tier, 'hive:<account>' for
+ * the Hive tier — passed straight into moderation.js's admin_id param.
+ * Throws { code:'unauthorized'|'forbidden'|...} on failure.
+ */
+async function verifyAdminAuth(req, { action, target }) {
+  const h = req.headers['authorization'] || '';
+  const m = h.match(/^Bearer\s+(.+)$/);
+  if (ADMIN_KEY && m && m[1] === ADMIN_KEY) return { adminId: 'operator' };
+
+  const src = (req.method === 'GET') ? req.query : (req.body || {});
+  const { admin_account, admin_ts, admin_pubkey, admin_sig } = src;
+  if (!admin_account || !admin_sig) {
+    throw Object.assign(new Error('admin auth required'), { code: 'unauthorized' });
+  }
+  const account = String(admin_account).toLowerCase();
+  if (!serverAdminHiveAccounts().includes(account)) {
+    throw Object.assign(new Error('account is not a server admin'), { code: 'forbidden' });
+  }
+  const message = `ipfs-gate:admin-action:v1:${action}:${target}:${account}:${admin_ts}`;
+  await verifySignedUserRequest({ account, ts: admin_ts, pubkey: admin_pubkey, sig: admin_sig, message });
+  return { adminId: `hive:${account}` };
+}
+
 /**
  * Settle one already-cancelled (or expired) claim: compute the pro-rata refund,
  * record it in the durable refund ledger, and attempt the on-chain broadcast.
@@ -369,7 +415,11 @@ app.get('/', (req, res) => {
       // Guardian feature (multi-participant hosting of the same CID):
       // POST /check (already-hosted detection), POST /claims/own-copy,
       // GET|POST /guardian/* (the dormant-pledge queue).
-      guardian: true, own_copy: true, cid_check: true
+      guardian: true, own_copy: true, cid_check: true,
+      // Whitelist / gated-server mode. Mode only — this endpoint has no caller
+      // identity, so "am I whitelisted / am I admin" rides on the SIGNED
+      // /uploads/by-user response instead. The admin roster is never listed.
+      whitelist_mode: quota.whitelistModeEnabled()
     }
   });
 });
@@ -944,18 +994,34 @@ app.get('/uploads/by-user', userApiLimiter, async (req, res) => {
       };
     });
 
+    // Whitelist mode: this response already proves the caller's identity (the
+    // signature above), so it's the privacy-safe place to answer "what am I on
+    // this server" — whitelisted? fee-exempt? admin? — without a new signed
+    // round-trip. With a per-account quota_bytes cap, the quota block switches
+    // from the shared-disk figures to the caller's own cap (tightest-wins:
+    // the global disk ceiling still applies at reserve time regardless).
+    const wlMode = quota.whitelistModeEnabled();
+    const wlEntry = wlMode ? quota.getWhitelistEntry(account) : null;
+    const hasOwnCap = !!(wlEntry && wlEntry.quota_bytes != null);
+    const ownUsage = hasOwnCap ? quota.getAccountUsage(account) : null;
+
     res.json({
       hive_account: account,
       quota: {
-        // NOTE: there is no per-account byte cap in v0.2 — these are the
-        // SHARED gate-disk figures. quota_scope makes that explicit so the
-        // client renders an honest "X of Y (shared)" label.
-        quota_scope: 'shared_disk',
-        used_bytes: disk.used_bytes,
-        limit_bytes: disk.limit_bytes,
-        available_bytes: disk.available_bytes,
-        pending_count: quota.getAccountPendingCount(account)
+        // quota_scope keeps the client's "X of Y" label honest: shared_disk =
+        // the gate-wide figures (no per-account cap), per_account = this
+        // caller's own whitelist quota_bytes cap.
+        quota_scope: hasOwnCap ? 'per_account' : 'shared_disk',
+        used_bytes: hasOwnCap ? ownUsage.used_bytes : disk.used_bytes,
+        limit_bytes: hasOwnCap ? wlEntry.quota_bytes : disk.limit_bytes,
+        available_bytes: hasOwnCap
+          ? Math.max(0, wlEntry.quota_bytes - ownUsage.used_bytes)
+          : disk.available_bytes,
+        pending_count: quota.getAccountPendingCount(account),
+        whitelisted: wlMode ? !!wlEntry : null,
+        fee_exempt: !!(wlEntry && wlEntry.fee_exempt)
       },
+      is_admin: serverAdminHiveAccounts().includes(account),
       uploads
     });
   } catch (e) {
@@ -1772,10 +1838,16 @@ app.post('/claims/extend', uploadLimiter, async (req, res) => {
 
 // ─── Admin endpoints ────────────────────────────────────────────────────────
 
-app.post('/admin/ban', requireAdmin, async (req, res) => {
+// The 4 moderation routes below accept BOTH admin tiers (Bearer ADMIN_KEY or a
+// Hive-signed roster admin — see verifyAdminAuth). Every other /admin/* route
+// stays requireAdmin/Bearer-only on purpose: narrower blast radius for a tier
+// that might be a trusted family member, not the box operator (design §5).
+
+app.post('/admin/ban', async (req, res) => {
   try {
     const { hive_account, reason, refund_policy } = req.body || {};
-    const result = moderation.banAccount({ hive_account, reason, refund_policy });
+    const { adminId } = await verifyAdminAuth(req, { action: 'ban', target: String(hive_account || '').toLowerCase() });
+    const result = moderation.banAccount({ hive_account, reason, refund_policy, admin_id: adminId });
 
     // Settle refunds for the banned user's voided claims — per refund_policy.
     // The banned user is NOT innocent (cohosting §7), so no full-refund override.
@@ -1814,20 +1886,22 @@ app.post('/admin/ban', requireAdmin, async (req, res) => {
   }
 });
 
-app.post('/admin/unban', requireAdmin, (req, res) => {
+app.post('/admin/unban', async (req, res) => {
   try {
     const { hive_account } = req.body || {};
-    const result = moderation.unbanAccount({ hive_account });
+    const { adminId } = await verifyAdminAuth(req, { action: 'unban', target: String(hive_account || '').toLowerCase() });
+    const result = moderation.unbanAccount({ hive_account, admin_id: adminId });
     res.json({ unbanned: hive_account.toLowerCase(), moderation_log_id: result.moderation_log_id });
   } catch (e) {
     return handleError(res, e);
   }
 });
 
-app.post('/admin/takedown', requireAdmin, async (req, res) => {
+app.post('/admin/takedown', async (req, res) => {
   try {
     const { cid, reason, refund_policy } = req.body || {};
-    const result = moderation.takedownCid({ cid, reason, refund_policy });
+    const { adminId } = await verifyAdminAuth(req, { action: 'takedown', target: String(cid || '') });
+    const result = moderation.takedownCid({ cid, reason, refund_policy, admin_id: adminId });
 
     // Settle refunds (cohosting §7): dormant guardians are INNOCENT third
     // parties → full escrow, no fee; the active host/offender follows refund_policy.
@@ -1864,11 +1938,124 @@ app.post('/admin/takedown', requireAdmin, async (req, res) => {
   }
 });
 
-app.post('/admin/untakedown', requireAdmin, (req, res) => {
+app.post('/admin/untakedown', async (req, res) => {
   try {
     const { cid } = req.body || {};
-    const result = moderation.untakedownCid({ cid });
+    const { adminId } = await verifyAdminAuth(req, { action: 'untakedown', target: String(cid || '') });
+    const result = moderation.untakedownCid({ cid, admin_id: adminId });
     res.json({ cid, moderation_log_id: result.moderation_log_id });
+  } catch (e) {
+    return handleError(res, e);
+  }
+});
+
+// ─── Whitelist CRUD + admin pin delete (both admin tiers) ────────────────────
+
+app.post('/admin/whitelist/add', async (req, res) => {
+  try {
+    const { target_account, quota_bytes, fee_exempt, note } = req.body || {};
+    const { adminId } = await verifyAdminAuth(req, { action: 'whitelist-add', target: String(target_account || '').toLowerCase() });
+    const result = moderation.addToWhitelist({
+      hive_account: target_account, added_by: adminId,
+      quota_bytes: quota_bytes ?? null, fee_exempt: !!fee_exempt, note: note || null
+    });
+    res.json({
+      whitelisted: String(target_account).toLowerCase(),
+      quota_bytes: quota_bytes ?? null, fee_exempt: !!fee_exempt,
+      moderation_log_id: result.moderation_log_id
+    });
+  } catch (e) {
+    return handleError(res, e);
+  }
+});
+
+app.post('/admin/whitelist/remove', async (req, res) => {
+  try {
+    const { target_account } = req.body || {};
+    const { adminId } = await verifyAdminAuth(req, { action: 'whitelist-remove', target: String(target_account || '').toLowerCase() });
+    const result = moderation.removeFromWhitelist({ hive_account: target_account, removed_by: adminId });
+    res.json({ removed: String(target_account).toLowerCase(), moderation_log_id: result.moderation_log_id });
+  } catch (e) {
+    return handleError(res, e);
+  }
+});
+
+app.get('/admin/whitelist', async (req, res) => {
+  try {
+    await verifyAdminAuth(req, { action: 'whitelist-list', target: 'all' });
+    const entries = moderation.listWhitelist().map(w => ({
+      hive_account: w.hive_account,
+      added_at: isoFromMs(w.added_at),
+      added_by: w.added_by,
+      quota_bytes: w.quota_bytes,
+      fee_exempt: !!w.fee_exempt,
+      note: w.note
+    }));
+    res.json({ whitelist_mode: quota.whitelistModeEnabled(), whitelist: entries });
+  } catch (e) {
+    return handleError(res, e);
+  }
+});
+
+/**
+ * POST /admin/pins/delete — the one genuinely-new moderation primitive
+ * (design §6): remove ONE account's claim(s) on ONE CID without banning the
+ * account (identity kill) or taking the CID down for everyone (content kill).
+ * Body: { target_account, cid, reason?, refund_policy? } + admin auth fields.
+ * Reuses cancelClaim({asAdmin}) + settleForcedRefund — the target is treated
+ * as the offender per refund_policy (default prorata: unused hours back).
+ * A queued guardian still takes the baton (reconcile runs inside cancelClaim).
+ */
+app.post('/admin/pins/delete', async (req, res) => {
+  try {
+    const { target_account, cid, reason, refund_policy } = req.body || {};
+    const account = String(target_account || '').toLowerCase();
+    if (!account || typeof cid !== 'string' || !cid) {
+      return respondError(res, 'bad_request', 'target_account, cid required');
+    }
+    const { adminId } = await verifyAdminAuth(req, { action: 'pin-delete', target: `${cid}:${account}` });
+    const policy = ['none', 'prorata'].includes(refund_policy) ? refund_policy : 'prorata';
+
+    const targetClaims = quota.getActiveClaimsForCid(cid).filter(c => c.owner === account);
+    if (targetClaims.length === 0) {
+      return respondError(res, 'not_found', 'no active claim for this account + cid');
+    }
+
+    const refunds = { sent: 0, pending: 0, failed: 0, skipped: 0 };
+    let fullyUnpinned = false;
+    const activated = [];
+    for (const c of targetClaims) {
+      const r = quota.cancelClaim(c.claim_id, null, { asAdmin: true });
+      if (r.fully_unpinned) fullyUnpinned = true;
+      if (r.activated) activated.push(r.activated);
+      const settled = await settleForcedRefund(r.claim, { policy, innocent: false });
+      refunds[settled.status] = (refunds[settled.status] || 0) + 1;
+    }
+
+    if (fullyUnpinned) {
+      try {
+        await kubo.unpin(cid);
+        await kubo.gc();
+      } catch (e) {
+        console.warn(`[admin/pins/delete] kubo unpin/gc failed for ${cid}: ${e.message}`);
+      }
+    }
+
+    const mlId = moderation.audit({
+      action: 'pin_delete', target_type: 'cid', target: cid,
+      reason: reason || null,
+      metadata: { target_account: account, claims_cancelled: targetClaims.length, refund_policy: policy },
+      admin_id: adminId
+    });
+
+    res.json({
+      cid, target_account: account,
+      claims_cancelled: targetClaims.length,
+      guardians_activated: activated.length,
+      fully_unpinned: fullyUnpinned,
+      refund_policy: policy, refunds,
+      moderation_log_id: mlId
+    });
   } catch (e) {
     return handleError(res, e);
   }
