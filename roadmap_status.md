@@ -143,6 +143,47 @@ missing spec pieces. Gate-side complete, **53 tests green** (was 43); client UI 
 - **Still open (spec §10, product not code):** final UI microcopy for the "already hosted" notice +
   guardian pledge flow — lands with the v4call client integration, which is the next step here.
 
+### ✅ Whitelist / gated-server mode — BUILT (2026-07-04)
+
+Per [WHITELIST-MODE-DESIGN-NOTES.md](WHITELIST-MODE-DESIGN-NOTES.md) (locked, then built the same day
+in four staged commits, one per design stage). Turns any gate into an optional invite-only
+"family server": whitelist Hive accounts, per-account storage quotas, fee-exempt entries, and a
+second Hive-account admin tier next to `ADMIN_KEY`. **`WHITELIST_MODE=false` (default) is a no-op** —
+the whole pre-existing suite runs with it off.
+
+- **Stage A — schema + enforcement.** Migration `007_whitelist.sql` (`whitelisted_accounts`, mirrors
+  `banned_accounts` + `quota_bytes`/`fee_exempt` knobs). Gate inlined at ALL THREE claim-creating
+  entry points (`createReservation`, guardian pledge, own-copy — the latter two bypass reservations,
+  same pattern as the existing ban checks); per-account quota cap checked inside the reservation tx.
+  `/claims/extend` deliberately unguarded (mirrors ban-check reasoning). `test/whitelist.test.js`.
+- **Stage B — fee exemption.** Exempt accounts get the same claim model at `rate: 0`; `/upload` +
+  pledge + own-copy + extend skip on-chain verification and record a synthetic `whitelist-free:*`
+  zero-amount payment row (FKs intact, `payments.tx_id UNIQUE` still the replay guard); shared
+  `verifyOrSkipPayment` helper deduplicates the pledge/own-copy verify sequences; quote endpoints
+  take optional `?hive_account=` for an honest $0 preview; all 4 claim call sites lock
+  `rate_locked` 0 when exempt (refund/extend math agrees with what was charged). ⚠ One design-lock
+  amendment: extend DID need a change — it demanded `tx_id` unconditionally, stranding exempt owners
+  at a $0 quote; skip is gated on cost===0 AND owner still exempt. `test/whitelist-fees.test.js`.
+- **Stage C — Hive-account admin tier.** `verifyAdminAuth`: Bearer `ADMIN_KEY` keeps every power
+  unconditionally; accounts in `SERVER_ADMIN_HIVE_ACCOUNTS` reach ban/unban/takedown/untakedown +
+  whitelist CRUD + pin-delete via signed requests whose message binds action AND target (no
+  cross-target replay). `admin_id` threaded through moderation.js ('operator' default = backward
+  compatible; Hive tier logs `hive:<account>`). New `/admin/whitelist/{add,remove}` + GET; new
+  `POST /admin/pins/delete` (end ONE account's claim on ONE CID — `cancelClaim({asAdmin})` ownership
+  bypass; guardians still take the baton). `GET /` advertises `features.whitelist_mode`; signed
+  `/uploads/by-user` answers whitelisted/fee_exempt/is_admin + per-account quota. `test/admin-hive-tier.test.js`.
+- **Stage D — frontend.** Invite-only banner; not-whitelisted accounts get both upload buttons
+  disabled with a clear message (no encrypt-then-403); "Free (fee-exempt)" estimates + all four pay
+  flows skip Keychain when the gate quotes exempt; per-account quota label; hidden 🛠 Admin tab for
+  roster admins (whitelist CRUD + ban/takedown/pin-delete forms, fresh action+target-bound signature
+  per action).
+
+**81 tests green** (was 53 pre-whitelist). The three example configs from the original ask are all
+settings of the same table: whitelist-only-free = everyone `fee_exempt`; admin+guest-quotas =
+roster admin + entries with `quota_bytes`; paid-but-gated = entries with `fee_exempt=0`.
+Still open: live browser pass on a whitelist-enabled deployment (operator golden-path convention),
+and a WalkThrough.wiki "enable whitelist mode" recipe when it first ships to a real box.
+
 ### ✅ Stage-1 decisions — RESOLVED (2026-06-14)
 All locked; nothing blocking Stage 1a/1b. (Full reasoning in the two design docs.)
 - **Refund-on-cancel** — pro-rata for the single active claim; dormant backstop → escrow minus `BACKSTOP_CANCEL_FEE_PCT`; expiry → none. The old pro-rata-vs-dedup tension is **dissolved** (v1 has one active claim per CID, so no over-collection; parallel co-ownership deferred to multi-node). [cohosting §6](ipfs-gate-cohosting-backstop.md).
