@@ -11,6 +11,7 @@
 > - [ipfs-gate-cohosting-backstop.md](ipfs-gate-cohosting-backstop.md) — **current** co-hosting / backstop / refund / moderation model (the lifecycle that pricing sits on). DESIGN LOCKED.
 > - [IPFS-Gate-Scale-Plan.md](IPFS-Gate-Scale-Plan.md) — how the gate scales (Kubernetes is the chosen path for the concept build).
 > - `v4call-ipfs-gate-build-handover.md` — the Private Encrypted Hosting v1 → v2 build handover (source for the current direction below).
+> - [WHITELIST-MODE-DESIGN-NOTES.md](WHITELIST-MODE-DESIGN-NOTES.md) — gated/family-server mode (per-account whitelist, quota, fee exemption, Hive-account admin tier). **DESIGN LOCKED 2026-07-04, not yet built** — Stage A (schema + enforcement) is next.
 > - [Archive.PRICING-V0.3-DESIGN-NOTES.md](Archive.PRICING-V0.3-DESIGN-NOTES.md) — ⚠️ **ARCHIVED / superseded** (two-part tariff + prepaid balance + token discount; never built). Kept for history only — **do not build from it**; ideas partly carried forward as optional later layers (see PRICING-V1 §11).
 
 ## Current status

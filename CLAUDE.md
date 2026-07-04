@@ -9,6 +9,7 @@
 > - `ipfs-gate-cohosting-backstop.md` — co-hosting / backstop / refund / moderation lifecycle (DESIGN LOCKED).
 > - `IPFS-Gate-Scale-Plan.md` — scaling (Kubernetes is the chosen path).
 > - `v4call-ipfs-gate-build-handover.md` — the v1 → v2 build handover.
+> - `WHITELIST-MODE-DESIGN-NOTES.md` — gated/family-server mode (DESIGN LOCKED 2026-07-04; not yet built — Stage A hasn't started).
 > - `Archive.PRICING-V0.3-DESIGN-NOTES.md` — ⚠️ **ARCHIVED / superseded**, history only — do **not** build from it (two-part tariff + prepaid balance + token discount; never built). The "Pricing (v0.1)" `.env` block further down is the *shipped v0.1.3 flat per-upload* fee — accurate for what's deployed today, but superseded by the claim model for the v1 build.
 
 > **Brainstorm scratchpad** (full design history with every decision's reasoning): `/home/noob/.claude/plans/question-i-have-you-groovy-hickey.md`. Read this if you need to understand WHY a v0.1 decision was made — locked decisions are mirrored here in CLAUDE.md but the rationale lives in the plan file.
