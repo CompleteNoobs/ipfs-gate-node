@@ -135,6 +135,75 @@ function isCidBlocked(cid) {
   return !!row;
 }
 
+// ─── Whitelist / gated-server mode (WHITELIST-MODE-DESIGN-NOTES.md) ─────────
+// Read at CALL time, not module load — operationally identical (env vars are
+// baked into the container at create time) but lets the test suite exercise
+// both modes in one process. Off by default: WHITELIST_MODE=false must be a
+// byte-for-byte no-op everywhere.
+
+function whitelistModeEnabled() {
+  return /^(1|true)$/i.test(process.env.WHITELIST_MODE || '');
+}
+
+function isAccountWhitelisted(account) {
+  const row = db.prepare(
+    "SELECT 1 FROM whitelisted_accounts WHERE hive_account = ? AND removed_at IS NULL"
+  ).get(account);
+  return !!row;
+}
+
+function getWhitelistEntry(account) {
+  return db.prepare(
+    "SELECT * FROM whitelisted_accounts WHERE hive_account = ? AND removed_at IS NULL"
+  ).get(account) || null;
+}
+
+/**
+ * This account's OWN active+pending bytes (uploader-scoped mirror of
+ * getDiskUsage). Sums only pins WHERE uploader = account — another account's
+ * own-copy/guardian pin on the same CID never counts against this one.
+ */
+function getAccountUsage(account) {
+  const active = db.prepare(
+    "SELECT COALESCE(SUM(size_bytes), 0) AS s FROM pins WHERE uploader = ? AND status = 'active'"
+  ).get(account);
+  const pending = db.prepare(
+    "SELECT COALESCE(SUM(size_bytes), 0) AS s FROM reservations WHERE uploader = ? AND status = 'pending' AND expires_at > ?"
+  ).get(account, now());
+  return {
+    active_bytes: active.s,
+    reserved_bytes: pending.s,
+    used_bytes: active.s + pending.s
+  };
+}
+
+/**
+ * Throws forbidden / insufficient_storage when whitelist mode blocks this
+ * account (not whitelisted, or its per-account quota_bytes cap would be
+ * exceeded by addedBytes). No-op when WHITELIST_MODE is off. The per-account
+ * cap applies IN ADDITION to the global DISK_LIMIT_BYTES check — tightest
+ * wins; callers keep the global check.
+ */
+function assertWhitelistAllows(account, addedBytes = 0) {
+  if (!whitelistModeEnabled()) return;
+  const entry = getWhitelistEntry(account);
+  if (!entry) {
+    throw Object.assign(
+      new Error('this server is invite-only — your account is not whitelisted'),
+      { code: 'forbidden' }
+    );
+  }
+  if (entry.quota_bytes != null && addedBytes > 0) {
+    const usage = getAccountUsage(account);
+    if (usage.used_bytes + addedBytes > entry.quota_bytes) {
+      throw Object.assign(
+        new Error(`per-account quota exceeded (${usage.used_bytes} + ${addedBytes} > ${entry.quota_bytes} bytes)`),
+        { code: 'insufficient_storage' }
+      );
+    }
+  }
+}
+
 // ─── Reservations ───────────────────────────────────────────────────────────
 
 /**
@@ -159,6 +228,12 @@ function createReservation(uploader, sizeBytes, mode = 'encrypted', quote = {}) 
   }
   if (isAccountBanned(uploader)) {
     throw Object.assign(new Error('uploader is banned'), { code: 'forbidden' });
+  }
+  if (whitelistModeEnabled() && !isAccountWhitelisted(uploader)) {
+    throw Object.assign(
+      new Error('this server is invite-only — your account is not whitelisted'),
+      { code: 'forbidden' }
+    );
   }
 
   // v1 claim model: the reservation carries the quote (hours/copies/amount) so
@@ -185,6 +260,11 @@ function createReservation(uploader, sizeBytes, mode = 'encrypted', quote = {}) 
         { code: 'insufficient_storage' }
       );
     }
+
+    // Whitelist mode: per-account quota_bytes cap, IN ADDITION to the global
+    // disk check above (tightest wins). Inside the tx so two concurrent
+    // reservations can't both slip under the same account's cap.
+    assertWhitelistAllows(uploader, sizeBytes);
 
     const id = newReservationId();
     const expires_at = t + (RESERVATION_TTL_MIN * 60 * 1000);
@@ -792,6 +872,11 @@ module.exports = {
   getAccountPendingCount,
   isAccountBanned,
   isCidBlocked,
+  whitelistModeEnabled,
+  isAccountWhitelisted,
+  getWhitelistEntry,
+  getAccountUsage,
+  assertWhitelistAllows,
   // reservations
   createReservation,
   getReservation,

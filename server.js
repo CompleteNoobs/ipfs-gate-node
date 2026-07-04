@@ -1266,6 +1266,12 @@ function guardianPledgeHandler(memoPurpose) {
       }
       const account = pledger.toLowerCase();
       if (quota.isAccountBanned(account)) return respondError(res, 'forbidden', 'pledger is banned');
+      // Whitelist mode: this route bypasses createReservation, so the gate is
+      // inlined here (same pattern as the ban check above). Membership only —
+      // a dormant pledge adds no bytes, so no per-account quota check.
+      if (quota.whitelistModeEnabled() && !quota.isAccountWhitelisted(account)) {
+        return respondError(res, 'forbidden', 'this server is invite-only — pledger is not whitelisted');
+      }
       if (quota.isCidBlocked(cid)) return respondError(res, 'legal_takedown', 'this CID is blocked on this server');
 
       const hosted = quota.alreadyHostedForCid(cid);
@@ -1456,11 +1462,24 @@ app.post('/claims/own-copy', uploadLimiter, async (req, res) => {
     }
     const account = owner.toLowerCase();
     if (quota.isAccountBanned(account)) return respondError(res, 'forbidden', 'owner is banned');
+    // Whitelist mode: this route bypasses createReservation, so the gate is
+    // inlined here (same pattern as the ban check above).
+    if (quota.whitelistModeEnabled() && !quota.isAccountWhitelisted(account)) {
+      return respondError(res, 'forbidden', 'this server is invite-only — owner is not whitelisted');
+    }
     if (quota.isCidBlocked(cid)) return respondError(res, 'legal_takedown', 'this CID is blocked on this server');
 
     const hosted = quota.alreadyHostedForCid(cid);
     if (!hosted) {
       return respondError(res, 'not_found', 'CID is not currently hosted here — upload it via /reserve + /upload instead');
+    }
+    // Unlike a dormant guardian pledge, an own copy adds accountable bytes
+    // immediately — so the per-account quota cap applies here too (checked
+    // before payment so nobody pays and then gets rejected on quota).
+    try {
+      quota.assertWhitelistAllows(account, hosted.size_bytes);
+    } catch (e) {
+      return handleError(res, e);
     }
     const quote = pricing.calculateCost({ sizeBytes: hosted.size_bytes, hoursRequested: hours, copies });
 

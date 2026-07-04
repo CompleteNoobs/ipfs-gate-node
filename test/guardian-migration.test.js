@@ -56,7 +56,7 @@ const MIG_DIR = path.join(__dirname, '..', 'migrations');
   db.close();
 }
 
-// ── Upgrade through the real runner (applies only 006) ──────────────────────
+// ── Upgrade through the real runner (applies 006 + everything after) ────────
 const quota = require('../quota');
 quota.open();
 quota.runMigrations();
@@ -66,7 +66,9 @@ process.on('exit', () => {
 
 test('006 renames backstop→guardian and preserves every other column', () => {
   const db = quota.open();
-  assert.equal(db.prepare('SELECT MAX(version) AS v FROM schema_version').get().v, 6);
+  // 006 applied (later migrations may push MAX(version) higher — that's fine,
+  // this test owns the 005→006 rebuild, not the ceiling).
+  assert.ok(db.prepare('SELECT 1 FROM schema_version WHERE version = 6').get(), '006 recorded');
   assert.equal(db.prepare("SELECT COUNT(*) AS c FROM claims WHERE kind = 'backstop'").get().c, 0);
 
   const orig = quota.getClaim('clm_orig');
