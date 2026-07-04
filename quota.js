@@ -419,7 +419,7 @@ function listUploadsForAccount(account, limit = 100, offset = 0) {
     SELECT p.id AS pin_id, p.cid, p.size_bytes, p.created_at, p.expires_at,
            p.status, p.status_reason, p.mode, p.mime,
            py.tx_id, py.amount, py.currency,
-           c.kind AS claim_kind
+           c.kind AS claim_kind, c.claim_id AS claim_id
     FROM pins p
     JOIN payments py ON p.payment_id = py.id
     LEFT JOIN claims c ON c.pin_id = p.id

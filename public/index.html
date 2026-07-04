@@ -998,9 +998,7 @@ function buildUploadRow(u, gw, ctx) {
     ${guardianLine}
     ${ctx && ctx.context ? `<div class="upl-ctx">${escapeHtml(ctx.context)}</div>` : ''}
     ${isPublic && u.public_url ? `<div class="upl-actions"><span class="upl-publink">${escapeHtml(u.public_url)}</span><button class="upl-btn" data-act="copy">📋 Copy link</button><button class="upl-btn" data-act="open">↗ Open</button></div>` : ''}
-    <div class="upl-actions upl-action-bar">
-      ${isActive ? '<button class="upl-btn danger" data-act="delete">🗑 Delete / unpin</button>' : ''}
-    </div>
+    <div class="upl-actions upl-action-bar"></div>
   `;
 
   row.querySelectorAll('[data-act]').forEach(btn => {
@@ -1013,12 +1011,29 @@ function buildUploadRow(u, gw, ctx) {
         });
       } else if (act === 'open') {
         window.open(u.public_url, '_blank', 'noopener');
-      } else if (act === 'delete') {
-        promptDeleteUpload(row, u, gw);
       }
     });
   });
+  resetUploadActionBar(row, u, gw);
   return row;
+}
+
+// Default action bar for an upload row — extend (claim-model pins only; a
+// legacy pin has no claim_id and can only be re-uploaded) + delete. Shared by
+// buildUploadRow and every prompt's Cancel path so the buttons never get lost.
+function resetUploadActionBar(row, u, gw) {
+  const bar = row.querySelector('.upl-action-bar');
+  if (!bar) return;
+  if (u.status !== 'active') { bar.innerHTML = ''; return; }
+  bar.innerHTML = `
+    ${u.claim_id ? '<button class="upl-btn" data-act="extend">⏳ Extend</button>' : ''}
+    <button class="upl-btn danger" data-act="delete">🗑 Delete / unpin</button>`;
+  const ext = bar.querySelector('[data-act="extend"]');
+  if (ext) ext.addEventListener('click', () => promptExtendClaim(row, u.claim_id, gw, {
+    resetBar: () => resetUploadActionBar(row, u, gw),
+    refresh: () => loadUploadsList()
+  }));
+  bar.querySelector('[data-act="delete"]').addEventListener('click', () => promptDeleteUpload(row, u, gw));
 }
 
 function promptDeleteUpload(row, u, gw) {
@@ -1030,11 +1045,77 @@ function promptDeleteUpload(row, u, gw) {
   bar.innerHTML = `<span class="upl-confirm">${escapeHtml(warn)}
       <button class="upl-btn danger" data-c="yes">Confirm</button>
       <button class="upl-btn" data-c="no">Cancel</button></span>`;
-  bar.querySelector('[data-c="no"]').addEventListener('click', () => {
-    bar.innerHTML = '<button class="upl-btn danger" data-act="delete">🗑 Delete / unpin</button>';
-    bar.querySelector('[data-act="delete"]').addEventListener('click', () => promptDeleteUpload(row, u, gw));
-  });
+  bar.querySelector('[data-c="no"]').addEventListener('click', () => resetUploadActionBar(row, u, gw));
   bar.querySelector('[data-c="yes"]').addEventListener('click', () => deleteUpload(row, u, gw));
+}
+
+// ── Extend / top-up (cohosting §8 — the gate bills at the claim's LOCKED rate,
+// never the live rate). Generic over any active claim the user owns: used by
+// the My-Uploads rows and by an ACTIVATED guardian claim in the pledges card.
+// A quote of 0 means the claim was created fee-exempt (rate_locked 0) — the
+// gate then accepts the extend with no payment at all (Stage B), so Keychain
+// is skipped exactly like the upload flows.
+function promptExtendClaim(row, claimId, gw, opts) {
+  const bar = row.querySelector('.upl-action-bar');
+  if (!bar) return;
+  bar.innerHTML = `<span class="upl-confirm">Extend by
+      <input type="number" min="1" value="${gateDefaultHours}" style="width:80px;" data-ext-hours> h
+      <button class="upl-btn" data-e="quote">Get quote</button>
+      <button class="upl-btn" data-e="no">Cancel</button></span>`;
+  bar.querySelector('[data-e="no"]').addEventListener('click', opts.resetBar);
+  bar.querySelector('[data-e="quote"]').addEventListener('click', async () => {
+    const hours = Math.max(1, parseInt(bar.querySelector('[data-ext-hours]').value) || 1);
+    bar.innerHTML = '<span class="upl-confirm">… fetching quote</span>';
+    let q;
+    try {
+      const qRes = await fetch(`${gw}/claims/extend/quote?claim_id=${encodeURIComponent(claimId)}&hours=${hours}`);
+      q = await qRes.json().catch(() => ({}));
+      if (!qRes.ok) throw new Error(q.message || `quote failed (${qRes.status})`);
+    } catch (e) {
+      bar.innerHTML = `<span class="upl-confirm">⚠ ${escapeHtml(e.message)} <button class="upl-btn" data-e="back">OK</button></span>`;
+      bar.querySelector('[data-e="back"]').addEventListener('click', opts.resetBar);
+      return;
+    }
+    const free = Number(q.quote.total) === 0;
+    bar.innerHTML = `<span class="upl-confirm">${free
+        ? `Free (fee-exempt) — add ${q.quote.extra_hrs} h?`
+        : `${escapeHtml(String(q.quote.total))} ${escapeHtml(q.quote.currency || '')} for ${q.quote.extra_hrs} h more (locked rate).`}
+        <button class="upl-btn" data-e="go">${free ? '⏳ Extend free' : '⏳ Pay & extend'}</button>
+        <button class="upl-btn" data-e="no">Cancel</button></span>`;
+    bar.querySelector('[data-e="no"]').addEventListener('click', opts.resetBar);
+    bar.querySelector('[data-e="go"]').addEventListener('click', () => executeExtendClaim(bar, claimId, gw, q, opts));
+  });
+}
+
+async function executeExtendClaim(bar, claimId, gw, q, opts) {
+  try {
+    let txId = null;
+    if (Number(q.quote.total) > 0) {
+      bar.innerHTML = '<span class="upl-confirm">… paying (Keychain)</span>';
+      txId = await keychainTransferGateToken({
+        to: q.payment.escrow_account, amount: q.payment.amount,
+        memo: q.payment.memo, symbol: q.payment.currency
+      });
+      if (!txId) { bar.innerHTML = '<span class="upl-confirm">⚠ payment cancelled</span>'; setTimeout(opts.resetBar, 1500); return; }
+      bar.innerHTML = '<span class="upl-confirm">… waiting for tx to index (3s)</span>';
+      await new Promise(r => setTimeout(r, 3000));
+    }
+    bar.innerHTML = '<span class="upl-confirm">… extending</span>';
+    const resp = await fetch(`${gw}/claims/extend`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ claim_id: claimId, extra_hours: q.quote.extra_hrs, ...(txId ? { tx_id: txId } : {}) })
+    });
+    const j = await resp.json().catch(() => ({}));
+    if (!resp.ok) {
+      bar.innerHTML = `<span class="upl-confirm">⚠ extend failed: ${escapeHtml(j.message || String(resp.status))}${txId ? ` — payment tx ${escapeHtml(txId)} may need operator review (orphan-payments).` : ''}</span>`;
+      return;
+    }
+    const until = j.expires_at ? new Date(j.expires_at).toLocaleString() : '?';
+    bar.innerHTML = `<span class="upl-confirm" style="color:var(--green);">✓ +${j.added_hours} h — hosted until ${escapeHtml(until)}</span>`;
+    if (opts.refresh) setTimeout(opts.refresh, 1500);
+  } catch (e) {
+    bar.innerHTML = `<span class="upl-confirm">⚠ ${escapeHtml(e.message)}</span>`;
+  }
 }
 
 async function deleteUpload(row, u, gw) {
@@ -1155,12 +1236,28 @@ function buildGuardianPledgeRow(c, gw) {
       <span>${c.state === 'dormant' ? 'starts if promoted' : 'until'}: ${escapeHtml(expiryTxt)}</span>
     </div>
     <div class="upl-actions upl-action-bar">
-      ${c.state === 'dormant' ? '<button class="upl-btn danger" data-act="cancel">✕ Cancel pledge</button>' : ''}
+      ${c.state === 'dormant' ? '<button class="upl-btn danger" data-act="cancel">✕ Cancel pledge</button>'
+        : c.state === 'active' ? '<button class="upl-btn" data-act="extend">⏳ Extend</button>' : ''}
     </div>
   `;
 
   const cancelBtn = row.querySelector('[data-act="cancel"]');
   if (cancelBtn) cancelBtn.addEventListener('click', () => promptCancelPledge(row, c, gw));
+  // An ACTIVATED guardian is now the live host — extending its claim extends
+  // the file's hosting, same endpoint as any other active claim.
+  const extendBtn = row.querySelector('[data-act="extend"]');
+  if (extendBtn) {
+    const extOpts = {
+      resetBar: () => {
+        const bar = row.querySelector('.upl-action-bar');
+        if (!bar) return;
+        bar.innerHTML = '<button class="upl-btn" data-act="extend">⏳ Extend</button>';
+        bar.querySelector('[data-act="extend"]').addEventListener('click', () => promptExtendClaim(row, c.claim_id, gw, extOpts));
+      },
+      refresh: () => loadGuardianPledges()
+    };
+    extendBtn.addEventListener('click', () => promptExtendClaim(row, c.claim_id, gw, extOpts));
+  }
   return row;
 }
 

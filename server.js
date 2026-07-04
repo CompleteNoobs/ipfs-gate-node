@@ -985,6 +985,9 @@ app.get('/uploads/by-user', userApiLimiter, async (req, res) => {
         mime: p.mime || null,
         mode: p.mode || 'encrypted',
         kind: p.claim_kind || null,
+        // claim_id enables extend/top-up from the client (null on pre-claim
+        // legacy pins — those can't be extended, only re-uploaded).
+        claim_id: p.claim_id || null,
         uploaded_at: isoFromMs(p.created_at),
         expires_at: isoFromMs(p.expires_at),
         pinned: p.status === 'active',
