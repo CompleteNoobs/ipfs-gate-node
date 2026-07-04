@@ -192,6 +192,8 @@ footer { margin-top: 30px; font-size: 0.68rem; color: var(--muted); border-top: 
       <button class="secondary" onclick="logout()" style="align-self:flex-end;">Log out</button>
     </div>
     <div class="gw-line" id="gate-info-line">…</div>
+    <!-- Whitelist / gated-server mode (filled by refreshGateInfo + loadUploadsList) -->
+    <div class="gw-line" id="whitelist-banner" style="display:none;margin-top:6px;"></div>
   </div>
 
   <nav class="tabs">
@@ -199,6 +201,7 @@ footer { margin-top: 30px; font-size: 0.68rem; color: var(--muted); border-top: 
     <button data-tab="tab-private" onclick="showTab('tab-private')">🔒 Private Send</button>
     <button data-tab="tab-public" onclick="showTab('tab-public')">🌐 Public Upload</button>
     <button data-tab="tab-reveal" onclick="showTab('tab-reveal')">👁 Reveal</button>
+    <button data-tab="tab-admin" id="admin-tab-btn" style="display:none;" onclick="showTab('tab-admin')">🛠 Admin</button>
   </nav>
 
   <!-- ── My Uploads ── -->
@@ -293,6 +296,47 @@ footer { margin-top: 30px; font-size: 0.68rem; color: var(--muted); border-top: 
     </div>
   </div>
 
+  <!-- ── Admin (hidden until /uploads/by-user reports is_admin) ── -->
+  <div class="tab-panel" id="tab-admin">
+    <div class="card">
+      <div class="row">
+        <h2 style="margin:0;flex:1;">🛠 Whitelist</h2>
+        <button class="secondary" onclick="loadAdminWhitelist()">↻ Refresh</button>
+      </div>
+      <div class="hint">You're a server admin (Hive tier) — every action here signs an <code>admin-action</code> message with your posting key; the box owner's <code>ADMIN_KEY</code> keeps working independently.</div>
+      <div class="row" style="margin-top:10px;">
+        <input type="text" id="adm-wl-account" placeholder="hive account" style="width:160px;">
+        <input type="number" id="adm-wl-quota-gb" placeholder="quota GB (blank = ∞)" min="0" step="0.1" style="width:160px;">
+        <label style="font-size:0.78rem;cursor:pointer;align-self:center;"><input type="checkbox" id="adm-wl-exempt"> fee-exempt</label>
+        <button class="purple" onclick="adminWhitelistAdd()">+ Whitelist</button>
+      </div>
+      <div class="status" id="adm-wl-status"></div>
+      <div id="adm-wl-list" style="margin-top:12px;"><div class="uploads-status">Hit Refresh to load (signs a read-only request).</div></div>
+    </div>
+    <div class="card" style="margin-top:12px;">
+      <h2>Moderation</h2>
+      <div class="hint">Ban = the account's uploads end (identity kill). Takedown = a CID is removed for everyone and can't come back (content kill). Delete pin = end ONE account's claim on ONE CID, leaving other hosts alone.</div>
+      <div class="row" style="margin-top:10px;">
+        <input type="text" id="adm-ban-account" placeholder="hive account" style="width:160px;">
+        <input type="text" id="adm-ban-reason" placeholder="reason" style="flex:1;min-width:140px;">
+        <select id="adm-ban-policy" style="width:110px;"><option value="prorata">prorata</option><option value="none">no refund</option></select>
+        <button class="danger" onclick="adminBan()">Ban</button>
+        <button class="secondary" onclick="adminUnban()">Unban</button>
+      </div>
+      <div class="row" style="margin-top:8px;">
+        <input type="text" id="adm-td-cid" placeholder="cid" style="flex:1;min-width:200px;">
+        <input type="text" id="adm-td-reason" placeholder="reason" style="width:160px;">
+        <button class="danger" onclick="adminTakedown()">Takedown</button>
+      </div>
+      <div class="row" style="margin-top:8px;">
+        <input type="text" id="adm-pd-cid" placeholder="cid" style="flex:1;min-width:200px;">
+        <input type="text" id="adm-pd-account" placeholder="whose pin" style="width:140px;">
+        <button class="danger" onclick="adminPinDelete()">Delete pin</button>
+      </div>
+      <div class="status" id="adm-mod-status"></div>
+    </div>
+  </div>
+
 </div><!-- /app -->
 
 <footer>
@@ -325,6 +369,13 @@ let gateRatePerMbHour = null;
 let gateMbDivisor     = 1000000;
 let gatePayCurrency   = null;
 let gateCopiesMax     = 1;
+// Whitelist / gated-server mode. gateWhitelistMode comes from GET / (public);
+// the my* trio comes from the SIGNED /uploads/by-user response (null = not
+// yet known). See WHITELIST-MODE-DESIGN-NOTES.md §7/§8.
+let gateWhitelistMode = false;
+let myWhitelisted     = null;
+let myFeeExempt       = false;
+let myIsAdmin         = false;
 
 function defaultGateway() {
   if (/^https?:$/.test(location.protocol)) return location.origin;
@@ -554,6 +605,8 @@ function logout() {
   myUsername = ''; myPubKey = ''; myPrivKey = null; myPrivKeyStr = ''; useKeychain = false;
   _uplListSig = null;
   _claimsListSig = null;
+  myWhitelisted = null; myFeeExempt = false; myIsAdmin = false;
+  applyWhitelistIdentity();
   sessionStorage.removeItem('hive_username');
   sessionStorage.removeItem('hive_pubkey');
   sessionStorage.removeItem('hive_keychain');
@@ -738,6 +791,8 @@ async function refreshGateInfo() {
     if (pr.mb_divisor) gateMbDivisor = pr.mb_divisor;
     if (pay.currency) gatePayCurrency = String(pay.currency).toUpperCase();
     if (pr.copies_max) gateCopiesMax = parseInt(pr.copies_max) || 1;
+    gateWhitelistMode = !!(j.features && j.features.whitelist_mode);
+    renderWhitelistBanner();
     line.innerHTML = `<b>${escapeHtml(j.service || 'ipfs-gate')}</b> · escrow @${escapeHtml(j.operator || '?')} · `
       + `${escapeHtml(String(gateRatePerMbHour ?? '?'))} ${escapeHtml(gatePayCurrency || '?')}/MB·h · `
       + `max ${escapeHtml(String(pay.max_size_mb || '?'))} MB · default ${gateDefaultHours} h · copies ≤ ${gateCopiesMax}`;
@@ -756,6 +811,44 @@ async function refreshGateInfo() {
   refreshPubEstimate();
 }
 
+// ── Whitelist mode UI (banner + upload gating + admin tab reveal) ────────────
+// gateWhitelistMode is public knowledge (GET /); myWhitelisted/myFeeExempt/
+// myIsAdmin arrive with the signed /uploads/by-user response and stay null/
+// false until it lands. applyWhitelistIdentity() is re-run after both.
+
+function renderWhitelistBanner() {
+  const el = document.getElementById('whitelist-banner');
+  if (!el) return;
+  if (!gateWhitelistMode) { el.style.display = 'none'; el.innerHTML = ''; return; }
+  el.style.display = 'block';
+  if (myWhitelisted === false) {
+    el.innerHTML = '🔒 <b>This server is invite-only</b> — your account is not whitelisted, so uploads are disabled. Ask the operator for access.';
+    el.style.color = 'var(--danger)';
+  } else if (myWhitelisted === true) {
+    el.innerHTML = '🔒 Invite-only server — you\'re whitelisted' + (myFeeExempt ? ' · <b>✓ fee-exempt (uploads are free)</b>' : '') + '.';
+    el.style.color = '';
+  } else {
+    el.innerHTML = '🔒 This server is <b>invite-only</b> — only whitelisted Hive accounts can upload.';
+    el.style.color = '';
+  }
+}
+
+function applyWhitelistIdentity() {
+  renderWhitelistBanner();
+  // Block the two upload actions when we KNOW the account isn't whitelisted
+  // (better than letting the user encrypt/pick recipients and then hit a 403).
+  const blocked = gateWhitelistMode && myWhitelisted === false;
+  const privBtn = document.getElementById('priv-send-btn');
+  const pubBtn = document.getElementById('pub-upload-btn');
+  if (privBtn) { privBtn.disabled = blocked; privBtn.title = blocked ? 'not whitelisted on this gate' : ''; }
+  if (pubBtn) { pubBtn.disabled = blocked; pubBtn.title = blocked ? 'not whitelisted on this gate' : ''; }
+  // Reveal the Admin tab for roster admins (hide again on logout/account swap).
+  const adminBtn = document.getElementById('admin-tab-btn');
+  if (adminBtn) adminBtn.style.display = myIsAdmin ? '' : 'none';
+  refreshPrivEstimate();
+  refreshPubEstimate();
+}
+
 // ══════════════════════════════════════════════════════════════
 // Tabs
 // ══════════════════════════════════════════════════════════════
@@ -763,6 +856,7 @@ function showTab(id) {
   document.querySelectorAll('.tab-panel').forEach(p => p.classList.toggle('shown', p.id === id));
   document.querySelectorAll('nav.tabs button').forEach(b => b.classList.toggle('active', b.dataset.tab === id));
   if (id === 'tab-uploads') { loadUploadsList(); loadGuardianPledges(); }
+  if (id === 'tab-admin') loadAdminWhitelist();
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -826,8 +920,17 @@ function renderUploadsList(data, gw, ctx) {
   mineEl.textContent = `Your uploads: ${bytesToHuman(yourBytes)} across ${active.length} file${active.length === 1 ? '' : 's'}`;
 
   const q = data.quota || {};
+  // Whitelist-mode identity rides on this signed response (design §7) —
+  // capture it, then re-apply the banner / upload gating / admin-tab state.
+  myWhitelisted = (typeof q.whitelisted === 'boolean') ? q.whitelisted : null;
+  myFeeExempt = !!q.fee_exempt;
+  myIsAdmin = !!data.is_admin;
+  applyWhitelistIdentity();
+
   sharedEl.textContent = q.limit_bytes
-    ? `Gate storage: ${bytesToHuman(q.used_bytes || 0)} of ${bytesToHuman(q.limit_bytes)} used (shared across all users)`
+    ? (q.quota_scope === 'per_account'
+        ? `Your quota: ${bytesToHuman(q.used_bytes || 0)} of ${bytesToHuman(q.limit_bytes)} (per-account cap on this gate)`
+        : `Gate storage: ${bytesToHuman(q.used_bytes || 0)} of ${bytesToHuman(q.limit_bytes)} used (shared across all users)`)
     : '';
 
   if (uploads.length === 0) {
@@ -1100,6 +1203,156 @@ async function cancelPledge(row, c, gw) {
 }
 
 // ══════════════════════════════════════════════════════════════
+// Admin tab (Hive-tier server admin — WHITELIST-MODE-DESIGN-NOTES.md §5/§8)
+// Every action signs ipfs-gate:admin-action:v1:<action>:<target>:<me>:<ts>
+// with the posting key. The message binds action+target, so each call signs
+// fresh (no sig caching — admin actions are infrequent, replay-safety wins).
+// ══════════════════════════════════════════════════════════════
+function setAdmWlStatus(text, isErr) {
+  const n = document.getElementById('adm-wl-status');
+  if (n) { n.textContent = text || ''; n.className = 'status' + (isErr ? ' err' : ''); }
+}
+function setAdmModStatus(text, isErr) {
+  const n = document.getElementById('adm-mod-status');
+  if (n) { n.textContent = text || ''; n.className = 'status' + (isErr ? ' err' : ''); }
+}
+
+async function signAdminAction(action, target) {
+  const ts = Math.floor(Date.now() / 1000);
+  const msg = `ipfs-gate:admin-action:v1:${action}:${target}:${myUsername}:${ts}`;
+  const sig = await signRaw(msg);
+  if (!sig) throw new Error('signing declined');
+  return { admin_account: myUsername, admin_ts: ts, admin_pubkey: myPubKey, admin_sig: sig };
+}
+
+async function adminPost(path, action, target, body) {
+  const auth = await signAdminAction(action, target);
+  const resp = await fetch(`${getGateway()}${path}`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ ...body, ...auth })
+  });
+  const j = await resp.json().catch(() => ({}));
+  if (!resp.ok) throw new Error(j.message || `failed (${resp.status})`);
+  return j;
+}
+
+async function loadAdminWhitelist() {
+  const listEl = document.getElementById('adm-wl-list');
+  if (!listEl) return;
+  listEl.innerHTML = '<div class="uploads-status">… loading</div>';
+  let auth;
+  try { auth = await signAdminAction('whitelist-list', 'all'); }
+  catch (e) { listEl.innerHTML = `<div class="uploads-status">⚠ ${escapeHtml(e.message)}</div>`; return; }
+  const qs = `admin_account=${encodeURIComponent(auth.admin_account)}&admin_ts=${auth.admin_ts}`
+           + `&admin_pubkey=${encodeURIComponent(auth.admin_pubkey)}&admin_sig=${encodeURIComponent(auth.admin_sig)}`;
+  let resp;
+  try { resp = await fetch(`${getGateway()}/admin/whitelist?${qs}`); }
+  catch (e) { listEl.innerHTML = '<div class="uploads-status">⚠ could not reach the gate.</div>'; return; }
+  const j = await resp.json().catch(() => ({}));
+  if (!resp.ok) { listEl.innerHTML = `<div class="uploads-status">⚠ ${escapeHtml(j.message || String(resp.status))}</div>`; return; }
+  renderAdminWhitelist(j);
+}
+
+function renderAdminWhitelist(data) {
+  const listEl = document.getElementById('adm-wl-list');
+  const entries = Array.isArray(data.whitelist) ? data.whitelist : [];
+  if (!data.whitelist_mode) {
+    setAdmWlStatus('⚠ WHITELIST_MODE is OFF on this gate — the list below is stored but not enforced.', true);
+  }
+  if (entries.length === 0) {
+    listEl.innerHTML = '<div class="uploads-empty">Nobody whitelisted yet.</div>';
+    return;
+  }
+  listEl.innerHTML = '';
+  entries.forEach(w => {
+    const row = document.createElement('div');
+    row.className = 'upl-row';
+    const quotaTxt = w.quota_bytes != null ? bytesToHuman(w.quota_bytes) : '∞';
+    row.innerHTML = `
+      <div class="upl-top">
+        <span class="upl-name">@${escapeHtml(w.hive_account)}</span>
+        ${w.fee_exempt ? '<span class="upl-mode">fee-exempt</span>' : ''}
+      </div>
+      <div class="upl-meta">
+        <span>quota: ${escapeHtml(quotaTxt)}</span>
+        <span>added by ${escapeHtml(w.added_by || '?')}</span>
+        ${w.note ? `<span>${escapeHtml(w.note)}</span>` : ''}
+      </div>
+      <div class="upl-actions"><button class="upl-btn danger" data-wl-rm="${escapeHtml(w.hive_account)}">✕ Remove</button></div>`;
+    row.querySelector('[data-wl-rm]').addEventListener('click', () => adminWhitelistRemove(w.hive_account));
+    listEl.appendChild(row);
+  });
+}
+
+async function adminWhitelistAdd() {
+  const account = (document.getElementById('adm-wl-account').value || '').trim().replace(/^@+/, '').toLowerCase();
+  if (!account) { setAdmWlStatus('⚠ enter a hive account', true); return; }
+  const gbRaw = document.getElementById('adm-wl-quota-gb').value;
+  const quota_bytes = gbRaw === '' ? null : Math.round(parseFloat(gbRaw) * 1e9);
+  const fee_exempt = document.getElementById('adm-wl-exempt').checked;
+  try {
+    setAdmWlStatus('Signing + adding…');
+    await adminPost('/admin/whitelist/add', 'whitelist-add', account, { target_account: account, quota_bytes, fee_exempt });
+    setAdmWlStatus(`✓ @${account} whitelisted${fee_exempt ? ' (fee-exempt)' : ''}${quota_bytes != null ? ` · ${bytesToHuman(quota_bytes)} quota` : ''}.`);
+    document.getElementById('adm-wl-account').value = '';
+    loadAdminWhitelist();
+  } catch (e) { setAdmWlStatus('⚠ ' + e.message, true); }
+}
+
+async function adminWhitelistRemove(account) {
+  try {
+    setAdmWlStatus(`Signing + removing @${account}…`);
+    await adminPost('/admin/whitelist/remove', 'whitelist-remove', account, { target_account: account });
+    setAdmWlStatus(`✓ @${account} removed — existing uploads stay (use Ban to end them).`);
+    loadAdminWhitelist();
+  } catch (e) { setAdmWlStatus('⚠ ' + e.message, true); }
+}
+
+async function adminBan() {
+  const account = (document.getElementById('adm-ban-account').value || '').trim().replace(/^@+/, '').toLowerCase();
+  const reason = (document.getElementById('adm-ban-reason').value || '').trim();
+  const refund_policy = document.getElementById('adm-ban-policy').value;
+  if (!account || !reason) { setAdmModStatus('⚠ account + reason required', true); return; }
+  try {
+    setAdmModStatus('Signing + banning…');
+    const j = await adminPost('/admin/ban', 'ban', account, { hive_account: account, reason, refund_policy });
+    setAdmModStatus(`✓ @${account} banned — ${j.claims_voided} claim(s) voided, ${j.guardians_activated} guardian(s) promoted.`);
+  } catch (e) { setAdmModStatus('⚠ ' + e.message, true); }
+}
+
+async function adminUnban() {
+  const account = (document.getElementById('adm-ban-account').value || '').trim().replace(/^@+/, '').toLowerCase();
+  if (!account) { setAdmModStatus('⚠ enter the account to unban', true); return; }
+  try {
+    setAdmModStatus('Signing + unbanning…');
+    await adminPost('/admin/unban', 'unban', account, { hive_account: account });
+    setAdmModStatus(`✓ @${account} unbanned.`);
+  } catch (e) { setAdmModStatus('⚠ ' + e.message, true); }
+}
+
+async function adminTakedown() {
+  const cid = (document.getElementById('adm-td-cid').value || '').trim();
+  const reason = (document.getElementById('adm-td-reason').value || '').trim();
+  if (!cid || !reason) { setAdmModStatus('⚠ cid + reason required', true); return; }
+  try {
+    setAdmModStatus('Signing + taking down…');
+    const j = await adminPost('/admin/takedown', 'takedown', cid, { cid, reason });
+    setAdmModStatus(`✓ CID taken down — ${j.claims_voided} claim(s) voided, ${j.guardians_refunded} innocent guardian(s) refunded.`);
+  } catch (e) { setAdmModStatus('⚠ ' + e.message, true); }
+}
+
+async function adminPinDelete() {
+  const cid = (document.getElementById('adm-pd-cid').value || '').trim();
+  const account = (document.getElementById('adm-pd-account').value || '').trim().replace(/^@+/, '').toLowerCase();
+  if (!cid || !account) { setAdmModStatus('⚠ cid + account required', true); return; }
+  try {
+    setAdmModStatus('Signing + deleting pin…');
+    const j = await adminPost('/admin/pins/delete', 'pin-delete', `${cid}:${account}`, { target_account: account, cid });
+    setAdmModStatus(`✓ ${j.claims_cancelled} claim(s) ended for @${account} on that CID${j.fully_unpinned ? ' — file unpinned' : ' — other hosts remain'}.`);
+  } catch (e) { setAdmModStatus('⚠ ' + e.message, true); }
+}
+
+// ══════════════════════════════════════════════════════════════
 // Private Send (encrypt-to-people, pay-to-host, v4reveal link)
 // ══════════════════════════════════════════════════════════════
 let privSendState = { file: null, recipients: new Set() };
@@ -1172,6 +1425,7 @@ function refreshPrivEstimate() {
   if (!f) { el.textContent = 'Pick a file to estimate.'; return; }
   const hours = Math.max(1, parseInt(document.getElementById('priv-hours').value) || gateDefaultHours);
   const copies = Math.max(1, Math.min(gateCopiesMax, parseInt(document.getElementById('priv-copies').value) || 1));
+  if (myFeeExempt) { el.textContent = `Free — you're fee-exempt on this gate (${(f.size / gateMbDivisor).toFixed(2)} MB × ${hours} h × ${copies} cop).`; return; }
   if (!gateRatePerMbHour) { el.textContent = `~ ${(f.size / 1e6).toFixed(2)} MB × ${hours} h × ${copies} — exact cost quoted at pay.`; return; }
   const mb = f.size / gateMbDivisor;
   const est = gateRatePerMbHour * mb * hours * copies;
@@ -1232,9 +1486,14 @@ async function runPrivateSend({ file, gatewayUrl, recipients, hours, copies, pol
   const memo = reserve.payment.memo;
   const payAmount = reserve.payment.amount;
   const payCurrency = (reserve.payment.currency || gatePayCurrency || 'CNOOBS').toUpperCase();
+  // Whitelist fee exemption: the gate quoted 0 and will accept the upload with
+  // no on-chain payment (no tx_id) — skip the Keychain transfer entirely.
+  const feeExempt = !!(reserve.quote && reserve.quote.fee_exempt);
   if (reserve.quote) {
     const q = reserve.quote;
-    setPrivStatus(`Quote: ${q.total} ${q.currency} — ${q.billable_mb} MB × ${q.billable_hrs} h × ${q.copies} cop${q.copies_capped ? ' (copies capped to node count)' : ''}.`);
+    setPrivStatus(feeExempt
+      ? `Free (fee-exempt) — ${q.billable_mb} MB × ${q.billable_hrs} h × ${q.copies} cop.`
+      : `Quote: ${q.total} ${q.currency} — ${q.billable_mb} MB × ${q.billable_hrs} h × ${q.copies} cop${q.copies_capped ? ' (copies capped to node count)' : ''}.`);
   }
 
   // 3) Sign upload proof.
@@ -1243,20 +1502,23 @@ async function runPrivateSend({ file, gatewayUrl, recipients, hours, copies, pol
   const uploadProofSig = await signRaw(proofMsg);
   if (!uploadProofSig) throw new Error('upload proof signature cancelled');
 
-  // 4) Pay (Keychain custom_json — Active auth).
-  setPrivStatus(`Paying ${payAmount} ${payCurrency} (Keychain)…`);
-  const txId = await keychainTransferGateToken({ to: escrowAccount, amount: payAmount, memo, symbol: payCurrency });
-  if (!txId) throw new Error('payment cancelled or failed');
+  let txId = null;
+  if (!feeExempt) {
+    // 4) Pay (Keychain custom_json — Active auth).
+    setPrivStatus(`Paying ${payAmount} ${payCurrency} (Keychain)…`);
+    txId = await keychainTransferGateToken({ to: escrowAccount, amount: payAmount, memo, symbol: payCurrency });
+    if (!txId) throw new Error('payment cancelled or failed');
 
-  // 5) Settle delay so the tx is indexed before /upload checks it.
-  setPrivStatus('Waiting for tx to index (3s)…');
-  await new Promise(r => setTimeout(r, 3000));
+    // 5) Settle delay so the tx is indexed before /upload checks it.
+    setPrivStatus('Waiting for tx to index (3s)…');
+    await new Promise(r => setTimeout(r, 3000));
+  }
 
   // 6) Upload ciphertext + release_policy + commitment.
   setPrivStatus('Uploading ciphertext…');
   const form = new FormData();
   form.append('reservation_id', reservationId);
-  form.append('tx_id', txId);
+  if (txId) form.append('tx_id', txId);
   form.append('uploader_pubkey', myPubKey);
   form.append('upload_proof_sig', uploadProofSig);
   form.append('release_policy', JSON.stringify(release_policy));
@@ -1266,9 +1528,11 @@ async function runPrivateSend({ file, gatewayUrl, recipients, hours, copies, pol
   try {
     upRes = await fetch(`${gatewayUrl}/upload`, { method: 'POST', body: form });
   } catch (e) {
-    throw new Error(`upload failed (${e.message}) — your ${payAmount} ${payCurrency} payment to ${escrowAccount} was already broadcast. tx: ${txId} · reservation: ${reservationId}. Ask the operator to check /admin/orphan-payments.`);
+    throw new Error(txId
+      ? `upload failed (${e.message}) — your ${payAmount} ${payCurrency} payment to ${escrowAccount} was already broadcast. tx: ${txId} · reservation: ${reservationId}. Ask the operator to check /admin/orphan-payments.`
+      : `upload failed (${e.message}) — nothing was paid (fee-exempt); just retry.`);
   }
-  if (!upRes.ok) { const j = await upRes.json().catch(() => ({})); throw new Error(`upload failed: ${j.message || upRes.status} — payment tx ${txId} may need operator review (orphan-payments).`); }
+  if (!upRes.ok) { const j = await upRes.json().catch(() => ({})); throw new Error(`upload failed: ${j.message || upRes.status}${txId ? ` — payment tx ${txId} may need operator review (orphan-payments).` : ' — nothing was paid (fee-exempt); just retry.'}`); }
   const upJson = await upRes.json();
   const cid = upJson.cid;
   const expires_at = upJson.expires_at || null;
@@ -1383,6 +1647,7 @@ function refreshPubEstimate() {
   if (!f) { el.textContent = 'Pick a file to estimate.'; return; }
   const hours = Math.max(1, parseInt(document.getElementById('pub-hours').value) || gateDefaultHours);
   const copies = Math.max(1, Math.min(gateCopiesMax, parseInt(document.getElementById('pub-copies').value) || 1));
+  if (myFeeExempt) { el.textContent = `Free — you're fee-exempt on this gate (${(f.size / gateMbDivisor).toFixed(2)} MB × ${hours} h × ${copies} cop).`; return; }
   if (!gateRatePerMbHour) { el.textContent = `~ ${(f.size / 1e6).toFixed(2)} MB × ${hours} h × ${copies} — exact cost quoted at pay.`; return; }
   const mb = f.size / gateMbDivisor;
   const est = gateRatePerMbHour * mb * hours * copies;
@@ -1490,20 +1755,25 @@ async function becomeGuardian() {
   const hours = Math.max(1, parseInt(document.getElementById('hosted-hours').value) || gateDefaultHours);
   try {
     setHostedStatus('Fetching guardian quote…');
-    const qRes = await fetch(`${gw}/guardian/quote?cid=${encodeURIComponent(hostedCid)}&hours=${hours}`);
+    const qRes = await fetch(`${gw}/guardian/quote?cid=${encodeURIComponent(hostedCid)}&hours=${hours}&hive_account=${encodeURIComponent(myUsername)}`);
     const q = await qRes.json().catch(() => ({}));
     if (!qRes.ok) throw new Error(q.message || `quote failed (${qRes.status})`);
 
-    setHostedStatus(`Pledging ${q.payment.amount} ${q.payment.currency} for ${q.quote.billable_hrs} h (Keychain)…`);
-    const txId = await keychainTransferGateToken({ to: q.payment.escrow_account, amount: q.payment.amount, memo: q.payment.memo, symbol: q.payment.currency });
-    if (!txId) throw new Error('payment cancelled or failed');
+    let txId = null;
+    if (q.quote && q.quote.fee_exempt) {
+      setHostedStatus('Free (fee-exempt) — pledging…');
+    } else {
+      setHostedStatus(`Pledging ${q.payment.amount} ${q.payment.currency} for ${q.quote.billable_hrs} h (Keychain)…`);
+      txId = await keychainTransferGateToken({ to: q.payment.escrow_account, amount: q.payment.amount, memo: q.payment.memo, symbol: q.payment.currency });
+      if (!txId) throw new Error('payment cancelled or failed');
 
-    setHostedStatus('Waiting for tx to index (3s)…');
-    await new Promise(r => setTimeout(r, 3000));
+      setHostedStatus('Waiting for tx to index (3s)…');
+      await new Promise(r => setTimeout(r, 3000));
+    }
 
     const pRes = await fetch(`${gw}/guardian/pledge`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ pledger: myUsername, cid: hostedCid, hours_requested: hours, tx_id: txId })
+      body: JSON.stringify({ pledger: myUsername, cid: hostedCid, hours_requested: hours, ...(txId ? { tx_id: txId } : {}) })
     });
     const pj = await pRes.json().catch(() => ({}));
     if (!pRes.ok) throw new Error(`${pj.message || pRes.status} — payment tx ${txId} may need operator review (orphan-payments).`);
@@ -1518,20 +1788,25 @@ async function hostOwnCopy() {
   const hours = Math.max(1, parseInt(document.getElementById('hosted-hours').value) || gateDefaultHours);
   try {
     setHostedStatus('Fetching own-copy quote…');
-    const qRes = await fetch(`${gw}/claims/own-copy/quote?cid=${encodeURIComponent(hostedCid)}&hours=${hours}`);
+    const qRes = await fetch(`${gw}/claims/own-copy/quote?cid=${encodeURIComponent(hostedCid)}&hours=${hours}&hive_account=${encodeURIComponent(myUsername)}`);
     const q = await qRes.json().catch(() => ({}));
     if (!qRes.ok) throw new Error(q.message || `quote failed (${qRes.status})`);
 
-    setHostedStatus(`Paying ${q.payment.amount} ${q.payment.currency} for ${q.quote.billable_hrs} h (Keychain)…`);
-    const txId = await keychainTransferGateToken({ to: q.payment.escrow_account, amount: q.payment.amount, memo: q.payment.memo, symbol: q.payment.currency });
-    if (!txId) throw new Error('payment cancelled or failed');
+    let txId = null;
+    if (q.quote && q.quote.fee_exempt) {
+      setHostedStatus('Free (fee-exempt) — claiming your copy…');
+    } else {
+      setHostedStatus(`Paying ${q.payment.amount} ${q.payment.currency} for ${q.quote.billable_hrs} h (Keychain)…`);
+      txId = await keychainTransferGateToken({ to: q.payment.escrow_account, amount: q.payment.amount, memo: q.payment.memo, symbol: q.payment.currency });
+      if (!txId) throw new Error('payment cancelled or failed');
 
-    setHostedStatus('Waiting for tx to index (3s)…');
-    await new Promise(r => setTimeout(r, 3000));
+      setHostedStatus('Waiting for tx to index (3s)…');
+      await new Promise(r => setTimeout(r, 3000));
+    }
 
     const cRes = await fetch(`${gw}/claims/own-copy`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ owner: myUsername, cid: hostedCid, hours_requested: hours, tx_id: txId })
+      body: JSON.stringify({ owner: myUsername, cid: hostedCid, hours_requested: hours, ...(txId ? { tx_id: txId } : {}) })
     });
     const cj = await cRes.json().catch(() => ({}));
     if (!cRes.ok) throw new Error(`${cj.message || cRes.status} — payment tx ${txId} may need operator review (orphan-payments).`);
@@ -1561,9 +1836,13 @@ async function uploadPublicFile(file, gatewayUrl, hours, copies) {
   const memo = reserve.payment.memo;
   const payAmount = reserve.payment.amount;
   const payCurrency = (reserve.payment.currency || 'CNOOBS').toUpperCase();
+  // Whitelist fee exemption — same skip as the private-send flow.
+  const feeExempt = !!(reserve.quote && reserve.quote.fee_exempt);
   if (reserve.quote) {
     const q = reserve.quote;
-    setPubStatus(`Quote: ${q.total} ${q.currency} — ${q.billable_mb} MB × ${q.billable_hrs} h × ${q.copies} cop${q.copies_capped ? ' (copies capped to node count)' : ''}.`);
+    setPubStatus(feeExempt
+      ? `Free (fee-exempt) — ${q.billable_mb} MB × ${q.billable_hrs} h × ${q.copies} cop.`
+      : `Quote: ${q.total} ${q.currency} — ${q.billable_mb} MB × ${q.billable_hrs} h × ${q.copies} cop${q.copies_capped ? ' (copies capped to node count)' : ''}.`);
   }
 
   setPubStatus('Signing upload proof…');
@@ -1571,17 +1850,20 @@ async function uploadPublicFile(file, gatewayUrl, hours, copies) {
   const uploadProofSig = await signRaw(proofMsg);
   if (!uploadProofSig) throw new Error('upload proof signature cancelled');
 
-  setPubStatus(`Paying ${payAmount} ${payCurrency} (Keychain)…`);
-  const txId = await keychainTransferGateToken({ to: escrowAccount, amount: payAmount, memo, symbol: payCurrency });
-  if (!txId) throw new Error('payment cancelled or failed');
+  let txId = null;
+  if (!feeExempt) {
+    setPubStatus(`Paying ${payAmount} ${payCurrency} (Keychain)…`);
+    txId = await keychainTransferGateToken({ to: escrowAccount, amount: payAmount, memo, symbol: payCurrency });
+    if (!txId) throw new Error('payment cancelled or failed');
 
-  setPubStatus('Waiting for tx to index (3s)…');
-  await new Promise(r => setTimeout(r, 3000));
+    setPubStatus('Waiting for tx to index (3s)…');
+    await new Promise(r => setTimeout(r, 3000));
+  }
 
   setPubStatus('Uploading (plaintext)…');
   const form = new FormData();
   form.append('reservation_id', reservationId);
-  form.append('tx_id', txId);
+  if (txId) form.append('tx_id', txId);
   form.append('uploader_pubkey', myPubKey);
   form.append('upload_proof_sig', uploadProofSig);
   form.append('mode', 'public');
@@ -1594,9 +1876,11 @@ async function uploadPublicFile(file, gatewayUrl, hours, copies) {
   try {
     upRes = await fetch(`${gatewayUrl}/upload`, { method: 'POST', body: form });
   } catch (e) {
-    throw new Error(`upload failed (${e.message}) — your ${payAmount} ${payCurrency} payment to ${escrowAccount} was already broadcast. tx: ${txId} · reservation: ${reservationId}. Ask the operator to check /admin/orphan-payments.`);
+    throw new Error(txId
+      ? `upload failed (${e.message}) — your ${payAmount} ${payCurrency} payment to ${escrowAccount} was already broadcast. tx: ${txId} · reservation: ${reservationId}. Ask the operator to check /admin/orphan-payments.`
+      : `upload failed (${e.message}) — nothing was paid (fee-exempt); just retry.`);
   }
-  if (!upRes.ok) { const j = await upRes.json().catch(() => ({})); throw new Error(`upload failed: ${j.message || upRes.status} — payment tx ${txId} may need operator review (orphan-payments).`); }
+  if (!upRes.ok) { const j = await upRes.json().catch(() => ({})); throw new Error(`upload failed: ${j.message || upRes.status}${txId ? ` — payment tx ${txId} may need operator review (orphan-payments).` : ' — nothing was paid (fee-exempt); just retry.'}`); }
   const upJson = await upRes.json();
   const cid = upJson.cid;
   let url = upJson.gateway_url || '';
