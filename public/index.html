@@ -213,6 +213,14 @@ footer { margin-top: 30px; font-size: 0.68rem; color: var(--muted); border-top: 
       <div id="uploads-list" style="margin-top:12px;"><div class="uploads-status">Hit Refresh to load (signs a read-only request).</div></div>
       <div class="hint">Encrypted uploads are labelled from this browser's local records — the gate itself only saw ciphertext, so files sent from another device show as 🔒 “encrypted upload”.</div>
     </div>
+    <div class="card" style="margin-top:12px;">
+      <div class="row">
+        <h2 style="margin:0;flex:1;">🛡 My Guardian Pledges</h2>
+        <button class="secondary" onclick="loadGuardianPledges(true)">↻ Refresh</button>
+      </div>
+      <div id="guardian-pledges-list" style="margin-top:12px;"><div class="uploads-status">Hit Refresh to load (signs a read-only request).</div></div>
+      <div class="hint">Guardian pledges you've made to help keep OTHERS' files hosted — dormant pledges refund in full if cancelled before they ever activate.</div>
+    </div>
   </div>
 
   <!-- ── Private Send ── -->
@@ -254,6 +262,11 @@ footer { margin-top: 30px; font-size: 0.68rem; color: var(--muted); border-top: 
       <label class="field-label">File</label>
       <input type="file" id="pub-file-input" onchange="onPubFilePick()">
       <div class="hint" id="pub-file-meta"></div>
+      <div class="row" style="margin-top:10px;">
+        <div><label class="field-label">Hours hosted</label><input type="number" id="pub-hours" min="1" value="168" style="width:110px;"></div>
+        <div><label class="field-label">Copies <span class="hint" id="pub-copies-note"></span></label><input type="number" id="pub-copies" min="1" value="1" style="width:90px;"></div>
+      </div>
+      <div class="gw-line" id="pub-cost-line" style="margin-top:8px;">Pick a file to estimate.</div>
       <div class="row" style="margin-top:10px;">
         <button id="pub-upload-btn" onclick="confirmPublicUpload()">🌐 Pay &amp; upload</button>
       </div>
@@ -534,11 +547,13 @@ function enterApp() {
   document.getElementById('kc-key-bar').style.display = myPrivKeyStr ? 'none' : '';
   refreshGateInfo();
   loadUploadsList();
+  loadGuardianPledges();
 }
 
 function logout() {
   myUsername = ''; myPubKey = ''; myPrivKey = null; myPrivKeyStr = ''; useKeychain = false;
   _uplListSig = null;
+  _claimsListSig = null;
   sessionStorage.removeItem('hive_username');
   sessionStorage.removeItem('hive_pubkey');
   sessionStorage.removeItem('hive_keychain');
@@ -730,10 +745,15 @@ async function refreshGateInfo() {
     if (hoursEl && !hoursEl.dataset.touched) hoursEl.value = String(gateDefaultHours);
     const note = document.getElementById('priv-copies-note');
     if (note) note.textContent = gateCopiesMax <= 1 ? '(single-node gate → 1)' : `(up to ${gateCopiesMax})`;
+    const pubHoursEl = document.getElementById('pub-hours');
+    if (pubHoursEl && !pubHoursEl.dataset.touched) pubHoursEl.value = String(gateDefaultHours);
+    const pubNote = document.getElementById('pub-copies-note');
+    if (pubNote) pubNote.textContent = gateCopiesMax <= 1 ? '(single-node gate → 1)' : `(up to ${gateCopiesMax})`;
   } catch (e) {
     line.textContent = '⚠ could not reach the gate at ' + gw + ' — check the URL.';
   }
   refreshPrivEstimate();
+  refreshPubEstimate();
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -742,7 +762,7 @@ async function refreshGateInfo() {
 function showTab(id) {
   document.querySelectorAll('.tab-panel').forEach(p => p.classList.toggle('shown', p.id === id));
   document.querySelectorAll('nav.tabs button').forEach(b => b.classList.toggle('active', b.dataset.tab === id));
-  if (id === 'tab-uploads') loadUploadsList();
+  if (id === 'tab-uploads') { loadUploadsList(); loadGuardianPledges(); }
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -853,11 +873,18 @@ function buildUploadRow(u, gw, ctx) {
   let uploadedTxt = '';
   try { uploadedTxt = u.uploaded_at ? new Date(u.uploaded_at).toLocaleString() : ''; } catch (_) {}
 
+  const kindLabel = u.kind === 'own_copy' ? 'own copy' : u.kind === 'guardian' ? 'guardian' : u.kind === 'original' ? 'original' : null;
+  const g = u.guardians;
+  const guardianLine = (g && (g.queue_depth > 0 || g.co_hosts > 0))
+    ? `<div class="upl-ctx">🛡 ${g.queue_depth} guardian(s) pledged (${g.pledged_hours_total}h)${g.co_hosts > 0 ? ` · ${g.co_hosts} co-host(s)` : ''}</div>`
+    : '';
+
   row.innerHTML = `
     <div class="upl-top">
       <span class="upl-icon">${icon}</span>
       <span class="upl-name">${escapeHtml(name)}</span>
       <span class="upl-mode ${isPublic ? 'public' : 'encrypted'}">${isPublic ? 'public' : 'encrypted'}</span>
+      ${kindLabel ? `<span class="upl-mode">${escapeHtml(kindLabel)}</span>` : ''}
     </div>
     <div class="upl-meta">
       <span>${bytesToHuman(u.size_bytes || 0)}</span>
@@ -865,6 +892,7 @@ function buildUploadRow(u, gw, ctx) {
       ${uploadedTxt ? `<span>↑ ${escapeHtml(uploadedTxt)}</span>` : ''}
       <span class="upl-status ${statusCls}">${escapeHtml(statusTxt)}</span>
     </div>
+    ${guardianLine}
     ${ctx && ctx.context ? `<div class="upl-ctx">${escapeHtml(ctx.context)}</div>` : ''}
     ${isPublic && u.public_url ? `<div class="upl-actions"><span class="upl-publink">${escapeHtml(u.public_url)}</span><button class="upl-btn" data-act="copy">📋 Copy link</button><button class="upl-btn" data-act="open">↗ Open</button></div>` : ''}
     <div class="upl-actions upl-action-bar">
@@ -937,6 +965,138 @@ function markRowRemoved(row, fullyUnpinned) {
   row.classList.add('inactive');
   const bar = row.querySelector('.upl-action-bar');
   if (bar) bar.innerHTML = `<span class="upl-confirm" style="color:var(--green);">✓ unpinned${fullyUnpinned === false ? ' (other copies remain)' : ''}</span>`;
+}
+
+// ══════════════════════════════════════════════════════════════
+// My Guardian Pledges (kind='guardian' claims this account holds on OTHERS'
+// files — dormant pledges never show up in "My Uploads" since they hold no
+// pins row until activated. Mirrors the uploads-list machinery above.)
+// ══════════════════════════════════════════════════════════════
+let _claimsListSig = null;
+
+async function getClaimsRequestSig() {
+  if (_claimsListSig && _claimsListSig.account === myUsername
+      && (Date.now() - _claimsListSig.signedAt) < 240000) {
+    return _claimsListSig;
+  }
+  const ts = Math.floor(Date.now() / 1000);
+  const msg = `ipfs-gate:list-claims:v1:${myUsername}:${ts}`;
+  const sig = await signRaw(msg);
+  if (!sig) throw new Error('could not sign the request (Keychain declined, or unlock your key first)');
+  _claimsListSig = { ts, sig, pubkey: myPubKey, account: myUsername, signedAt: Date.now() };
+  return _claimsListSig;
+}
+
+async function loadGuardianPledges(forceResign) {
+  const listEl = document.getElementById('guardian-pledges-list');
+  if (!listEl) return;
+  if (!myUsername) { listEl.innerHTML = '<div class="uploads-status">Log in first.</div>'; return; }
+  if (forceResign) _claimsListSig = null;
+  const gw = getGateway();
+  listEl.innerHTML = `<div class="uploads-status">… loading your guardian pledges from ${escapeHtml(gw)}</div>`;
+  let s;
+  try { s = await getClaimsRequestSig(); }
+  catch (e) { listEl.innerHTML = `<div class="uploads-status">⚠ ${escapeHtml(e.message)}</div>`; return; }
+  const qs = `hive_account=${encodeURIComponent(myUsername)}&ts=${s.ts}`
+           + `&pubkey=${encodeURIComponent(s.pubkey)}&sig=${encodeURIComponent(s.sig)}`;
+  let resp;
+  try {
+    resp = await fetch(`${gw}/claims/mine?${qs}`, { method: 'GET' });
+  } catch (e) {
+    listEl.innerHTML = `<div class="uploads-status">⚠ could not reach the gate at ${escapeHtml(gw)}. Check the Gate URL above.</div>`;
+    return;
+  }
+  if (resp.status === 401) { _claimsListSig = null; listEl.innerHTML = '<div class="uploads-status">⚠ the gate rejected your signature (401). Hit Refresh to re-sign.</div>'; return; }
+  if (resp.status === 422) { _claimsListSig = null; listEl.innerHTML = '<div class="uploads-status">⚠ the gate could not verify your Hive identity right now (422 — a Hive node was unreachable). Try Refresh in a moment.</div>'; return; }
+  if (resp.status === 429) { listEl.innerHTML = '<div class="uploads-status">⚠ too many requests (429). Wait a minute, then Refresh.</div>'; return; }
+  if (!resp.ok) { listEl.innerHTML = `<div class="uploads-status">⚠ gate error (${resp.status}).</div>`; return; }
+  let data;
+  try { data = await resp.json(); }
+  catch (e) { listEl.innerHTML = '<div class="uploads-status">⚠ bad response from the gate.</div>'; return; }
+  renderGuardianPledges(data, gw);
+}
+
+function renderGuardianPledges(data, gw) {
+  const listEl = document.getElementById('guardian-pledges-list');
+  const claims = (Array.isArray(data.claims) ? data.claims : []).filter(c => c.kind === 'guardian');
+  if (claims.length === 0) {
+    listEl.innerHTML = '<div class="uploads-empty">No guardian pledges yet. Use 🛡 Become a Guardian on an already-hosted file (Public Upload tab) to back someone else\'s content.</div>';
+    return;
+  }
+  claims.sort((a, b) => new Date(b.created_ts || 0) - new Date(a.created_ts || 0));
+  listEl.innerHTML = '';
+  claims.forEach(c => listEl.appendChild(buildGuardianPledgeRow(c, gw)));
+}
+
+function buildGuardianPledgeRow(c, gw) {
+  const row = document.createElement('div');
+  row.className = 'upl-row' + (c.state === 'dormant' || c.state === 'active' ? '' : ' inactive');
+  row.dataset.claimId = c.claim_id;
+
+  const stateTxt = c.state === 'dormant' ? '🕓 pledged, waiting'
+                 : c.state === 'active'  ? '🛡 currently hosting'
+                 : c.state === 'cancelled' ? 'cancelled'
+                 : c.state === 'expired' ? 'expired'
+                 : (c.state || 'unknown');
+  const expiryTxt = c.state === 'dormant' ? 'not started' : (c.expiry_ts ? new Date(c.expiry_ts).toLocaleString() : '?');
+
+  row.innerHTML = `
+    <div class="upl-top">
+      <span class="upl-icon">🛡</span>
+      <span class="upl-name" title="${escapeHtml(c.cid)}">cid:${escapeHtml(String(c.cid).slice(0, 12))}…</span>
+      <span class="upl-mode">${escapeHtml(stateTxt)}</span>
+    </div>
+    <div class="upl-meta">
+      <span>#${escapeHtml(String(c.pledge_order ?? '?'))} in queue</span>
+      <span>pledged ${escapeHtml(String(c.paid_hours))}h (budget ${escapeHtml(String(c.pledge_budget ?? c.amount_paid))} ${escapeHtml(c.currency || '')})</span>
+      <span>${c.state === 'dormant' ? 'starts if promoted' : 'until'}: ${escapeHtml(expiryTxt)}</span>
+    </div>
+    <div class="upl-actions upl-action-bar">
+      ${c.state === 'dormant' ? '<button class="upl-btn danger" data-act="cancel">✕ Cancel pledge</button>' : ''}
+    </div>
+  `;
+
+  const cancelBtn = row.querySelector('[data-act="cancel"]');
+  if (cancelBtn) cancelBtn.addEventListener('click', () => promptCancelPledge(row, c, gw));
+  return row;
+}
+
+function promptCancelPledge(row, c, gw) {
+  const bar = row.querySelector('.upl-action-bar');
+  if (!bar) return;
+  bar.innerHTML = `<span class="upl-confirm">Cancel this pledge? Dormant pledges refund in full.
+      <button class="upl-btn danger" data-c="yes">Confirm</button>
+      <button class="upl-btn" data-c="no">Cancel</button></span>`;
+  bar.querySelector('[data-c="no"]').addEventListener('click', () => {
+    bar.innerHTML = '<button class="upl-btn danger" data-act="cancel">✕ Cancel pledge</button>';
+    bar.querySelector('[data-act="cancel"]').addEventListener('click', () => promptCancelPledge(row, c, gw));
+  });
+  bar.querySelector('[data-c="yes"]').addEventListener('click', () => cancelPledge(row, c, gw));
+}
+
+async function cancelPledge(row, c, gw) {
+  const bar = row.querySelector('.upl-action-bar');
+  if (bar) bar.innerHTML = '<span class="upl-confirm">… cancelling</span>';
+  const ts = Math.floor(Date.now() / 1000);
+  const msg = `ipfs-gate:cancel-claim:v1:${c.claim_id}:${myUsername}:${ts}`;
+  let sig = '';
+  try { sig = await signRaw(msg); } catch (_) {}
+  if (!sig) { if (bar) bar.innerHTML = '<span class="upl-confirm">⚠ signing declined</span>'; return; }
+  let resp;
+  try {
+    resp = await fetch(`${gw}/claims/cancel`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ claim_id: c.claim_id, hive_account: myUsername, ts, pubkey: myPubKey, sig })
+    });
+  } catch (e) {
+    if (bar) bar.innerHTML = '<span class="upl-confirm">⚠ could not reach the gate</span>';
+    return;
+  }
+  if (!resp.ok) { const j = await resp.json().catch(() => ({})); if (bar) bar.innerHTML = `<span class="upl-confirm">⚠ cancel failed (${j.message || resp.status})</span>`; return; }
+  row.classList.add('inactive');
+  if (bar) bar.innerHTML = '<span class="upl-confirm" style="color:var(--green);">✓ cancelled — refunded in full</span>';
+  loadGuardianPledges();
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -1210,10 +1370,23 @@ function onPubFilePick() {
   // a new file means the old already-hosted answer no longer applies
   document.getElementById('pub-hosted-panel').style.display = 'none';
   hostedCid = null;
-  if (!f) { meta.textContent = ''; return; }
+  if (!f) { meta.textContent = ''; refreshPubEstimate(); return; }
   const mime = detectFileMime(f) || 'application/octet-stream';
   const warn = f.size > attachMaxBytes ? ` ⚠ over gate cap (${(attachMaxBytes / 1024 / 1024).toFixed(0)} MB)` : '';
   meta.textContent = `${f.name} · ${bytesToHuman(f.size)} · ${mime}${warn}`;
+  refreshPubEstimate();
+}
+function refreshPubEstimate() {
+  const el = document.getElementById('pub-cost-line');
+  if (!el) return;
+  const f = (document.getElementById('pub-file-input').files || [])[0];
+  if (!f) { el.textContent = 'Pick a file to estimate.'; return; }
+  const hours = Math.max(1, parseInt(document.getElementById('pub-hours').value) || gateDefaultHours);
+  const copies = Math.max(1, Math.min(gateCopiesMax, parseInt(document.getElementById('pub-copies').value) || 1));
+  if (!gateRatePerMbHour) { el.textContent = `~ ${(f.size / 1e6).toFixed(2)} MB × ${hours} h × ${copies} — exact cost quoted at pay.`; return; }
+  const mb = f.size / gateMbDivisor;
+  const est = gateRatePerMbHour * mb * hours * copies;
+  el.textContent = `≈ ${est.toFixed(3)} ${gatePayCurrency || '?'} (${mb.toFixed(2)} MB × ${hours} h × ${copies} cop) — exact at pay`;
 }
 function showPubResult(url) {
   const r = document.getElementById('pub-result');
@@ -1253,7 +1426,9 @@ async function confirmPublicUpload(skipHostedCheck) {
       }
     }
     document.getElementById('pub-hosted-panel').style.display = 'none';
-    const res = await uploadPublicFile(file, getGateway());
+    const hours = Math.max(1, parseInt(document.getElementById('pub-hours').value) || gateDefaultHours);
+    const copies = Math.max(1, Math.min(gateCopiesMax, parseInt(document.getElementById('pub-copies').value) || 1));
+    const res = await uploadPublicFile(file, getGateway(), hours, copies);
     recordCtx(res.cid, { filename: file.name, mime: res.mime, kind: mimeToKind(res.mime), context: 'public link' });
     showPubResult(res.url);
     setPubStatus('✓ Uploaded — link ready below.');
@@ -1366,16 +1541,18 @@ async function hostOwnCopy() {
     loadUploadsList();
   } catch (e) { setHostedStatus('⚠ ' + e.message, true); }
 }
-async function uploadPublicFile(file, gatewayUrl) {
+async function uploadPublicFile(file, gatewayUrl, hours, copies) {
   const buf = new Uint8Array(await file.arrayBuffer());
   const mime = detectFileMime(file) || 'application/octet-stream';
   const kind = mimeToKind(mime);
   const sha = await sha256HexBytes(buf);
+  const hoursReq = Math.max(1, hours || gateDefaultHours);
+  const copiesReq = Math.max(1, Math.min(gateCopiesMax, copies || 1));
 
   setPubStatus('Reserving quota…');
   const reserveRes = await fetch(`${gatewayUrl}/reserve`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ uploader: myUsername, size_bytes: buf.length, mode: 'public', hours_requested: gateDefaultHours, copies: 1 })
+    body: JSON.stringify({ uploader: myUsername, size_bytes: buf.length, mode: 'public', hours_requested: hoursReq, copies: copiesReq })
   });
   if (!reserveRes.ok) { const j = await reserveRes.json().catch(() => ({})); throw new Error(`reserve failed: ${j.message || reserveRes.status}`); }
   const reserve = await reserveRes.json();
@@ -1647,6 +1824,8 @@ document.getElementById('hive-username').addEventListener('keydown', e => {
 document.getElementById('kc-key-input').addEventListener('keydown', e => { if (e.key === 'Enter') unlockEncryption(); });
 document.getElementById('priv-hours').addEventListener('input', function () { this.dataset.touched = '1'; refreshPrivEstimate(); });
 document.getElementById('priv-copies').addEventListener('input', refreshPrivEstimate);
+document.getElementById('pub-hours').addEventListener('input', function () { this.dataset.touched = '1'; refreshPubEstimate(); });
+document.getElementById('pub-copies').addEventListener('input', refreshPubEstimate);
 document.getElementById('priv-recip-input').addEventListener('keydown', e => { if (e.key === 'Enter') privAddRecipient(); });
 
 // Dim the Keychain button if the extension isn't there (it injects late).

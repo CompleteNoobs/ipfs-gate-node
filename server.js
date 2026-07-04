@@ -808,18 +808,31 @@ app.get('/uploads/by-user', userApiLimiter, async (req, res) => {
 
     const disk = quota.getDiskUsage();
     const rows = quota.listUploadsForAccount(account, 500, 0);
-    const uploads = rows.map(p => ({
-      cid: p.cid,
-      size_bytes: p.size_bytes,
-      mime: p.mime || null,
-      mode: p.mode || 'encrypted',
-      kind: null,
-      uploaded_at: isoFromMs(p.created_at),
-      expires_at: isoFromMs(p.expires_at),
-      pinned: p.status === 'active',
-      status: p.status,
-      public_url: (p.mode === 'public') ? `${PUBLIC_GATEWAY_BASE}/ipfs/${p.cid}` : null
-    }));
+    const uploads = rows.map(p => {
+      let guardians = null;
+      if (p.status === 'active') {
+        const dormant = quota.getDormantGuardiansForCid(p.cid);
+        const activeOthers = quota.getActiveClaimsForCid(p.cid).filter(c => c.pin_id !== p.pin_id);
+        guardians = {
+          queue_depth: dormant.length,
+          pledged_hours_total: dormant.reduce((s, c) => s + c.paid_hours, 0),
+          co_hosts: activeOthers.length
+        };
+      }
+      return {
+        cid: p.cid,
+        size_bytes: p.size_bytes,
+        mime: p.mime || null,
+        mode: p.mode || 'encrypted',
+        kind: p.claim_kind || null,
+        uploaded_at: isoFromMs(p.created_at),
+        expires_at: isoFromMs(p.expires_at),
+        pinned: p.status === 'active',
+        status: p.status,
+        public_url: (p.mode === 'public') ? `${PUBLIC_GATEWAY_BASE}/ipfs/${p.cid}` : null,
+        guardians
+      };
+    });
 
     res.json({
       hive_account: account,
@@ -835,6 +848,47 @@ app.get('/uploads/by-user', userApiLimiter, async (req, res) => {
       },
       uploads
     });
+  } catch (e) {
+    return handleError(res, e);
+  }
+});
+
+/**
+ * GET /claims/mine
+ * Query: hive_account, ts (unix seconds), pubkey, sig
+ * Signed message: ipfs-gate:list-claims:v1:<hive_account>:<ts>
+ * Every claim this account holds, any kind/state (original/own_copy/guardian).
+ * The client filters to kind='guardian' to render "My Guardian Pledges".
+ */
+app.get('/claims/mine', userApiLimiter, async (req, res) => {
+  try {
+    const account = String(req.query.hive_account || '').toLowerCase();
+    const ts = req.query.ts;
+    const pubkey = req.query.pubkey;
+    const sig = req.query.sig;
+
+    const message = `ipfs-gate:list-claims:v1:${account}:${ts}`;
+    await verifySignedUserRequest({ account, ts, pubkey, sig, message });
+
+    const claims = quota.listClaimsForOwner(account).map(c => ({
+      claim_id: c.claim_id,
+      order_id: c.order_id,
+      cid: c.cid,
+      kind: c.kind,
+      state: c.state,
+      paid_hours: c.paid_hours,
+      copies_requested: c.copies_requested,
+      size_mb: c.size_mb,
+      rate_locked: c.rate_locked,
+      amount_paid: c.amount_paid,
+      currency: c.currency,
+      pledge_order: c.pledge_order,
+      pledge_budget: c.pledge_budget,
+      start_ts: isoFromMs(c.start_ts),
+      expiry_ts: isoFromMs(c.expiry_ts),
+      created_ts: isoFromMs(c.created_ts)
+    }));
+    res.json({ hive_account: account, claims });
   } catch (e) {
     return handleError(res, e);
   }

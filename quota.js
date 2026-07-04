@@ -338,9 +338,11 @@ function listUploadsForAccount(account, limit = 100, offset = 0) {
   return db.prepare(`
     SELECT p.id AS pin_id, p.cid, p.size_bytes, p.created_at, p.expires_at,
            p.status, p.status_reason, p.mode, p.mime,
-           py.tx_id, py.amount, py.currency
+           py.tx_id, py.amount, py.currency,
+           c.kind AS claim_kind
     FROM pins p
     JOIN payments py ON p.payment_id = py.id
+    LEFT JOIN claims c ON c.pin_id = p.id
     WHERE p.uploader = ?
     ORDER BY p.created_at DESC
     LIMIT ? OFFSET ?
