@@ -441,8 +441,18 @@ app.post('/reserve', reserveLimiter, (req, res) => {
     // as octet-stream (unchanged). 'public' = plaintext, shareable link served
     // with the claimed MIME. Same reserve→pay→upload billing for both.
     const mode = (req.body && req.body.mode) || 'encrypted';
-    if (typeof uploader !== 'string' || !Number.isInteger(size_bytes)) {
-      return respondError(res, 'bad_request', 'uploader (string) and size_bytes (integer) required');
+    if (typeof uploader !== 'string' || !Number.isInteger(size_bytes) || size_bytes < 1) {
+      return respondError(res, 'bad_request', 'uploader (string) and size_bytes (positive integer) required');
+    }
+    // Reject over-cap files at RESERVE time — before the client is handed
+    // payment instructions. /upload re-checks the actual bytes, but by then
+    // the user has already paid; a reservation that can never be uploaded
+    // must not be quotable. (The client checks the advertised max_size_mb
+    // too, but the server is the authority.)
+    if (size_bytes > MAX_FILE_SIZE_BYTES) {
+      return respondError(res, 'payload_too_large',
+        `size_bytes (${size_bytes}) exceeds this gate's ${MAX_FILE_SIZE_MB}MB max — do not pay`,
+        { max_size_bytes: MAX_FILE_SIZE_BYTES });
     }
     if (mode !== 'encrypted' && mode !== 'public') {
       return respondError(res, 'bad_request', "mode must be 'encrypted' or 'public'");
