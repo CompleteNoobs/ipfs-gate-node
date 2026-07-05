@@ -188,6 +188,7 @@ invited fee-exempt and completed a full reserve→upload→gateway-fetch round t
 third paid-but-whitelisted account correctly still required `tx_id`; per-account `quota_bytes` cap
 rejected an over-cap reserve and accepted an under-cap one; de-whitelist blocked a new reserve.
 Recipe folded into `WalkThrough.wiki` ("Optional: Private / family hosting (whitelist mode)").
+Operator independently confirmed the feature working on 2026-07-05 after this pass.
 **One finding from this pass, not previously called out in the design doc:** the fee-exempt
 `/upload` path verifies `upload_proof_sig` against the caller-supplied `uploader_pubkey` only —
 unlike `/uploads/by-user` and the Hive-signed admin tier, it never checks that pubkey against the
