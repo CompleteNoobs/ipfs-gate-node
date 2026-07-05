@@ -15,6 +15,10 @@ data/
 *.db-wal
 *.db-shm
 
+# Claude Code session dir (contains embedded git worktrees — never commit;
+# work done in a worktree gets MERGED into main, the directory itself doesn't)
+.claude/
+
 # Editor / OS
 .DS_Store
 .vscode/
