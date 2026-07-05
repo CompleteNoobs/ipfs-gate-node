@@ -18,6 +18,7 @@ const sweeper = require('./sweeper');
 const kubo = require('./backends/kubo');
 const pricing = require('./pricing');
 const releaseAuth = require('./release-policy');
+const { parseRange } = require('./range');
 
 // ─── Config ─────────────────────────────────────────────────────────────────
 
@@ -88,6 +89,7 @@ function respondError(res, code, message, details) {
     gone: 410,
     payload_too_large: 413,
     rate_limited: 429,
+    range_not_satisfiable: 416,
     unprocessable_entity: 422,
     legal_takedown: 451,
     insufficient_storage: 507,
@@ -911,7 +913,6 @@ app.get('/ipfs/:cid', async (req, res) => {
     if (!serve) {
       return respondError(res, 'not_found', 'CID not pinned here');
     }
-    const upstream = await kubo.cat(cid);
 
     // v0.2 — content-type. Encrypted CIDs are opaque ciphertext → octet-stream.
     // Public CIDs are served with their claimed MIME so links render directly,
@@ -931,6 +932,39 @@ app.get('/ipfs/:cid', async (req, res) => {
     // for production; recommend 3600 or less during dev/testing so pin expiry
     // is visible without browser cache lying. Set GATEWAY_CACHE_MAX_AGE in .env.
     res.set('Cache-Control', `public, max-age=${GATEWAY_CACHE_MAX_AGE}`);
+
+    // Byte-range support (BYTE-RANGE-DESIGN-NOTES.md). size_bytes was recorded
+    // from the uploaded buffer, so it's byte-exact for what kubo.cat streams.
+    // Content-Length MUST equal the bytes actually sent — always computed from
+    // the CLAMPED range, never the client's raw ask.
+    res.set('Accept-Ranges', 'bytes');
+    const size = serve.size_bytes;
+    const range = parseRange(req.headers.range, size);
+    if (range && range.unsatisfiable) {
+      res.set('Content-Range', `bytes */${size}`);
+      return respondError(res, 'range_not_satisfiable', 'requested range beyond end of file');
+    }
+    if (range) {
+      // Includes the `bytes=0-` Chrome/Safari media probe — MUST answer 206,
+      // not 200, or those players give up on seeking.
+      res.status(206);
+      res.set('Content-Range', `bytes ${range.start}-${range.end}/${size}`);
+      res.set('Content-Length', String(range.end - range.start + 1));
+    } else if (Number.isFinite(size)) {
+      res.set('Content-Length', String(size));
+    }
+
+    // HEAD short-circuit: Express routes HEAD through this GET handler and
+    // Node discards the body anyway — without this, every player HEAD-probe
+    // would stream the whole file out of Kubo for nothing.
+    if (req.method === 'HEAD') {
+      return res.end();
+    }
+
+    const upstream = await kubo.cat(
+      cid,
+      range ? { offset: range.start, length: range.end - range.start + 1 } : {}
+    );
     // Stream the response
     upstream.body.pipeTo(new WritableStream({
       write(chunk) { res.write(Buffer.from(chunk)); },

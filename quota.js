@@ -361,12 +361,14 @@ function createPin({ cid, uploader, size_bytes, payment_id, ttl_days, expires_at
 
 /**
  * Rendering info for a CID served over GET /ipfs/:cid. Returns the mode + mime
- * of an active pin (most recently created wins; rows for the same CID agree in
- * practice since identical bytes → identical CID). null when no active pin.
+ * + size_bytes of an active pin (most recently created wins; rows for the same
+ * CID agree in practice since identical bytes → identical CID). size_bytes is
+ * recorded from the actual uploaded buffer, so it is byte-exact for what
+ * kubo.cat serves — the Range/Content-Length authority. null when no active pin.
  */
 function getServeInfoForCid(cid) {
   return db.prepare(`
-    SELECT mode, mime FROM pins
+    SELECT mode, mime, size_bytes FROM pins
     WHERE cid = ? AND status = 'active'
     ORDER BY created_at DESC
     LIMIT 1

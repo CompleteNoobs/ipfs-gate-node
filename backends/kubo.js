@@ -168,9 +168,15 @@ async function stats() {
 /**
  * Fetch raw bytes for a CID (used by the GET /ipfs/:cid pass-through).
  * Returns a Response object so the caller can stream it.
+ * Optional { offset, length } map onto Kubo /cat's query params (int64,
+ * well-supported) to serve HTTP Range requests. No-args behaviour is
+ * byte-identical to before — existing callers unaffected.
  */
-async function cat(cid) {
-  const res = await fetch(`${KUBO_API_URL}/api/v0/cat?arg=${encodeURIComponent(cid)}`, {
+async function cat(cid, { offset, length } = {}) {
+  let qs = `arg=${encodeURIComponent(cid)}`;
+  if (Number.isFinite(offset) && offset > 0) qs += `&offset=${offset}`;
+  if (Number.isFinite(length)) qs += `&length=${length}`;
+  const res = await fetch(`${KUBO_API_URL}/api/v0/cat?${qs}`, {
     method: 'POST',
     signal: AbortSignal.timeout(KUBO_TIMEOUT_MS)
   });

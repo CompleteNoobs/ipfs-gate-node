@@ -220,6 +220,39 @@ gap on the *paying* path (a real on-chain transfer already proves key ownership)
 security note in the wiki; a future hardening pass could require a signed request on the fee-exempt
 upload path the same way `/uploads/by-user` already does.
 
+### ✅ Byte-range / seek support on the gateway — BUILT (2026-07-05)
+
+Per [BYTE-RANGE-DESIGN-NOTES.md](BYTE-RANGE-DESIGN-NOTES.md) (locked 2026-07-05, built same day).
+`GET /ipfs/:cid` now honors HTTP `Range` requests so audio/video players can scrub/seek public
+uploads without downloading from byte 0. Kubo's `/api/v0/cat` `offset`/`length` params do the
+slicing; the pins row's `size_bytes` (byte-exact from the upload buffer) is the `Content-Range`
+total. No nginx change (Range/206 proxy through untouched); Pinata BYO untouched (already
+Range-capable); encrypted uploads unaffected by design (one opaque AES-GCM blob — must fetch all
+of it to decrypt regardless).
+
+- **`range.js`** (new) — pure `parseRange(header, size)` parser, no I/O (pricing.js pattern).
+  Only `bytes=` unit, single range spec (`a-b`, `a-`, `-suffix`); multi-range/malformed/inverted →
+  null → plain 200 full (RFC 9110 allows ignoring Range); start ≥ size or `-0` → unsatisfiable →
+  416. `test/range.test.js` (13 tests incl. the `bytes=0-` Chrome/Safari probe → MUST be 206 not
+  200, end-clamping, zero-length-file edge).
+- **`quota.js`** — `getServeInfoForCid` also returns `size_bytes` (rides along free on the
+  existing serve-authority row).
+- **`backends/kubo.js`** — `cat(cid, {offset, length})`; no-args form byte-identical to before.
+- **`server.js`** — `Accept-Ranges: bytes` + `Content-Length` on every gateway response (players
+  need these to enable seeking at all); `206` + `Content-Range` on satisfiable ranges with
+  Content-Length computed from the CLAMPED end (the money-grade invariant: promised length must
+  equal streamed bytes); `416` + `Content-Range: bytes */<size>` past-EOF
+  (`range_not_satisfiable` added to the respondError status table); HEAD short-circuits after
+  headers, before `kubo.cat` (Express routes HEAD through GET and Node discards the body — without
+  this every player HEAD-probe would stream the whole file out of Kubo). Blocklist check stays
+  FIRST; mode/MIME/nosniff/Cache-Control logic identical on 200 and 206.
+
+**94 tests green** (was 81). Local smoke against a live server + seeded pin row: 200+headers /
+206 slice / `0-` probe / suffix / end-clamp / 416 / multi-range→200 / malformed→200 all match the
+§2 behaviour contract byte-for-byte (HEAD path verified Kubo is never touched).
+**Live pass on ipfs.v4call.com (§6 of the design notes — curl ranges + real browser scrub) still
+pending next deploy.**
+
 ### ✅ Stage-1 decisions — RESOLVED (2026-06-14)
 All locked; nothing blocking Stage 1a/1b. (Full reasoning in the two design docs.)
 - **Refund-on-cancel** — pro-rata for the single active claim; dormant backstop → escrow minus `BACKSTOP_CANCEL_FEE_PCT`; expiry → none. The old pro-rata-vs-dedup tension is **dissolved** (v1 has one active claim per CID, so no over-collection; parallel co-ownership deferred to multi-node). [cohosting §6](ipfs-gate-cohosting-backstop.md).
