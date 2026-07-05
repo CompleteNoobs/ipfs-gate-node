@@ -376,6 +376,129 @@ curl -X POST -H 'Authorization: Bearer YOUR_ADMIN_KEY' -H 'Content-Type: applica
   https://ipfs.your-domain.com/admin/log-refund
 </pre>
 
+== Optional: Private / family hosting (whitelist mode) ==
+
+Everything above builds an open, pay-to-use gate. '''Whitelist mode''' flips that: only Hive accounts you explicitly invite can use the server at all, and invited accounts can be made free (no token payment) — the shape you want for a "family server." One knob, three configurations:
+
+* '''Whitelist-only, free-for-all''' — every invited account is <code>fee_exempt</code>. Nobody pays; only invited accounts can upload at all.
+* '''Admin-free + guest quotas''' — invited guests pay nothing but each gets a hard per-account storage cap via <code>quota_bytes</code>.
+* '''Paid-but-still-whitelisted''' — invited accounts still pay the normal per-MB-hour rate; whitelisting is just a second gate on top (e.g. "only people I've actually met can use my public gate").
+
+Live-tested end-to-end on <code>ipfs.v4call.com</code> on 2026-07-05 — every example below is a copy of a real, working test run against the production server, not a hypothetical.
+
+=== Turning it on ===
+
+Edit <code>.env</code>:
+
+<pre>
+WHITELIST_MODE=true
+SERVER_ADMIN_HIVE_ACCOUNTS=
+</pre>
+
+<code>SERVER_ADMIN_HIVE_ACCOUNTS</code> is optional — a comma-separated list of Hive accounts (lowercase, no <code>@</code>) that get a second, narrower admin tier authenticated by a Hive-signed request instead of your <code>ADMIN_KEY</code> (useful if you want a trusted family member to manage the guest list without handing them your box's admin password). Leave it blank if you, the box owner, will be the only admin — <code>ADMIN_KEY</code> alone already covers every <code>/admin/*</code> route including whitelist management.
+
+Recreate the container so the env change takes effect (a plain <code>restart</code> does NOT pick up <code>.env</code> changes — Common Problems #4):
+
+<pre>
+docker compose down && docker compose up -d
+</pre>
+
+Confirm it's live:
+
+<pre>
+curl -s https://ipfs.your-domain.com/ | grep whitelist_mode
+</pre>
+
+You should see <code>"whitelist_mode":true</code> inside the <code>features</code> block. '''With <code>WHITELIST_MODE=false</code> (the default), behavior is byte-for-byte identical to the open gate described earlier in this guide — this mode is entirely opt-in.'''
+
+=== Inviting an account ===
+
+Add each friend/family Hive username with <code>POST /admin/whitelist/add</code> (Bearer <code>ADMIN_KEY</code>, same auth as every other <code>/admin/*</code> route):
+
+<pre>
+curl -X POST -H 'Authorization: Bearer YOUR_ADMIN_KEY' -H 'Content-Type: application/json' \
+  -d '{"target_account":"guest33","fee_exempt":true,"note":"family"}' \
+  https://ipfs.your-domain.com/admin/whitelist/add
+</pre>
+
+Fields:
+
+* <code>target_account</code> — required, the Hive username to invite.
+* <code>fee_exempt</code> — optional, default <code>false</code>. <code>true</code> means this account uploads at $0 (the quote still shows the real numbers, just zeroed out — never a silent free ride the account can't explain).
+* <code>quota_bytes</code> — optional, default unlimited. A hard per-account storage cap, '''on top of''' (never instead of) your server's overall <code>DISK_LIMIT_GB</code>. Whichever cap is tighter wins.
+* <code>note</code> — optional, freeform (e.g. <code>"cousin's laptop"</code>).
+
+List who's currently whitelisted:
+
+<pre>
+curl -H 'Authorization: Bearer YOUR_ADMIN_KEY' https://ipfs.your-domain.com/admin/whitelist
+</pre>
+
+Remove someone (soft-delete — blocks their '''new''' reservations only; anything already pinned for them keeps running until it naturally expires, or you ban/take it down separately):
+
+<pre>
+curl -X POST -H 'Authorization: Bearer YOUR_ADMIN_KEY' -H 'Content-Type: application/json' \
+  -d '{"target_account":"guest33"}' \
+  https://ipfs.your-domain.com/admin/whitelist/remove
+</pre>
+
+=== What a non-invited stranger sees ===
+
+Anyone not on the list gets a clean rejection right at the quote stage, before any file bytes move:
+
+<pre>
+$ curl -s -X POST -H 'Content-Type: application/json' \
+    -d '{"uploader":"randomstranger999","size_bytes":1000000}' \
+    https://ipfs.your-domain.com/reserve
+{"error":"forbidden","message":"this server is invite-only — your account is not whitelisted","details":{}}
+</pre>
+
+=== What an invited, fee-exempt account sees ===
+
+The quote at <code>/reserve</code> comes back honestly labeled — <code>total: 0</code> plus <code>fee_exempt: true</code>, never a silent free upload the client can't explain:
+
+<pre>
+"quote": { ... "rate_per_mb_hour": 0, "total": 0, "currency": "TEST", "fee_exempt": true }
+</pre>
+
+The follow-up <code>POST /upload</code> succeeds with no on-chain payment step at all — no Hive Keychain popup, no <code>tx_id</code>. The landing page's upload tabs (and v4call's ipfs-gate tab) show a "Free (fee-exempt)" badge in place of a cost estimate for these accounts.
+
+=== Paid-but-still-whitelisted accounts ===
+
+Add someone with <code>fee_exempt</code> omitted (or explicitly <code>false</code>) and the whitelist becomes a pure access gate — they still pay the normal per-MB-hour rate:
+
+<pre>
+curl -X POST -H 'Authorization: Bearer YOUR_ADMIN_KEY' -H 'Content-Type: application/json' \
+  -d '{"target_account":"cnoobz","fee_exempt":false}' \
+  https://ipfs.your-domain.com/admin/whitelist/add
+</pre>
+
+<code>/reserve</code> now returns a real non-zero <code>total</code>, and <code>/upload</code> still rejects with <code>400 {"error":"bad_request","message":"tx_id required"}</code> until a genuine Hive-Engine payment is presented — confirmed live. Useful for "only people I actually know may use this gate at all, but everyone still pays."
+
+=== Per-account quota caps ===
+
+Set <code>quota_bytes</code> when inviting someone if you want a hard ceiling per guest (e.g. "cousin gets 500MB, no more"):
+
+<pre>
+curl -X POST -H 'Authorization: Bearer YOUR_ADMIN_KEY' -H 'Content-Type: application/json' \
+  -d '{"target_account":"guest33","fee_exempt":true,"quota_bytes":524288000}' \
+  https://ipfs.your-domain.com/admin/whitelist/add
+</pre>
+
+Once their pending reservations + active pins hit the cap, further reservations fail with <code>507 insufficient_storage</code> naming the exact numbers over the cap — tested live, e.g. <code>"per-account quota exceeded (0 + 2000 > 1000 bytes)"</code>.
+
+=== Security note: whitelist membership ≠ cryptographic identity proof (fee-exempt path) ===
+
+'''Read this before telling friends "this is private, only invited accounts can use it."''' Whitelist mode gates on the '''Hive account name string''' supplied to <code>/reserve</code> and <code>/upload</code>. For a normal, paying upload this is fine — actually spending real CNOOBS/HBD from an account requires that account's real private key, so the on-chain payment itself proves who's uploading. But for a '''fee-exempt''' whitelisted account there is no on-chain transaction at all, and nothing else in the current build checks that the <code>uploader_pubkey</code>/<code>upload_proof_sig</code> presented to <code>/upload</code> is an actual current key of the named Hive account (unlike <code>/uploads/by-user</code> or the Hive-signed admin tier, which both do check the presented key against the chain).
+
+'''Practical effect, confirmed by live testing (2026-07-05):''' a caller can hit <code>/upload</code> claiming to be any fee-exempt whitelisted account using a throwaway, freshly-generated keypair with no relationship to that account's real Hive keys — and the upload succeeds and pins for free. Hive account names are public information, so this isn't a secret-guessing problem: anyone who knows you've whitelisted <code>guest33</code> could upload under that name for free, and any abuse would show up attributed to your friend's account rather than the actual anonymous caller.
+
+'''What this means for a real family-server deployment:'''
+* Keep <code>DISK_LIMIT_GB</code> and per-account <code>quota_bytes</code> tight — those are your actual backstop against free-upload abuse, not the whitelist name match.
+* Don't treat a fee-exempt whitelist gate's '''existence''' as safe-to-publicize just because it's "invite-only" — treat the domain the way you'd treat any semi-public, unlisted service.
+* '''Whitelisted-but-paying''' accounts (<code>fee_exempt:false</code>) don't have this gap — spending that account's real CNOOBS still requires its real keys, verified on-chain.
+* This is a known limitation of the current build, not a regression — worth a follow-up hardening pass (e.g. requiring a signed request, the same mechanism <code>/uploads/by-user</code> already uses, on the fee-exempt <code>/upload</code> path specifically) before depending on whitelist mode as your '''only''' access control for a free-upload configuration.
+
 == Federation (deferred to v0.3+) ==
 
 ipfs-gate is currently standalone. Each operator runs their own server with their own ban list, their own pricing, their own disk allocation. v0.3+ will add optional Nostr-based discovery and opt-in cross-operator banlist sharing — same architectural pattern as v4call's Nostr federation work.
@@ -435,6 +558,10 @@ docker compose up -d</pre>If you've already lost the file: restore it from <code
 #: '''A:''' Certbot writes new files but nginx doesn't auto-reload. The cron line in Step 8 includes <code>docker compose restart nginx</code> after renew — make sure you copied that part too.
 # '''Q:''' Let's Encrypt certbot fails with "DNS problem" or "No A/AAAA record for host".
 #: '''A:''' Your domain's A record isn't pointing at this VPS, or DNS hasn't propagated yet. Verify with <code>dig ipfs.your-domain.com</code> from any machine. If it returns the wrong IP, fix at your DNS provider and wait 5-10 minutes for propagation, then retry the certbot command from Step 5.
+# '''Q:''' I set <code>WHITELIST_MODE=true</code> but reservations for '''my own''' Hive account (the operator) get rejected with <code>"this server is invite-only"</code>.
+#: '''A:''' Turning on whitelist mode does not automatically whitelist the box owner or the <code>IPFS_GATE_HIVE_ACCOUNT</code> escrow account — it's a plain per-account gate with no built-in owner exception. Invite your own personal Hive account the same way you'd invite anyone else (see [[#Optional: Private / family hosting (whitelist mode)|Whitelist mode]] above): <code>POST /admin/whitelist/add</code> with your own username.
+# '''Q:''' I flipped <code>WHITELIST_MODE=true</code> in <code>.env</code> but <code>curl https://.../</code> still shows <code>"whitelist_mode":false</code>.
+#: '''A:''' Same env-reload gotcha as everywhere else in this file (Common Problems #4) — <code>docker compose restart</code> does not re-read <code>.env</code>. Run <code>docker compose down && docker compose up -d</code> to recreate the container with the new value.
 
 == Resources ==
 

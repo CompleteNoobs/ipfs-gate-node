@@ -181,8 +181,21 @@ the whole pre-existing suite runs with it off.
 **81 tests green** (was 53 pre-whitelist). The three example configs from the original ask are all
 settings of the same table: whitelist-only-free = everyone `fee_exempt`; admin+guest-quotas =
 roster admin + entries with `quota_bytes`; paid-but-gated = entries with `fee_exempt=0`.
-Still open: live browser pass on a whitelist-enabled deployment (operator golden-path convention),
-and a WalkThrough.wiki "enable whitelist mode" recipe when it first ships to a real box.
+
+**✅ Live golden-path pass — done (2026-07-05).** Tested end-to-end on `ipfs.v4call.com` (fresh
+hard-reset data + fresh redeploy first): non-whitelisted `/reserve` rejected; `guest33`/`cnoobz`
+invited fee-exempt and completed a full reserve→upload→gateway-fetch round trip at `total:0`; a
+third paid-but-whitelisted account correctly still required `tx_id`; per-account `quota_bytes` cap
+rejected an over-cap reserve and accepted an under-cap one; de-whitelist blocked a new reserve.
+Recipe folded into `WalkThrough.wiki` ("Optional: Private / family hosting (whitelist mode)").
+**One finding from this pass, not previously called out in the design doc:** the fee-exempt
+`/upload` path verifies `upload_proof_sig` against the caller-supplied `uploader_pubkey` only —
+unlike `/uploads/by-user` and the Hive-signed admin tier, it never checks that pubkey against the
+account's real on-chain posting key. Confirmed live: a throwaway keypair with no relation to
+`guest33`'s real Hive keys can upload for free under that name once whitelisted+fee_exempt. Not a
+gap on the *paying* path (a real on-chain transfer already proves key ownership). Documented as a
+security note in the wiki; a future hardening pass could require a signed request on the fee-exempt
+upload path the same way `/uploads/by-user` already does.
 
 ### ✅ Stage-1 decisions — RESOLVED (2026-06-14)
 All locked; nothing blocking Stage 1a/1b. (Full reasoning in the two design docs.)
