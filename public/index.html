@@ -363,7 +363,12 @@ const HIVE_NODES = [
 
 // Gate defaults — refreshed from GET / (same learn-the-caps pattern as v4call
 // v0.16.21; the consts are fallbacks for when the gate hasn't answered yet).
+// gateCapKnown guards the size checks: until the gate has actually answered,
+// the 10MB fallback is a GUESS and must never be enforced or displayed as the
+// gate's cap (2026-07-05 lesson: operator raised MAX_FILE_SIZE_MB to 1000 but
+// a stale/raced page kept rejecting at "gate cap is 10 MB").
 let attachMaxBytes    = 10 * 1024 * 1024;
+let gateCapKnown      = false;
 let gateDefaultHours  = 168;
 let gateRatePerMbHour = null;
 let gateMbDivisor     = 1000000;
@@ -389,6 +394,7 @@ function saveGateway() {
   const v = (document.getElementById('gw-input').value || '').trim().replace(/\/+$/, '');
   if (!/^https?:\/\//.test(v)) { alert('Enter a full URL (https://…)'); return; }
   try { localStorage.setItem('ipfsgate:page:gateway', v); } catch (_) {}
+  gateCapKnown = false; // the old gate's cap doesn't apply to the new one
   refreshGateInfo();
 }
 
@@ -785,7 +791,7 @@ async function refreshGateInfo() {
     const j = await res.json();
     const pay = j.payment || {};
     const pr = j.pricing || {};
-    if (pay.max_size_mb) attachMaxBytes = pay.max_size_mb * 1024 * 1024;
+    if (pay.max_size_mb) { attachMaxBytes = pay.max_size_mb * 1024 * 1024; gateCapKnown = true; }
     if (pay.default_hours) gateDefaultHours = parseInt(pay.default_hours) || gateDefaultHours;
     if (pr.rate_per_mb_hour != null) gateRatePerMbHour = parseFloat(pr.rate_per_mb_hour);
     if (pr.mb_divisor) gateMbDivisor = pr.mb_divisor;
@@ -809,6 +815,15 @@ async function refreshGateInfo() {
   }
   refreshPrivEstimate();
   refreshPubEstimate();
+}
+
+// Called right before enforcing attachMaxBytes: if the gate never confirmed
+// its cap (fetch failed at load, or the user beat it to the button), ask
+// again NOW. Returns true only when attachMaxBytes is the gate's real value —
+// the callers refuse to enforce the local fallback as if the gate said it.
+async function ensureGateCap() {
+  if (!gateCapKnown) await refreshGateInfo();
+  return gateCapKnown;
 }
 
 // ── Whitelist mode UI (banner + upload gating + admin tab reveal) ────────────
@@ -1485,8 +1500,11 @@ function onPrivFilePick() {
   privSendState.file = f || null;
   const meta = document.getElementById('priv-file-meta');
   if (!f) { meta.textContent = ''; refreshPrivEstimate(); return; }
-  const overCap = f.size > attachMaxBytes ? ` ⚠ over gate cap (${(attachMaxBytes / 1024 / 1024).toFixed(0)} MB)` : '';
+  // Only warn against a CONFIRMED gate cap; if the gate hasn't answered yet,
+  // fetch it and re-render rather than flashing the 10MB fallback.
+  const overCap = gateCapKnown && f.size > attachMaxBytes ? ` ⚠ over gate cap (${(attachMaxBytes / 1024 / 1024).toFixed(0)} MB)` : '';
   meta.textContent = `${f.name} · ${bytesToHuman(f.size)} · ${detectFileMime(f) || 'application/octet-stream'}${overCap}`;
+  if (!gateCapKnown) refreshGateInfo().then(() => { if (gateCapKnown) onPrivFilePick(); });
   refreshPrivEstimate();
 }
 function privAddRecipient() {
@@ -1534,7 +1552,8 @@ async function confirmPrivateSend() {
   if (!privSendState.file) { setPrivStatus('⚠ Pick a file first.', true); return; }
   if (!myPrivKeyStr) { setPrivStatus('⚠ Unlock encryption first (🔑 bar at the top) — recipient key wrapping needs your posting key.', true); return; }
   const file = privSendState.file;
-  if (file.size > attachMaxBytes) { setPrivStatus(`⚠ ${(file.size / 1024 / 1024).toFixed(2)} MB — exceeds gate cap (${(attachMaxBytes / 1024 / 1024).toFixed(0)} MB).`, true); return; }
+  if (!(await ensureGateCap())) { setPrivStatus(`⚠ Can't read this gate's upload limit — ${getGateway()} isn't answering. Check the Gateway URL at the top, then retry.`, true); return; }
+  if (file.size > attachMaxBytes) { setPrivStatus(`⚠ ${(file.size / 1024 / 1024).toFixed(2)} MB — exceeds this gate's cap (${(attachMaxBytes / 1024 / 1024).toFixed(0)} MB).`, true); return; }
   const hours = Math.max(1, parseInt(document.getElementById('priv-hours').value) || gateDefaultHours);
   const copies = Math.max(1, Math.min(gateCopiesMax, parseInt(document.getElementById('priv-copies').value) || 1));
   const policyType = (document.querySelector('input[name=priv-policy]:checked') || {}).value || 'owner_only';
@@ -1733,8 +1752,9 @@ function onPubFilePick() {
   hostedCid = null;
   if (!f) { meta.textContent = ''; refreshPubEstimate(); return; }
   const mime = detectFileMime(f) || 'application/octet-stream';
-  const warn = f.size > attachMaxBytes ? ` ⚠ over gate cap (${(attachMaxBytes / 1024 / 1024).toFixed(0)} MB)` : '';
+  const warn = gateCapKnown && f.size > attachMaxBytes ? ` ⚠ over gate cap (${(attachMaxBytes / 1024 / 1024).toFixed(0)} MB)` : '';
   meta.textContent = `${f.name} · ${bytesToHuman(f.size)} · ${mime}${warn}`;
+  if (!gateCapKnown) refreshGateInfo().then(() => { if (gateCapKnown) onPubFilePick(); });
   refreshPubEstimate();
 }
 function refreshPubEstimate() {
@@ -1771,7 +1791,8 @@ function showPubResult(url) {
 async function confirmPublicUpload(skipHostedCheck) {
   const file = (document.getElementById('pub-file-input').files || [])[0];
   if (!file) { setPubStatus('Pick a file first.', true); return; }
-  if (file.size > attachMaxBytes) { setPubStatus(`File too big — gate cap is ${(attachMaxBytes / 1024 / 1024).toFixed(0)} MB.`, true); return; }
+  if (!(await ensureGateCap())) { setPubStatus(`⚠ Can't read this gate's upload limit — ${getGateway()} isn't answering. Check the Gateway URL at the top, then retry.`, true); return; }
+  if (file.size > attachMaxBytes) { setPubStatus(`File too big — this gate caps uploads at ${(attachMaxBytes / 1024 / 1024).toFixed(0)} MB.`, true); return; }
   const btn = document.getElementById('pub-upload-btn');
   btn.disabled = true;
   try {
