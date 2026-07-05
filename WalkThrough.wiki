@@ -257,6 +257,15 @@ Runs every Monday at 03:00 UTC. Certbot only actually renews when within 30 days
 
 == Updating to a new version ==
 
+'''Recommended: <code>scripts/ipfs-update.sh</code>.''' Does steps 1–6 below for you, plus safety this manual recipe doesn't have: it validates the restored nginx config against the live container mounts ''before'' touching any running container, refuses to run if unexpected local changes exist outside <code>nginx/ipfs-gate.conf</code>, locks against a second overlapping invocation, and no-ops cleanly if already up to date. Install once, then re-run any time:
+<pre>
+cp /opt/IPFS-Gate/scripts/ipfs-update.sh /usr/local/bin/ipfs-update.sh
+chmod +x /usr/local/bin/ipfs-update.sh
+/usr/local/bin/ipfs-update.sh
+</pre>
+Written after the incident below (Common Problems #422) where a bare hard reset took the site down.
+
+Manual recipe (what the script automates):
 <pre>
 IPFS_GATE_DIR=/opt/IPFS-Gate
 cd "$IPFS_GATE_DIR"
