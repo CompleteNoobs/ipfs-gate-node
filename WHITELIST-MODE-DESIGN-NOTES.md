@@ -4,14 +4,20 @@
 > v4call and nGate) is a concept design build by independent builders. Not
 > production software, not safe to use, not recommended for general users.
 >
-> **Status: DESIGN LOCKED (2026-07-04).** Written per plan
-> `need-help-my-brain-humming-stroustrup.md`. Every open decision below was
-> resolved with a concrete default chosen for reversibility and least surprise
-> (mirroring how PRICING-V1 and the cohosting/backstop docs were locked before
-> their builds started) — not litigated line-by-line with the operator first.
-> If any call below turns out wrong once building starts, it's cheap to flip
-> (nothing here is irreversible in the schema), but treat this as the plan of
-> record rather than reopening each point from scratch.
+> **Status: DESIGN LOCKED (2026-07-04) → BUILT Stages A–D the same day →
+> LIVE-TESTED end-to-end on `ipfs.v4call.com` (2026-07-05, operator-confirmed).**
+> Written per plan `need-help-my-brain-humming-stroustrup.md`. Every open
+> decision below was resolved with a concrete default chosen for reversibility
+> and least surprise (mirroring how PRICING-V1 and the cohosting/backstop docs
+> were locked before their builds started). Two post-lock findings:
+> the §4 extend amendment (marked inline), and a ⚠ **known security gap from
+> the live pass** — the fee-exempt `/upload` path doesn't verify
+> `uploader_pubkey` against the account's real on-chain posting key, so a
+> free-tier whitelisted account's name can be uploaded-under with a throwaway
+> keypair (paying path unaffected — payment is auth). Not yet hardened; see
+> roadmap_status.md "Live golden-path pass" for detail. Build record:
+> roadmap_status.md "Whitelist / gated-server mode"; operator recipe:
+> `WalkThrough.wiki` "Optional: Private / family hosting (whitelist mode)".
 >
 > **Reads with:** `PRICING-V1-DESIGN-NOTES.md` (the fee formula this reuses at
 > `rate: 0`), `ipfs-gate-cohosting-backstop.md` (the claim/refund model this
@@ -352,5 +358,7 @@ exactly one genuinely new primitive (delete-one-pin-as-admin).**
 
 *Written 2026-07-04. Source: plan `need-help-my-brain-humming-stroustrup.md`
 (design-agent research pass over `server.js`, `quota.js`, `moderation.js`,
-`pricing.js`, all 6 existing migrations). No code written yet — build starts
-at Stage A.*
+`pricing.js`, all 6 existing migrations). Built Stages A–D the same day
+(migration 007, 28 new tests → suite 81 green); live-tested end-to-end on
+`ipfs.v4call.com` 2026-07-05 — see the status header for the two post-lock
+findings.*

@@ -1,16 +1,11 @@
 # ipfs-gate
 
-> ## 🔀 ARCHIVED — ipfs-gate is being decoupled (2026-06-16)
->
-> This monolith repo (final version **v0.1.3**, v1 Stages 0–6 complete, 43 tests green) is **archived**. Active
-> work has moved to:
->
-> - **[ipfs-gate-node](https://github.com/CompleteNoobs/ipfs-gate-node)** — headless gateway / pinning / claims server (no money key)
-> - **[escrow-core](https://github.com/CompleteNoobs/escrow-core)** — shared custodial-escrow engine; the escrow
->   logic proven here (`pricing.js` / `hive-verify.js` / `quota.js` / `release-policy.js`) is its source.
->
-> Part of the wider v4call + ipfs-gate decoupling — see `handover-decoupling.md` in the `~/CAI` project root.
-> This repo stays for reference/history. **Do not build new features here.**
+> ℹ️ **This monolith repo is ACTIVE again.** A decoupling into
+> [ipfs-gate-node](https://github.com/CompleteNoobs/ipfs-gate-node) +
+> [escrow-core](https://github.com/CompleteNoobs/escrow-core) was started 2026-06-16 and then
+> **deferred** — feature work resumed here (Guardian feature, whitelist/family-server mode,
+> extend/top-up, the standalone web interface all landed in this repo, July 2026). The split
+> repos remain as the eventual direction; until that resumes, **this is the source of truth.**
 
 ---
 
@@ -46,9 +41,11 @@ For v0.1, the integrating client is [v4call](https://github.com/CompleteNoobs/v4
 
 ## Status
 
-- **v0.1.3 — in production** at `https://ipfs.completenoobs.com/` (concept build; see the proof-of-concept warning above). First end-to-end paid encrypted upload landed 2026-05-25.
+- **In production** at `https://ipfs.v4call.com/` (concept build; see the proof-of-concept warning above), with its own standalone web interface at `/`. First end-to-end paid encrypted upload landed 2026-05-25.
+- **"Private Encrypted Hosting v1" — shipped** (2026-06-16): claim/order model, claim-based MB-hour pricing, release authority, proof-of-receipt, extend/top-up. See [roadmap_status.md](roadmap_status.md).
+- **Guardian feature — shipped** (gate 2026-07-02, client UI 07-03→05): multi-participant hosting of one CID — guard an already-hosted file (dormant FIFO safety-net, full refund on dormant cancel) or host your own independent copy without re-uploading; pledge tracking, cancel, and extend in both frontends.
+- **Whitelist / family-server mode — shipped + live-tested** (2026-07-04/05): opt-in invite-only gate with per-account quotas, fee-exempt entries, and a second Hive-account admin tier. Operator recipe in [WalkThrough.wiki](WalkThrough.wiki).
 - **First-client (v4call) integration — complete and extended**: multi-format attachments, DM attachments, public/plaintext upload-and-share, an uploads-management tab, and a Pinata bring-your-own storage backend (all client-side in v4call).
-- **Current build direction — "Private Encrypted Hosting v1"**: a claim/order model with a backstop safety-net, claim-based pricing, release authority, and proof-of-receipt. See [roadmap_status.md](roadmap_status.md) "Current direction" + the design docs below.
 
 ## Use cases (current and prospective)
 
@@ -75,7 +72,7 @@ MIT — see [LICENSE](LICENSE).
 
 ## Project context
 
-- **Repository**: https://github.com/CompleteNoobs/ipfs-gate (will be created)
+- **Repository**: https://github.com/CompleteNoobs/IPFS-Gate
 - **Author**: CompleteNoobs ([completenoobs.com](https://completenoobs.com))
 - **Sister project**: [v4call](https://github.com/CompleteNoobs/v4call) — decentralised paid video/voice/text platform on Hive (first ipfs-gate client)
 - **Related project**: nGate (Nostr identity-gated relay; same architectural philosophy)

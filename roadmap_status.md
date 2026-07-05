@@ -2,7 +2,7 @@
 
 > ⚠️ **Proof of concept — not for real use.** ipfs-gate (with sister projects [v4call](https://github.com/CompleteNoobs/v4call) and [nGate](https://github.com/CompleteNoobs/nGate)) is a **concept design build by independent builders** — not production software. Not safe to use, not recommended for general users; for developers reviewing the code who accept the risks. Treat it as a demo.
 
-> Updated 2026-07-02. Source of truth: this file + [CLAUDE.md](CLAUDE.md).
+> Updated 2026-07-05. Source of truth: this file + [CLAUDE.md](CLAUDE.md).
 > Full design history + reasoning lives in the brainstorm scratchpad at
 > `/home/noob/.claude/plans/question-i-have-you-groovy-hickey.md`.
 >
@@ -11,12 +11,12 @@
 > - [ipfs-gate-cohosting-backstop.md](ipfs-gate-cohosting-backstop.md) — **current** co-hosting / backstop / refund / moderation model (the lifecycle that pricing sits on). DESIGN LOCKED.
 > - [IPFS-Gate-Scale-Plan.md](IPFS-Gate-Scale-Plan.md) — how the gate scales (Kubernetes is the chosen path for the concept build).
 > - `v4call-ipfs-gate-build-handover.md` — the Private Encrypted Hosting v1 → v2 build handover (source for the current direction below).
-> - [WHITELIST-MODE-DESIGN-NOTES.md](WHITELIST-MODE-DESIGN-NOTES.md) — gated/family-server mode (per-account whitelist, quota, fee exemption, Hive-account admin tier). **DESIGN LOCKED 2026-07-04, not yet built** — Stage A (schema + enforcement) is next.
+> - [WHITELIST-MODE-DESIGN-NOTES.md](WHITELIST-MODE-DESIGN-NOTES.md) — gated/family-server mode (per-account whitelist, quota, fee exemption, Hive-account admin tier). **DESIGN LOCKED 2026-07-04; BUILT Stages A–D the same day; LIVE-TESTED end-to-end 2026-07-05** — build record + live-pass findings below, operator recipe in `WalkThrough.wiki`.
 > - [Archive.PRICING-V0.3-DESIGN-NOTES.md](Archive.PRICING-V0.3-DESIGN-NOTES.md) — ⚠️ **ARCHIVED / superseded** (two-part tariff + prepaid balance + token discount; never built). Kept for history only — **do not build from it**; ideas partly carried forward as optional later layers (see PRICING-V1 §11).
 
 ## Current status
 
-**v0.1.3 in production + first-client (v4call) integration complete and extended well past the original scope. Private Encrypted Hosting v1 (Stages 0–6) is now BUILT** — claim/order/pricing/backstop/replication/release authority (gate) + encrypted multi-recipient upload, Reveal tab, and proof-of-receipt (v4call), the whole arc end-to-end on the one-gate model. Live at `https://ipfs.completenoobs.com/`. First end-to-end paid encrypted upload landed 2026-05-25. Since then the v4call client grew multi-format attachments, DM attachments, public/plaintext upload-and-share, an uploads-management tab, and a Pinata bring-your-own storage backend (all on the v4call side — see "v4call integration — COMPLETE" below). **Next direction after v1: v2 federation** (cross-operator settlement/verification/repair — designed, not built; see "v2 — Federation" below). Sub-revisions:
+**v0.1.3 in production + first-client (v4call) integration complete and extended well past the original scope. Private Encrypted Hosting v1 (Stages 0–6) is now BUILT** — claim/order/pricing/backstop/replication/release authority (gate) + encrypted multi-recipient upload, Reveal tab, and proof-of-receipt (v4call), the whole arc end-to-end on the one-gate model. Live at `https://ipfs.v4call.com/` (the original `ipfs.completenoobs.com` box was retired in the 2026-07-01 infra reset). First end-to-end paid encrypted upload landed 2026-05-25. Since then: the Guardian feature + its client UI in BOTH frontends, whitelist/family-server mode (built + live-tested), extend/top-up UI, and a standalone gate web page at `/` — see the build records below. Since then the v4call client grew multi-format attachments, DM attachments, public/plaintext upload-and-share, an uploads-management tab, and a Pinata bring-your-own storage backend (all on the v4call side — see "v4call integration — COMPLETE" below). **Next direction after v1: v2 federation** (cross-operator settlement/verification/repair — designed, not built; see "v2 — Federation" below). Sub-revisions:
 
 | Version | Date | What |
 |---|---|---|
@@ -116,7 +116,8 @@ Stages 4–6 are v4call-side, each adding one small gate endpoint.
 
 Multi-participant hosting of the same CID, per the Guardian dev-handover spec (v1, single gate).
 The Stage-1b "backstop" **is** the Guardian by its final name — the build renamed it and added the
-missing spec pieces. Gate-side complete, **53 tests green** (was 43); client UI (v4call) not built yet.
+missing spec pieces. Gate-side complete, **53 tests green at build time** (suite now 81 after
+whitelist mode); **client UI since BUILT in both frontends** — see "Client parity" below.
 
 - **Three roles locked** (spec §2): internal `kind` values `original | own_copy | guardian`
   (migration `006_guardian.sql` rebuilds the claims CHECK; existing `backstop` rows rename in place).
@@ -140,8 +141,29 @@ missing spec pieces. Gate-side complete, **53 tests green** (was 43); client UI 
   (`reconcileCidAfterEnd` — a guardian guards the *file*, never fires while any live host remains,
   incl. an own copy), extend/top-up at `rate_locked` delaying activation, moderation × escrow
   (innocent guardians full refund).
-- **Still open (spec §10, product not code):** final UI microcopy for the "already hosted" notice +
-  guardian pledge flow — lands with the v4call client integration, which is the next step here.
+- ~~**Still open (spec §10):** final UI microcopy~~ — ✅ resolved with the client builds below.
+
+### ✅ Guardian client UI + extend/top-up UI + client parity — BUILT (2026-07-03 → 05)
+
+The product surface over the Guardian/claim backends, landed in BOTH frontends (the gate's
+standalone `public/index.html` and v4call-app's `desktop-app.html`; mobile-app.html deliberately
+untouched per convention):
+
+- **Pledge flow** (2026-07-03): public upload runs `POST /check` first; if the CID is already
+  hosted, a panel offers 🛡 Become a Guardian / 📄 Host my own copy / ⬆ Upload anyway.
+- **Guardian tracking** (2026-07-04, gate `65feb91`): `/uploads/by-user` now returns real claim
+  `kind` (was hardcoded null — missing claims JOIN) + a per-file `guardians` summary (queue depth,
+  pledged hours, co-hosts) + `claim_id`; rows badge kind and show a 🛡 summary line. New signed
+  `GET /claims/mine` backs a **"My Guardian Pledges"** list — dormant pledges hold no pin row and
+  were previously invisible — with dormant-cancel (full refund via the existing `/claims/cancel`).
+- **Public-upload fee parity** (2026-07-04): hours/copies dial + live pre-pay estimate at the
+  gate's real rate (was hardcoded default-hours/1-copy with no preview).
+- **⏳ Extend/top-up UI** (2026-07-05, gate `14db6d1`): every active upload row (and an ACTIVATED
+  guardian claim) gets quote-at-locked-rate → pay → new expiry; $0 quote (fee-exempt claim) skips
+  Keychain, matching the gate's synthetic-payment path.
+- **v4call desktop port** (2026-07-05, v4call-app `33ab44a`): all of the above + fee-exempt
+  Keychain-skip in all five pay flows (room/DM attach, private send, public upload, pledge, own
+  copy) + whitelist identity surfacing; default gate flipped to `ipfs.v4call.com` (`1ad42fe`).
 
 ### ✅ Whitelist / gated-server mode — BUILT (2026-07-04)
 

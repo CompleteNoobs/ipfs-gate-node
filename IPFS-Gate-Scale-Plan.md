@@ -23,7 +23,7 @@ The original chat advice was directionally right but needed updating:
 
 ## 1. Starting point
 
-- v0.1.3 live at `ipfs.completenoobs.com`: one VPS, one Kubo node, 5GB disk, **private DHT**, SQLite ledger, sweeper, nginx, Docker
+- v0.1.3+ live at `ipfs.v4call.com` (originally `ipfs.completenoobs.com`, retired in the 2026-07-01 infra reset): one VPS, one Kubo node, 5GB disk, **private DHT**, SQLite ledger, sweeper, nginx, Docker
 - Plug-in backend interface in `backends/` — the **4-function contract** is the scaling seam
 - Roadmap v0.5+ already names the endgame: Pinata adapter, Filecoin tier, multi-host replication, Cluster integration
 

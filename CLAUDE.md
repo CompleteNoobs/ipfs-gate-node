@@ -2,7 +2,7 @@
 
 > ⚠️ **Proof of concept — not for real use.** ipfs-gate (with sister projects v4call and nGate) is a **concept design build by independent builders** — not production software, not safe to use, not recommended for general users; for developers reviewing the code who accept the risks. Treat it as a demo.
 
-> **Status (2026-07-05): v0.1.3 in production; v1 (Stages 0–6) COMPLETE; Guardian feature BUILT (gate + standalone-page UI incl. tracking/cancel); Whitelist/gated-server mode BUILT (Stages A–D, 81 tests) AND live-tested end-to-end on ipfs.v4call.com (fresh data reset, guest33 + cnoobz invited, fee-exempt + paid-but-whitelisted + quota-cap + de-whitelist all confirmed working; operator-confirmed 2026-07-05) — recipe in `WalkThrough.wiki` ("Optional: Private / family hosting (whitelist mode)"), build record in roadmap_status.md "Whitelist / gated-server mode". One caveat found during the live pass: the fee-exempt `/upload` path doesn't bind `uploader_pubkey` to the account's real on-chain key (unlike `/uploads/by-user`), so a free-tier whitelisted account's name can be uploaded-under by anyone with a throwaway keypair — not a gap on the paying path. See roadmap_status.md for detail; not yet hardened.** First-client (v4call) integration complete and extended (multi-format, DM, public uploads, uploads tab, Pinata BYO — all client-side in v4call). "Private Encrypted Hosting v1" — claim/order model, claim-based pricing, release authority, proof-of-receipt — shipped 2026-06-16. The **Guardian feature** (multi-participant hosting of the same CID: `original | own_copy | guardian` claim kinds, already-hosted detection via `POST /check`, own-copy claims without re-upload, FIFO guardian queue with `pledge_order`/`pledge_budget`, full dormant-cancel refund) landed 2026-07-02 per the Guardian dev-handover spec — the Stage-1b "backstop" was renamed to guardian (migration 006; `/backstop/*` routes remain as legacy aliases). See `roadmap_status.md` "Guardian feature" for the build record. Client UI for it is NOT built yet.
+> **Status (2026-07-05): v0.1.3 in production; v1 (Stages 0–6) COMPLETE; Guardian feature BUILT (gate + standalone-page UI incl. tracking/cancel); Whitelist/gated-server mode BUILT (Stages A–D, 81 tests) AND live-tested end-to-end on ipfs.v4call.com (fresh data reset, guest33 + cnoobz invited, fee-exempt + paid-but-whitelisted + quota-cap + de-whitelist all confirmed working; operator-confirmed 2026-07-05) — recipe in `WalkThrough.wiki` ("Optional: Private / family hosting (whitelist mode)"), build record in roadmap_status.md "Whitelist / gated-server mode". One caveat found during the live pass: the fee-exempt `/upload` path doesn't bind `uploader_pubkey` to the account's real on-chain key (unlike `/uploads/by-user`), so a free-tier whitelisted account's name can be uploaded-under by anyone with a throwaway keypair — not a gap on the paying path. See roadmap_status.md for detail; not yet hardened.** First-client (v4call) integration complete and extended (multi-format, DM, public uploads, uploads tab, Pinata BYO — all client-side in v4call). "Private Encrypted Hosting v1" — claim/order model, claim-based pricing, release authority, proof-of-receipt — shipped 2026-06-16. The **Guardian feature** (multi-participant hosting of the same CID: `original | own_copy | guardian` claim kinds, already-hosted detection via `POST /check`, own-copy claims without re-upload, FIFO guardian queue with `pledge_order`/`pledge_budget`, full dormant-cancel refund) landed 2026-07-02 per the Guardian dev-handover spec — the Stage-1b "backstop" was renamed to guardian (migration 006; `/backstop/*` routes remain as legacy aliases). See `roadmap_status.md` "Guardian feature" for the build record. **Guardian client UI is BUILT in both frontends** (2026-07-03/05): the gate's standalone page (`public/index.html`) has the pledge flow, kind badges + per-file guardian summaries, a "My Guardian Pledges" list (`GET /claims/mine`) with dormant-cancel, and an ⏳ Extend/top-up flow on every active claim; all of it is ported to v4call's `desktop-app.html` (v4call-app repo), including fee-exempt Keychain-skip in every pay flow.
 
 > **📐 Current-direction design docs (READ THESE — they are the live path; the older per-upload/pricing thinking is superseded):**
 > - `PRICING-V1-DESIGN-NOTES.md` — claim-based MB-hour pricing (DESIGN LOCKED).
@@ -31,7 +31,7 @@ A standalone, Hive-payment-gated IPFS pinning service. Same architectural philos
   - **v0.1.2** — Removed the redundant `payload.from` check in `hive-verify.js` that always failed (Hive-Engine's `tokens/transfer` contractPayload has no `from` field — the sender is in the wrapping custom_json's `required_auths`, which `extractTokenTransferOp` already validates). Added `PUBLIC_GATEWAY_BASE` to `.env.example` (was undocumented; defaulted to `https://ipfs.localhost`). Added `ttl_days` to the `/reserve` response so clients can render the actual cost dynamically.
   - **v0.1.3** — Hard sidechain confirmation. The previous balance-check after `/upload` payment was useless for catching under-balanced senders: escrow's existing balance already exceeded the per-payment amount, so the check passed even when 0 actually landed. Replaced with `verifyHiveEngineSidechain(txId)` that polls `api.hive-engine.com/rpc/blockchain getTransactionInfo` for authoritative success/fail, then HARD-rejects the upload (cancels reservation, no pin) if sidechain rejected. Surfaces the actual sidechain error to the client. Closes the "file pinned for free when under-paid" bypass.
 - **Federation protocol**: N/A (federation deferred to v0.3+)
-- **Production state**: live at `https://ipfs.completenoobs.com/`. First end-to-end paid encrypted upload landed on 2026-05-25 (cnoobz → testin + guest33). All v0.1 surface area exercised against real Hive accounts on real Hive-Engine: payment-required, under-payment rejection, encrypted upload, gateway fetch, expiry, persistence, bystander privacy.
+- **Production state**: live at `https://ipfs.v4call.com/` (the original `ipfs.completenoobs.com` deployment was retired in the 2026-07-01 infra reset — that server and its keys are DEAD). First end-to-end paid encrypted upload landed 2026-05-25 (cnoobz → testin + guest33) on the old box; whitelist mode live-tested end-to-end on the new one 2026-07-05. All v0.1 surface area exercised against real Hive accounts on real Hive-Engine: payment-required, under-payment rejection, encrypted upload, gateway fetch, expiry, persistence, bystander privacy.
 
 ## What v0.1 ships
 
@@ -55,29 +55,35 @@ v4call never touches the file bytes. ipfs-gate never sees plaintext.
 - **Deployment**: Docker (node:20-alpine), Nginx reverse proxy, Let's Encrypt SSL
 - **Database**: single SQLite file at `/app/data/ipfs-gate.db` (WAL mode), mounted as `./data/ipfs-gate:/app/data`
 
-## File Map (planned)
+## File Map
 
 ```
 ipfs-gate/
-├── server.js              — HTTP routing (Express). Public + admin endpoints.
+├── server.js              — HTTP routing (Express). Public + signed-user + admin endpoints.
 ├── hive-verify.js         — Hive payment + signature verification. (Copy patterns from v4call/server.js)
-├── quota.js               — SQLite quota DB + reservation tokens. better-sqlite3 module.
-├── moderation.js          — Ban list, takedown-by-CID, audit log writes.
-├── sweeper.js             — Cron: expire reservations + pins, unpin from Kubo + GC.
+├── quota.js               — SQLite DB layer: reservations, pins, orders/claims, whitelist, migrations runner.
+├── pricing.js             — Claim-based MB-hour pricing engine (pure functions; PRICING-V1).
+├── moderation.js          — Ban / takedown / whitelist CRUD, audit log writes (admin_id-attributed).
+├── release-policy.js      — Release authority (owner_only / any_of / all_of) evaluation.
+├── sweeper.js             — Cron: expire reservations + pins/claims, guardian promotion, unpin + GC.
 ├── envelope.js            — Wire-format helpers (envelope sig verify, etc.)
+├── public/
+│   └── index.html         — Standalone web interface (uploads, private send, guardian, extend, admin tab)
 ├── backends/
 │   ├── interface.md       — Backend contract: pin / unpin / exists / stats
 │   ├── kubo.js            — v0.1 backend; talks to local Kubo HTTP API
 │   ├── pinata.js          — v0.5+ adapter (NOT BUILT)
 │   └── filecoin.js        — v0.5+ adapter (NOT BUILT)
-├── migrations/
-│   └── 001_initial.sql    — Initial schema (7 tables + indexes + pragmas)
+├── migrations/            — 001_initial … 007_whitelist (version-aware runner, applied once each)
+├── scripts/
+│   └── ipfs-update.sh     — Operator helper: safe git pull + rebuild
+├── test/                  — node:test suite (81 tests): claims, guardian, whitelist, fees, admin tier…
 ├── admin-cli/
 │   └── ipfs-gate-admin.sh — Thin curl wrapper for /admin endpoints (optional)
 ├── Dockerfile             — node:20-alpine, runs as user node (UID 1000)
 ├── docker-compose.yml     — kubo + ipfs-gate + nginx + certbot
 ├── nginx/ipfs-gate.conf   — HTTPS + CORS + reverse proxy to ipfs-gate:3001
-├── .env.example           — All config; never commit real .env
+├── .env.example           — All config (authoritative reference); never commit real .env
 ├── package.json
 ├── README.md
 ├── roadmap_status.md
@@ -201,10 +207,20 @@ Full schema with DDL + indexes + hot-path queries: see plan file at `/home/noob/
 - `GET /ipfs/:cid` — IPFS gateway pass-through
 - `GET /claims/own-copy/quote`, `POST /claims/own-copy` — pay for an independent copy of an already-hosted CID (memo `ipfs-gate:owncopy:<cid>`, no re-upload)
 - `GET /guardian/quote`, `POST /guardian/pledge`, `GET /guardian/queue` — the dormant FIFO safety-net (memo `ipfs-gate:guardian:<cid>`); `/backstop/*` = legacy aliases (old memo)
+- `GET /claims/extend/quote`, `POST /claims/extend` — top up an active claim's hours at its LOCKED rate (memo `ipfs-gate:extend:<claim_id>`)
+- Quote endpoints take an optional `?hive_account=` so a fee-exempt (whitelisted) account previews $0 before paying; `/reserve` surfaces `quote.fee_exempt` the same way
 
-### Admin (Bearer ADMIN_KEY)
-- `POST /admin/ban`, `POST /admin/unban`
-- `POST /admin/takedown`, `POST /admin/untakedown`
+### Signed user endpoints (Hive posting-key auth — `verifySignedUserRequest`)
+- `GET /uploads/by-user` — the caller's pins (+ per-file `guardians` summary, `claim_id`, `kind`) + quota snapshot + whitelist identity (`whitelisted`/`fee_exempt`/`is_admin`)
+- `POST /uploads/delete` — unpin the caller's OWN pin(s) for a CID (claim-aware: cancels with pro-rata refund)
+- `GET /claims/mine` — every claim the caller owns, any kind/state (backs the "My Guardian Pledges" UI)
+- `POST /claims/cancel`, `POST /claims/release`, `POST /claims/receipt`
+
+### Admin (Bearer ADMIN_KEY; * = ALSO reachable by a Hive-signed roster admin per WHITELIST-MODE-DESIGN-NOTES.md §5)
+- `POST /admin/ban`*, `POST /admin/unban`*
+- `POST /admin/takedown`*, `POST /admin/untakedown`*
+- `POST /admin/whitelist/add`*, `POST /admin/whitelist/remove`*, `GET /admin/whitelist`* — whitelist CRUD (quota_bytes + fee_exempt per entry)
+- `POST /admin/pins/delete`* — end ONE account's claim on ONE CID (no account ban, no CID-wide takedown)
 - `GET /admin/uploads?account=X`, `GET /admin/bans`, `GET /admin/takedowns`
 - `POST /admin/takedowns/import`
 - `GET /admin/moderation/log`, `GET /admin/stats`, `GET /admin/orphan-payments`
@@ -287,7 +303,15 @@ HIVE_API=                    — blank = use fallback list
 PAYMENT_VERIFY_RETRIES=5
 PAYMENT_VERIFY_DELAY_MS=3000
 SIDECHAIN_CONFIRM_DELAY_MS=5000
+
+# Whitelist / gated-server mode (opt-in; see WHITELIST-MODE-DESIGN-NOTES.md)
+WHITELIST_MODE=false         — true = only whitelisted Hive accounts can use the gate
+SERVER_ADMIN_HIVE_ACCOUNTS=  — comma-separated Hive accounts with the narrow signed-request admin tier
 ```
+
+> ⚠ The pricing block above is the *v0.1 flat-fee* surface; the live v1 claim-model knobs
+> (`PRICE_RATE_PER_MB_HOUR`, `NODE_COUNT`, `GUARDIAN_CANCEL_FEE_PCT`, …) are documented in
+> `.env.example`, which is the authoritative config reference.
 
 ## Known Gotchas
 
