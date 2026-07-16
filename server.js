@@ -36,6 +36,12 @@ const IPFS_GATE_HIVE_ACCOUNT = (process.env.IPFS_GATE_HIVE_ACCOUNT || '').toLowe
 // hours_requested — the authoritative timer is the claim's expiry_ts.
 const DEFAULT_TTL_DAYS = parseFloat(process.env.DEFAULT_TTL_DAYS || '7');
 const DEFAULT_HOURS = Math.max(pricing.MIN_HOURS, Math.round(DEFAULT_TTL_DAYS * 24));
+// HOSTING_MODE=permanent → every new claim hosts until the owner/admin unpins
+// (no timer). Intended for private/whitelist gates ("store as long as they
+// like"). Default 'timed' = the normal MB-hour claim model, zero behavior
+// change. Permanent claims still bill a one-time size×rate×copies fee (hours
+// pinned to MIN_HOURS), which is 0 for fee-exempt accounts.
+const HOSTING_PERMANENT = String(process.env.HOSTING_MODE || 'timed').toLowerCase() === 'permanent';
 const MAX_FILE_SIZE_MB = parseInt(process.env.MAX_FILE_SIZE_MB || '10', 10);
 const MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024;
 const RATE_LIMIT_RESERVE = parseInt(process.env.RATE_LIMIT_RESERVE_PER_MIN || '30', 10);
@@ -121,7 +127,10 @@ function requireAdmin(req, res, next) {
 }
 
 function isoFromMs(ms) {
-  return ms ? new Date(ms).toISOString() : null;
+  // Permanent claims carry a far-future sentinel expiry — surface it to clients
+  // as null ("no expiry / host until unpinned"), not a year-9999 timestamp.
+  if (!ms || pricing.isPermanent(ms)) return null;
+  return new Date(ms).toISOString();
 }
 
 /**
@@ -399,7 +408,11 @@ app.get('/', (req, res) => {
       currency: PAYMENT_CURRENCY,
       max_size_mb: MAX_FILE_SIZE_MB,
       default_hours: DEFAULT_HOURS,
-      ttl_days: DEFAULT_TTL_DAYS
+      ttl_days: DEFAULT_TTL_DAYS,
+      // 'permanent' → uploads host until the owner/admin unpins (no timer);
+      // 'timed' (default) → the MB-hour claim model. Clients hide the duration
+      // picker and render "permanent" when this is 'permanent'.
+      hosting_mode: HOSTING_PERMANENT ? 'permanent' : 'timed'
     },
     pricing: {
       rate_per_mb_hour: pricing.RATE_PER_MB_HOUR,
@@ -474,10 +487,16 @@ app.post('/reserve', reserveLimiter, (req, res) => {
     // $0 is never silent (same philosophy as copies_capped).
     const feeExempt = !!feeExemptEntryFor(uploader.toLowerCase());
 
+    // Permanent-hosting gate: the claim never expires, so hours are meaningless
+    // as a duration. Price it as a one-time fee (hours pinned to MIN_HOURS =
+    // size×rate×copies), which is 0 for fee-exempt accounts. The client's
+    // hours_requested is ignored in this mode.
+    const pricingHours = HOSTING_PERMANENT ? pricing.MIN_HOURS : hoursRequested;
+
     let quote;
     try {
       quote = pricing.calculateCost({
-        sizeBytes: size_bytes, hoursRequested, copies: copiesRequested,
+        sizeBytes: size_bytes, hoursRequested: pricingHours, copies: copiesRequested,
         ...(feeExempt ? { rate: 0 } : {})
       });
     } catch (e) {
@@ -513,7 +532,10 @@ app.post('/reserve', reserveLimiter, (req, res) => {
         rate_per_mb_hour: quote.rate,
         total: quote.total,
         currency: PAYMENT_CURRENCY,
-        fee_exempt: feeExempt
+        fee_exempt: feeExempt,
+        // permanent gate: billable_hrs above is the pricing floor, not a
+        // duration — the resulting claim hosts until unpinned (no expiry).
+        permanent: HOSTING_PERMANENT
       },
       max_size_bytes: quota.MAX_FILE_SIZE_BYTES
     });
@@ -775,7 +797,12 @@ app.post('/upload', uploadLimiter, upload.single('ciphertext'), async (req, res)
     //     mechanics, distinct role). Checked before our own pin row lands.
     const hostedBefore = quota.alreadyHostedForCid(cid);
     const claimKind = hostedBefore ? 'own_copy' : 'original';
-    const hoursPaid = (r.hours_requested && r.hours_requested > 0) ? r.hours_requested : DEFAULT_HOURS;
+    // Permanent gate: pin paid_hours to MIN_HOURS (matches the one-time /reserve
+    // quote) and set the far-future sentinel expiry so the sweeper never touches
+    // it — the claim hosts until the owner/admin unpins.
+    const hoursPaid = HOSTING_PERMANENT
+      ? pricing.MIN_HOURS
+      : ((r.hours_requested && r.hours_requested > 0) ? r.hours_requested : DEFAULT_HOURS);
     const copies = pricing.cappedCopies(r.copies || 1);
     const sizeMB = pricing.billableMB(sizeBytes);
     // Fee-exempt claims lock rate 0 — the charged rate and the persisted
@@ -783,7 +810,7 @@ app.post('/upload', uploadLimiter, upload.single('ciphertext'), async (req, res)
     // bill the real rate on a claim that was free.
     const rateLocked = isFeeExempt ? 0 : pricing.RATE_PER_MB_HOUR;
     const startTs = quota.now();
-    const expiryTs = startTs + hoursPaid * pricing.HOUR_MS;
+    const expiryTs = HOSTING_PERMANENT ? pricing.PERMANENT_EXPIRY_TS : (startTs + hoursPaid * pricing.HOUR_MS);
 
     const pin = quota.createPin({
       cid,
@@ -1662,7 +1689,7 @@ app.get('/claims/own-copy/quote', userApiLimiter, (req, res) => {
     const quoteAccount = String(req.query.hive_account || '').toLowerCase();
     const feeExempt = !!(quoteAccount && feeExemptEntryFor(quoteAccount));
     const quote = pricing.calculateCost({
-      sizeBytes: hosted.size_bytes, hoursRequested: hours, copies,
+      sizeBytes: hosted.size_bytes, hoursRequested: HOSTING_PERMANENT ? pricing.MIN_HOURS : hours, copies,
       ...(feeExempt ? { rate: 0 } : {})
     });
 
@@ -1742,7 +1769,7 @@ app.post('/claims/own-copy', uploadLimiter, async (req, res) => {
       return handleError(res, e);
     }
     const quote = pricing.calculateCost({
-      sizeBytes: hosted.size_bytes, hoursRequested: hours, copies,
+      sizeBytes: hosted.size_bytes, hoursRequested: HOSTING_PERMANENT ? pricing.MIN_HOURS : hours, copies,
       ...(feeExempt ? { rate: 0 } : {})
     });
 
@@ -1761,9 +1788,10 @@ app.post('/claims/own-copy', uploadLimiter, async (req, res) => {
 
     const claim = quota.createOwnCopyClaim({
       cid, owner: account, paymentId: payment.id,
-      paidHours: quote.billable_hrs, copies: quote.copies,
+      paidHours: HOSTING_PERMANENT ? pricing.MIN_HOURS : quote.billable_hrs, copies: quote.copies,
       rateLocked: feeExempt ? 0 : pricing.RATE_PER_MB_HOUR,
-      amountPaid: payResult.paid, currency: payResult.currency
+      amountPaid: payResult.paid, currency: payResult.currency,
+      expiryOverride: HOSTING_PERMANENT ? pricing.PERMANENT_EXPIRY_TS : null
     });
 
     res.json({
@@ -1835,6 +1863,10 @@ app.post('/claims/extend', uploadLimiter, async (req, res) => {
     const claim = quota.getClaim(claim_id);
     if (!claim) return respondError(res, 'not_found', 'claim not found');
     if (claim.state !== 'active') return respondError(res, 'conflict', `claim is ${claim.state}; only active claims can be extended`);
+    // A permanent claim already hosts until unpinned — there is no expiry to push.
+    if (pricing.isPermanent(claim.expiry_ts)) {
+      return respondError(res, 'conflict', 'claim is permanent (hosts until unpinned) — nothing to extend');
+    }
     if (quota.isCidBlocked(claim.cid)) return respondError(res, 'legal_takedown', 'this CID is blocked on this server');
 
     const cost = pricing.roundCoins(claim.size_mb * extraHrs * claim.rate_locked * claim.copies_requested);

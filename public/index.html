@@ -242,7 +242,7 @@ footer { margin-top: 30px; font-size: 0.68rem; color: var(--muted); border-top: 
       </div>
       <div class="chips" id="priv-recip-chips"></div>
       <div class="row" style="margin-top:10px;">
-        <div><label class="field-label">Hours hosted</label><input type="number" id="priv-hours" min="1" value="168" style="width:110px;"></div>
+        <div id="priv-hours-field"><label class="field-label">Hours hosted</label><input type="number" id="priv-hours" min="1" value="168" style="width:110px;"></div>
         <div><label class="field-label">Copies <span class="hint" id="priv-copies-note"></span></label><input type="number" id="priv-copies" min="1" value="1" style="width:90px;"></div>
       </div>
       <label class="field-label">Who can end hosting early (release policy)</label>
@@ -267,7 +267,7 @@ footer { margin-top: 30px; font-size: 0.68rem; color: var(--muted); border-top: 
       <input type="file" id="pub-file-input" onchange="onPubFilePick()">
       <div class="hint" id="pub-file-meta"></div>
       <div class="row" style="margin-top:10px;">
-        <div><label class="field-label">Hours hosted</label><input type="number" id="pub-hours" min="1" value="168" style="width:110px;"></div>
+        <div id="pub-hours-field"><label class="field-label">Hours hosted</label><input type="number" id="pub-hours" min="1" value="168" style="width:110px;"></div>
         <div><label class="field-label">Copies <span class="hint" id="pub-copies-note"></span></label><input type="number" id="pub-copies" min="1" value="1" style="width:90px;"></div>
       </div>
       <div class="gw-line" id="pub-cost-line" style="margin-top:8px;">Pick a file to estimate.</div>
@@ -370,6 +370,7 @@ const HIVE_NODES = [
 // a stale/raced page kept rejecting at "gate cap is 10 MB").
 let attachMaxBytes    = 10 * 1024 * 1024;
 let gateCapKnown      = false;
+let gatePermanent     = false;  // HOSTING_MODE=permanent → no expiry, host until unpinned
 let gateDefaultHours  = 168;
 let gateRatePerMbHour = null;
 let gateMbDivisor     = 1000000;
@@ -783,6 +784,19 @@ const TEXT_INLINE_PREVIEW_BYTES = 64 * 1024;
 // Gate info (GET / — JSON; nginx routes browser-navigations to this page but
 // fetch() calls straight through to the gate)
 // ══════════════════════════════════════════════════════════════
+// Permanent-hosting gate: the duration picker is meaningless (uploads host
+// until unpinned), so hide the "Hours hosted" fields and label the panels.
+function applyHostingModeUI() {
+  for (const id of ['priv-hours-field', 'pub-hours-field']) {
+    const el = document.getElementById(id);
+    if (el) el.style.display = gatePermanent ? 'none' : '';
+  }
+  for (const id of ['priv-cost-line', 'pub-cost-line']) {
+    const el = document.getElementById(id);
+    if (el && gatePermanent) el.dataset.permanent = '1';
+  }
+}
+
 async function refreshGateInfo() {
   const line = document.getElementById('gate-info-line');
   const gw = getGateway();
@@ -806,10 +820,14 @@ async function refreshGateInfo() {
     if (pay.currency) gatePayCurrency = String(pay.currency).toUpperCase();
     if (pr.copies_max) gateCopiesMax = parseInt(pr.copies_max) || 1;
     gateWhitelistMode = !!(j.features && j.features.whitelist_mode);
+    gatePermanent = (pay.hosting_mode === 'permanent');
     renderWhitelistBanner();
+    applyHostingModeUI();
     line.innerHTML = `<b>${escapeHtml(j.service || 'ipfs-gate')}</b> · escrow @${escapeHtml(j.operator || '?')} · `
       + `${escapeHtml(String(gateRatePerMbHour ?? '?'))} ${escapeHtml(gatePayCurrency || '?')}/MB·h · `
-      + `max ${escapeHtml(String(pay.max_size_mb || '?'))} MB · default ${gateDefaultHours} h · copies ≤ ${gateCopiesMax}`;
+      + `max ${escapeHtml(String(pay.max_size_mb || '?'))} MB · `
+      + (gatePermanent ? `<b>permanent</b> (hosts until unpinned)` : `default ${gateDefaultHours} h`)
+      + ` · copies ≤ ${gateCopiesMax}`;
     const hoursEl = document.getElementById('priv-hours');
     if (hoursEl && !hoursEl.dataset.touched) hoursEl.value = String(gateDefaultHours);
     const note = document.getElementById('priv-copies-note');
@@ -990,7 +1008,7 @@ function buildUploadRow(u, gw, ctx) {
   const statusCls = u.status === 'active' ? 'active'
                   : u.status === 'expired' ? 'expired'
                   : 'removed';
-  const statusTxt = u.status === 'active'   ? (u.expires_at ? 'expires in ' + (timeUntilExpiry(u.expires_at) || '?') : 'pinned')
+  const statusTxt = u.status === 'active'   ? (u.expires_at ? 'expires in ' + (timeUntilExpiry(u.expires_at) || '?') : 'permanent · until unpinned')
                   : u.status === 'expired'  ? 'expired'
                   : u.status === 'banned'   ? 'removed (banned)'
                   : u.status === 'takedown' ? 'removed by operator'
@@ -1547,8 +1565,15 @@ function refreshPrivEstimate() {
   if (!el) return;
   const f = privSendState.file;
   if (!f) { el.textContent = 'Pick a file to estimate.'; return; }
-  const hours = Math.max(1, parseInt(document.getElementById('priv-hours').value) || gateDefaultHours);
   const copies = Math.max(1, Math.min(gateCopiesMax, parseInt(document.getElementById('priv-copies').value) || 1));
+  if (gatePermanent) {
+    const mb = (f.size / gateMbDivisor).toFixed(2);
+    el.textContent = myFeeExempt ? `Permanent — hosts until you unpin. Free (fee-exempt), ${mb} MB × ${copies} cop.`
+      : gateRatePerMbHour ? `Permanent — one-time ≈ ${(gateRatePerMbHour * (f.size / gateMbDivisor) * copies).toFixed(3)} ${gatePayCurrency || '?'} (${mb} MB × ${copies} cop) — exact at pay.`
+      : `Permanent — hosts until unpinned; exact cost quoted at pay.`;
+    return;
+  }
+  const hours = Math.max(1, parseInt(document.getElementById('priv-hours').value) || gateDefaultHours);
   if (myFeeExempt) { el.textContent = `Free — you're fee-exempt on this gate (${(f.size / gateMbDivisor).toFixed(2)} MB × ${hours} h × ${copies} cop).`; return; }
   if (!gateRatePerMbHour) { el.textContent = `~ ${(f.size / 1e6).toFixed(2)} MB × ${hours} h × ${copies} — exact cost quoted at pay.`; return; }
   const mb = f.size / gateMbDivisor;
@@ -1771,8 +1796,15 @@ function refreshPubEstimate() {
   if (!el) return;
   const f = (document.getElementById('pub-file-input').files || [])[0];
   if (!f) { el.textContent = 'Pick a file to estimate.'; return; }
-  const hours = Math.max(1, parseInt(document.getElementById('pub-hours').value) || gateDefaultHours);
   const copies = Math.max(1, Math.min(gateCopiesMax, parseInt(document.getElementById('pub-copies').value) || 1));
+  if (gatePermanent) {
+    const mb = (f.size / gateMbDivisor).toFixed(2);
+    el.textContent = myFeeExempt ? `Permanent — hosts until you unpin. Free (fee-exempt), ${mb} MB × ${copies} cop.`
+      : gateRatePerMbHour ? `Permanent — one-time ≈ ${(gateRatePerMbHour * (f.size / gateMbDivisor) * copies).toFixed(3)} ${gatePayCurrency || '?'} (${mb} MB × ${copies} cop) — exact at pay.`
+      : `Permanent — hosts until unpinned; exact cost quoted at pay.`;
+    return;
+  }
+  const hours = Math.max(1, parseInt(document.getElementById('pub-hours').value) || gateDefaultHours);
   if (myFeeExempt) { el.textContent = `Free — you're fee-exempt on this gate (${(f.size / gateMbDivisor).toFixed(2)} MB × ${hours} h × ${copies} cop).`; return; }
   if (!gateRatePerMbHour) { el.textContent = `~ ${(f.size / 1e6).toFixed(2)} MB × ${hours} h × ${copies} — exact cost quoted at pay.`; return; }
   const mb = f.size / gateMbDivisor;

@@ -27,6 +27,19 @@ const GUARDIAN_CANCEL_FEE_PCT = parseFloat(
 
 const HOUR_MS = 60 * 60 * 1000;
 
+// ─── Permanent hosting (HOSTING_MODE=permanent) ─────────────────────────────
+// A claim whose expiry_ts is this far-future sentinel is "permanent" — it lives
+// until the owner or an admin unpins it, never swept by the timer. We use a
+// sentinel rather than NULL because claims.expiry_ts / pins.expires_at are
+// NOT NULL in the schema; the sweeper's `expiry_ts < now` never matches it, and
+// isoFromMs() maps it back to null so clients render "no expiry" not year-9999.
+// 9999-12-31T23:59:59Z — a valid JS Date, well inside 64-bit int range.
+const PERMANENT_EXPIRY_TS = 253402300799000;
+/** True if a claim/pin timestamp is the permanent sentinel (host-until-unpinned). */
+function isPermanent(ts) {
+  return Number(ts) >= PERMANENT_EXPIRY_TS;
+}
+
 // ─── Billable units ─────────────────────────────────────────────────────────
 
 /** Decimal MB, rounded up, minimum 1. */
@@ -106,6 +119,11 @@ function calculateCost({ sizeBytes, hoursRequested, copies = 1, rate = RATE_PER_
  * when below MIN_REFUND. Rate is the claim's locked rate, never the live rate.
  */
 function calculateRefund(claim, now = Date.now()) {
+  // Permanent claims have no time dimension to pro-rate — a one-time fee buys
+  // hosting-until-unpinned, so there is nothing to refund on cancel.
+  if (isPermanent(claim.expiry_ts)) {
+    return { hours_used: 0, hours_refunded: 0, amount: 0, dust: true, permanent: true };
+  }
   const startTs    = Number(claim.start_ts);
   const paidHours  = Number(claim.paid_hours);
   const rateLocked = Number(claim.rate_locked);
@@ -166,7 +184,9 @@ module.exports = {
   calculateRefund,
   calculateDormantRefund,
   forcedRefundAmount,
+  isPermanent,
   // constants (exposed for server.js + tests)
+  PERMANENT_EXPIRY_TS,
   RATE_PER_MB_HOUR,
   MIN_HOURS,
   MB_DIVISOR,

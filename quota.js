@@ -618,14 +618,16 @@ function alreadyHostedForCid(cid) {
  * record accounting model since v0.1. Throws not_found when the CID has no live
  * host (an own copy backs a live file; a dead CID needs a real /upload).
  */
-function createOwnCopyClaim({ cid, owner, paymentId, paidHours, copies = 1, rateLocked, amountPaid, currency }) {
+function createOwnCopyClaim({ cid, owner, paymentId, paidHours, copies = 1, rateLocked, amountPaid, currency, expiryOverride = null }) {
   return db.transaction(() => {
     const info = getLatestPinInfoForCid(cid);
     if (!hasActivePinForCid(cid) || !info) {
       throw Object.assign(new Error('CID is not currently hosted here'), { code: 'not_found' });
     }
     const t = now();
-    const expiryTs = t + paidHours * 60 * 60 * 1000;
+    // expiryOverride lets a permanent-hosting gate pass the far-future sentinel
+    // so the own-copy claim also hosts until unpinned (never swept).
+    const expiryTs = (expiryOverride != null) ? expiryOverride : (t + paidHours * 60 * 60 * 1000);
     const pinRes = db.prepare(`
       INSERT INTO pins (cid, uploader, size_bytes, payment_id, created_at, expires_at, status, mode, mime)
       VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?)
