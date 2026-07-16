@@ -496,17 +496,20 @@ curl -X POST -H 'Authorization: Bearer YOUR_ADMIN_KEY' -H 'Content-Type: applica
 
 Once their pending reservations + active pins hit the cap, further reservations fail with <code>507 insufficient_storage</code> naming the exact numbers over the cap — tested live, e.g. <code>"per-account quota exceeded (0 + 2000 > 1000 bytes)"</code>.
 
-=== Security note: whitelist membership ≠ cryptographic identity proof (fee-exempt path) ===
+=== Security note: whitelist membership + on-chain key binding (fee-exempt path) ===
 
-'''Read this before telling friends "this is private, only invited accounts can use it."''' Whitelist mode gates on the '''Hive account name string''' supplied to <code>/reserve</code> and <code>/upload</code>. For a normal, paying upload this is fine — actually spending real CNOOBS/HBD from an account requires that account's real private key, so the on-chain payment itself proves who's uploading. But for a '''fee-exempt''' whitelisted account there is no on-chain transaction at all, and nothing else in the current build checks that the <code>uploader_pubkey</code>/<code>upload_proof_sig</code> presented to <code>/upload</code> is an actual current key of the named Hive account (unlike <code>/uploads/by-user</code> or the Hive-signed admin tier, which both do check the presented key against the chain).
+'''FIXED 2026-07-16 — this section now documents the hardened behavior; the historical gap is noted at the end.''' Whitelist mode gates on the '''Hive account name string''' supplied to <code>/reserve</code> and <code>/upload</code>. For a normal, paying upload the on-chain payment itself proves who's uploading — spending real CNOOBS/HBD from an account requires that account's real private key. For a '''fee-exempt''' whitelisted account there is no on-chain transaction, so <code>/upload</code> now performs the same key→account binding <code>/uploads/by-user</code> and the Hive-signed admin tier already do: the <code>uploader_pubkey</code> that signed <code>upload_proof_sig</code> '''must be a current posting key of the named Hive account''' (looked up live via <code>condenser_api.get_accounts</code>). Clients sign the upload proof with the posting key, so a legitimate upload passes unchanged; a throwaway keypair does not.
 
-'''Practical effect, confirmed by live testing (2026-07-05):''' a caller can hit <code>/upload</code> claiming to be any fee-exempt whitelisted account using a throwaway, freshly-generated keypair with no relationship to that account's real Hive keys — and the upload succeeds and pins for free. Hive account names are public information, so this isn't a secret-guessing problem: anyone who knows you've whitelisted <code>guest33</code> could upload under that name for free, and any abuse would show up attributed to your friend's account rather than the actual anonymous caller.
+'''Behavior now (confirmed live 2026-07-16):'''
+* A fee-exempt upload signed with the account's '''real''' posting key → succeeds and pins (no change for legitimate users).
+* An upload claiming a fee-exempt account but signed with a '''throwaway''' keypair → rejected <code>401 {"error":"unauthorized","message":"uploader_pubkey is not a current posting key of this Hive account"}</code>.
+* If Hive is unreachable at upload time the check '''fails closed''' → <code>422 unprocessable_entity</code> (an attacker can't bypass by DoSing the RPC path; a legitimate user retries when nodes recover).
+* '''Whitelisted-but-paying''' accounts (<code>fee_exempt:false</code>) were never affected — spending that account's real CNOOBS already requires its real keys, verified on-chain. The new check is scoped to the fee-exempt branch only, so the paid path takes no extra Hive round-trip.
 
-'''What this means for a real family-server deployment:'''
-* Keep <code>DISK_LIMIT_GB</code> and per-account <code>quota_bytes</code> tight — those are your actual backstop against free-upload abuse, not the whitelist name match.
-* Don't treat a fee-exempt whitelist gate's '''existence''' as safe-to-publicize just because it's "invite-only" — treat the domain the way you'd treat any semi-public, unlisted service.
-* '''Whitelisted-but-paying''' accounts (<code>fee_exempt:false</code>) don't have this gap — spending that account's real CNOOBS still requires its real keys, verified on-chain.
-* This is a known limitation of the current build, not a regression — worth a follow-up hardening pass (e.g. requiring a signed request, the same mechanism <code>/uploads/by-user</code> already uses, on the fee-exempt <code>/upload</code> path specifically) before depending on whitelist mode as your '''only''' access control for a free-upload configuration.
+'''Defense-in-depth still worth keeping:'''
+* Keep <code>DISK_LIMIT_GB</code> and per-account <code>quota_bytes</code> reasonable — good hygiene against a compromised-key or runaway-client scenario, even though the name-spoofing hole is closed.
+
+'''Historical note (pre-2026-07-16):''' before this fix, nothing checked <code>uploader_pubkey</code> against the chain on the fee-exempt path, so anyone who knew a whitelisted account name could upload for free under it with a freshly-generated keypair (attributed to the innocent account). See <code>FEE-EXEMPT-UPLOAD-AUTH-HARDENING.md</code> for the full write-up. If you run an old binary, <code>git pull</code> + rebuild.
 
 == Federation (deferred to v0.3+) ==
 

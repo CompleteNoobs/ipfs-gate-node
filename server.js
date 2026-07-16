@@ -636,6 +636,29 @@ app.post('/upload', uploadLimiter, upload.single('ciphertext'), async (req, res)
       return respondError(res, 'unauthorized', 'upload_proof_sig verification failed');
     }
 
+    // 3b. Fee-exempt uploads have no on-chain payment to anchor identity, so
+    //     the signature alone only proves "whoever holds THIS key signed" —
+    //     not that the key is `uploader`'s. Bind key→account against the chain
+    //     the same way /uploads/by-user and the Hive-admin tier already do
+    //     (verifySignedUserRequest step 3). Clients sign the upload proof with
+    //     the POSTING key (gate landing page + v4call both use Keychain
+    //     requestSignBuffer(..., 'Posting') / the pasted posting key).
+    //     Scoped to the fee-exempt branch only: on the paid path the on-chain
+    //     token transfer already proves account ownership, and this check
+    //     would add a Hive round-trip + fail-closed dependency for nothing.
+    if (isFeeExempt) {
+      let uploaderPostingKeys;
+      try {
+        uploaderPostingKeys = await hive.getAccountPostingPubkeys(uploader);
+      } catch (e) {
+        // Fail closed: if Hive is unreachable we cannot prove key ownership.
+        return respondError(res, 'unprocessable_entity', `could not verify uploader keys: ${e.message}`);
+      }
+      if (!uploaderPostingKeys.includes(uploader_pubkey)) {
+        return respondError(res, 'unauthorized', 'uploader_pubkey is not a current posting key of this Hive account');
+      }
+    }
+
     // 4–6. Payment. Fee-exempt (whitelist) reservations skip the on-chain
     //    verify entirely and record a synthetic zero-amount payment row (the
     //    pins/claims FK still needs a payments row). The synthetic tx_id is
