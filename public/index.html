@@ -788,7 +788,14 @@ async function refreshGateInfo() {
   const gw = getGateway();
   line.textContent = '… querying ' + gw;
   try {
-    const res = await fetch(gw + '/', { headers: { 'Accept': 'application/json' } });
+    // cache:'no-store' — "/" serves BOTH this JSON and the landing-page HTML.
+    // If the gate's nginx lacks Vary:Accept, the browser can serve the cached
+    // navigation HTML to this fetch and res.json() throws ("isn't answering").
+    // Bypassing the HTTP cache makes the client robust regardless of the gate.
+    const res = await fetch(gw + '/', { headers: { 'Accept': 'application/json' }, cache: 'no-store' });
+    if (!res.ok) throw new Error(`gate info HTTP ${res.status}`);
+    const ct = res.headers.get('content-type') || '';
+    if (!/application\/json/i.test(ct)) throw new Error(`gate info returned ${ct || 'unknown type'}, not JSON`);
     const j = await res.json();
     const pay = j.payment || {};
     const pr = j.pricing || {};
@@ -812,6 +819,7 @@ async function refreshGateInfo() {
     const pubNote = document.getElementById('pub-copies-note');
     if (pubNote) pubNote.textContent = gateCopiesMax <= 1 ? '(single-node gate → 1)' : `(up to ${gateCopiesMax})`;
   } catch (e) {
+    console.warn('[ipfs-gate] gate info fetch failed for', gw + '/', '—', e && e.message);
     line.textContent = '⚠ could not reach the gate at ' + gw + ' — check the URL.';
   }
   refreshPrivEstimate();
