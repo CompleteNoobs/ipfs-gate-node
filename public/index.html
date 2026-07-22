@@ -1,0 +1,2299 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>IPFS-Gate — encrypted IPFS hosting, gated by Hive</title>
+<!--
+  ipfs-gate standalone landing page (v0.1).
+
+  A self-contained client for THIS gate — no v4call server needed. Log in with
+  your Hive account and you get the same surface v4call's desktop app exposes
+  for the gate:
+    · My Uploads   — list / delete your pins        (GET /uploads/by-user, POST /uploads/delete)
+    · Private Send — encrypt to Hive users, pay, get a v4reveal: link
+    · Public Upload— plaintext upload → shareable gateway link; if the file is
+                     already hosted (POST /check), offers Guardian (dormant FIFO
+                     pledge, POST /guardian/pledge) or an own copy
+                     (POST /claims/own-copy) instead of a blind re-upload
+    · Reveal       — paste a v4reveal: link, decrypt in-browser, confirm receipt
+
+  Wire-format + signature schemes are byte-identical to v4call desktop-app.html
+  (same upload-proof message, same inner blob, same privSigInput), so links made
+  here open in v4call and vice-versa. Crypto is all client-side: the gate only
+  ever sees ciphertext for encrypted uploads.
+
+  Serving note: nginx serves this file for browser requests to "/" (Accept:
+  text/html) and proxies everything else — including fetch() calls to "/",
+  which still reach the gate's JSON info endpoint. See nginx/ipfs-gate.conf.
+-->
+<script src="https://cdn.jsdelivr.net/npm/@hiveio/dhive@1.3.2/dist/dhive.js"></script>
+<script src="https://unpkg.com/hivecrypt/bin/hivecrypt.min.js"></script>
+<style>
+:root {
+  --bg: #0a0c0f;
+  --surface: #12151a;
+  --border: #262b33;
+  --text: #d8dee6;
+  --subtext: #9aa4b2;
+  --muted: #5c6672;
+  --accent: #4da3ff;
+  --purple: #b48cff;
+  --green: #4fd68a;
+  --danger: #ff6b6b;
+  --warn: #ffb454;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; background: var(--bg); color: var(--text);
+  font-family: 'IBM Plex Sans', system-ui, sans-serif;
+  font-size: 15px; line-height: 1.5;
+}
+code, .mono, textarea, input { font-family: 'IBM Plex Mono', ui-monospace, monospace; }
+a { color: var(--accent); }
+button {
+  background: var(--accent); color: #0a0c0f; border: none; border-radius: 6px;
+  padding: 7px 14px; font-size: 0.82rem; font-weight: 600; cursor: pointer;
+  font-family: inherit;
+}
+button.secondary { background: var(--surface); color: var(--text); border: 1px solid var(--border); }
+button.danger { background: transparent; color: var(--danger); border: 1px solid var(--danger); }
+button.purple { background: var(--purple); }
+button:disabled { opacity: 0.45; cursor: not-allowed; }
+input[type=text], input[type=password], input[type=number], textarea {
+  background: var(--bg); color: var(--text); border: 1px solid var(--border);
+  border-radius: 6px; padding: 8px 10px; font-size: 0.82rem; width: 100%;
+}
+input:focus, textarea:focus { outline: 1px solid var(--accent); }
+.wrap { max-width: 860px; margin: 0 auto; padding: 18px 16px 60px; }
+header.site { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; margin-bottom: 4px; }
+header.site h1 { font-size: 1.25rem; margin: 0; letter-spacing: 0.5px; }
+header.site .host { color: var(--muted); font-size: 0.78rem; }
+.badge {
+  background: var(--surface); border: 1px solid var(--border); border-radius: 12px;
+  padding: 2px 10px; font-size: 0.78rem; color: var(--green); margin-left: auto;
+}
+.tagline { color: var(--subtext); font-size: 0.82rem; margin: 0 0 16px; }
+.card {
+  background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
+  padding: 16px; margin-bottom: 14px;
+}
+.card h2 { margin: 0 0 10px; font-size: 0.95rem; }
+.hint { font-size: 0.72rem; color: var(--muted); }
+.field-label { display: block; font-size: 0.68rem; color: var(--subtext); letter-spacing: 0.08em; margin: 10px 0 4px; text-transform: uppercase; }
+.row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.status { font-size: 0.78rem; color: var(--subtext); min-height: 1.2em; margin-top: 8px; }
+.status.err { color: var(--danger); }
+.status.ok { color: var(--green); }
+/* tabs */
+nav.tabs { display: flex; gap: 4px; margin: 18px 0 12px; flex-wrap: wrap; }
+nav.tabs button {
+  background: var(--surface); color: var(--subtext); border: 1px solid var(--border);
+  border-bottom: 2px solid transparent; border-radius: 8px 8px 0 0; font-weight: 500;
+}
+nav.tabs button.active { color: var(--text); border-bottom-color: var(--accent); }
+.tab-panel { display: none; }
+.tab-panel.shown { display: block; }
+/* uploads list */
+.upl-row { border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; margin-bottom: 8px; background: var(--bg); }
+.upl-row.inactive { opacity: 0.55; }
+.upl-top { display: flex; align-items: center; gap: 8px; }
+.upl-name { font-weight: 600; font-size: 0.85rem; overflow-wrap: anywhere; }
+.upl-mode { font-size: 0.64rem; border-radius: 10px; padding: 1px 8px; border: 1px solid var(--border); }
+.upl-mode.public { color: var(--warn); }
+.upl-mode.encrypted { color: var(--purple); }
+.upl-meta { display: flex; gap: 12px; flex-wrap: wrap; font-size: 0.7rem; color: var(--muted); margin-top: 4px; }
+.upl-status.active { color: var(--green); }
+.upl-status.expired { color: var(--muted); }
+.upl-status.removed { color: var(--danger); }
+.upl-ctx { font-size: 0.68rem; color: var(--subtext); margin-top: 3px; }
+.upl-actions { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; margin-top: 7px; }
+.upl-btn { background: var(--surface); color: var(--text); border: 1px solid var(--border); font-size: 0.7rem; padding: 4px 10px; font-weight: 500; }
+.upl-btn.danger { color: var(--danger); border-color: var(--danger); }
+.upl-publink { font-size: 0.66rem; color: var(--accent); overflow-wrap: anywhere; }
+.upl-confirm { font-size: 0.72rem; color: var(--warn); display: inline-flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+.uploads-status, .uploads-empty { font-size: 0.78rem; color: var(--muted); padding: 12px 4px; }
+/* chips */
+.chips { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 6px; }
+.chip {
+  display: inline-flex; align-items: center; gap: 5px; background: var(--bg);
+  border: 1px solid var(--border); border-radius: 12px; padding: 3px 8px; font-size: 0.74rem;
+}
+.chip .rm { cursor: pointer; color: var(--danger); font-weight: 700; }
+/* reveal render */
+.reveal-card { border: 1px solid var(--purple); border-radius: 8px; padding: 10px; background: var(--surface); margin-top: 8px; }
+.reveal-card img { max-width: 100%; max-height: 420px; border-radius: 6px; cursor: pointer; }
+pre.textprev {
+  max-width: 100%; max-height: 300px; overflow: auto; white-space: pre-wrap; word-break: break-word;
+  font-size: 0.72rem; line-height: 1.4; padding: 8px 10px; margin: 0;
+  background: var(--bg); color: var(--text); border: 1px solid var(--border); border-radius: 6px;
+}
+.result-box { border: 1px solid var(--green); border-radius: 8px; padding: 10px; margin-top: 10px; background: var(--bg); }
+.warn-banner {
+  border: 1px solid var(--warn); border-radius: 8px; padding: 8px 12px;
+  font-size: 0.72rem; color: var(--warn); margin-bottom: 14px;
+}
+footer { margin-top: 30px; font-size: 0.68rem; color: var(--muted); border-top: 1px solid var(--border); padding-top: 12px; }
+.unlock-bar { border: 1px dashed var(--warn); border-radius: 8px; padding: 10px 12px; margin-bottom: 14px; }
+.unlock-bar.unlocked { border-color: var(--green); }
+.gw-line { font-size: 0.72rem; color: var(--muted); margin-top: 2px; }
+.gw-line b { color: var(--subtext); }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header class="site">
+  <h1>🗄 IPFS-Gate</h1>
+  <span class="host" id="site-host"></span>
+  <span class="badge" id="hive-badge" style="display:none;"></span>
+</header>
+<p class="tagline">Encrypted IPFS hosting, gated by Hive payment. Files are encrypted <em>in your browser</em> — this gate only ever stores ciphertext. Same account, same uploads as the v4call app.</p>
+<div class="warn-banner">⚠ Proof of concept — not production software. For tinkerers who accept the risks.<br>
+<strong>Concept design — in active development.</strong> Servers can be rebooted, turned off, or replaced with no warning at any time. Please only use <strong>TEST tokens</strong>, free at the faucet: <a href="https://faucet.v4call.com/" target="_blank" rel="noopener">https://faucet.v4call.com/</a></div>
+
+<!-- ── Login ─────────────────────────────────────────────── -->
+<div class="card" id="login-card">
+  <h2>Log in with your Hive account</h2>
+  <label class="field-label" for="hive-username">Hive username</label>
+  <input type="text" id="hive-username" placeholder="username (no @)" autocomplete="username">
+  <div class="row" style="margin-top:10px;">
+    <button id="keychain-login-btn" onclick="keychainLogin()">🔑 Log in with Keychain</button>
+    <span class="hint">recommended — your key never leaves the extension</span>
+  </div>
+  <label class="field-label" for="hive-privkey">…or posting private key</label>
+  <div class="row">
+    <input type="password" id="hive-privkey" placeholder="5J… (posting private key)" style="flex:1;min-width:220px;" autocomplete="off">
+    <button class="secondary" id="login-btn" onclick="hiveLogin()">Log in with key</button>
+  </div>
+  <div class="hint" style="margin-top:6px;">Key login keeps the key in this tab's memory only — nothing is stored or sent anywhere except signatures. Note: <strong>payments still need Keychain</strong> (they're Active-key token transfers).</div>
+  <div class="status err" id="login-error"></div>
+  <div class="status" id="login-status"></div>
+</div>
+
+<!-- ── App (hidden until login) ──────────────────────────── -->
+<div id="app" style="display:none;">
+
+  <div class="unlock-bar" id="kc-key-bar" style="display:none;">
+    <div style="font-size:0.78rem;" id="kc-key-label">🔑 Unlock encryption — Private Send and Reveal wrap/unwrap AES keys with your <strong>posting private key</strong> (Keychain can sign, but can't do memo-encryption in-page).</div>
+    <div class="row" id="kc-key-row" style="margin-top:8px;">
+      <input type="password" id="kc-key-input" placeholder="5J… posting private key" style="flex:1;min-width:220px;" autocomplete="off">
+      <button class="secondary" onclick="unlockEncryption()">Unlock</button>
+    </div>
+    <div class="status err" id="kc-key-status"></div>
+  </div>
+
+  <div class="card">
+    <div class="row">
+      <div style="flex:1;min-width:240px;">
+        <label class="field-label" for="gw-input">Gate URL (this server by default)</label>
+        <input type="text" id="gw-input">
+      </div>
+      <button class="secondary" onclick="saveGateway()" style="align-self:flex-end;">Save</button>
+      <button class="secondary" onclick="logout()" style="align-self:flex-end;">Log out</button>
+    </div>
+    <div class="gw-line" id="gate-info-line">…</div>
+    <!-- Whitelist / gated-server mode (filled by refreshGateInfo + loadUploadsList) -->
+    <div class="gw-line" id="whitelist-banner" style="display:none;margin-top:6px;"></div>
+  </div>
+
+  <nav class="tabs">
+    <button data-tab="tab-uploads" class="active" onclick="showTab('tab-uploads')">📂 My Uploads</button>
+    <button data-tab="tab-private" onclick="showTab('tab-private')">🔒 Private Send</button>
+    <button data-tab="tab-public" onclick="showTab('tab-public')">🌐 Public Upload</button>
+    <button data-tab="tab-reveal" onclick="showTab('tab-reveal')">👁 Reveal</button>
+    <button data-tab="tab-admin" id="admin-tab-btn" style="display:none;" onclick="showTab('tab-admin')">🛠 Admin</button>
+  </nav>
+
+  <!-- ── My Uploads ── -->
+  <div class="tab-panel shown" id="tab-uploads">
+    <div class="card">
+      <div class="row">
+        <h2 style="margin:0;flex:1;">Your uploads on this gate</h2>
+        <button class="secondary" onclick="loadUploadsList(true)">↻ Refresh</button>
+      </div>
+      <div class="gw-line" id="uploads-quota-mine"></div>
+      <div class="gw-line" id="uploads-quota-shared"></div>
+      <div id="uploads-list" style="margin-top:12px;"><div class="uploads-status">Hit Refresh to load (signs a read-only request).</div></div>
+      <div class="hint">Encrypted uploads are labelled from this browser's local records — the gate itself only saw ciphertext, so files sent from another device show as 🔒 “encrypted upload”.</div>
+    </div>
+    <div class="card" style="margin-top:12px;">
+      <div class="row">
+        <h2 style="margin:0;flex:1;">🛡 My Guardian Pledges</h2>
+        <button class="secondary" onclick="loadGuardianPledges(true)">↻ Refresh</button>
+      </div>
+      <div id="guardian-pledges-list" style="margin-top:12px;"><div class="uploads-status">Hit Refresh to load (signs a read-only request).</div></div>
+      <div class="hint">Guardian pledges you've made to help keep OTHERS' files hosted — dormant pledges refund in full if cancelled before they ever activate.</div>
+    </div>
+  </div>
+
+  <!-- ── Private Send ── -->
+  <div class="tab-panel" id="tab-private">
+    <div class="card">
+      <h2>Encrypt a file to Hive users, pay the gate to host it</h2>
+      <div class="hint">The file is AES-GCM encrypted in your browser; the AES key is wrapped to each recipient's Hive posting key (memo encryption). You get a self-contained <code>v4reveal:</code> link only they can open — here or in v4call's Reveal tab.</div>
+      <label class="field-label">File</label>
+      <input type="file" id="priv-file-input" onchange="onPrivFilePick()">
+      <div class="hint" id="priv-file-meta"></div>
+      <label class="field-label">Recipients (Hive accounts — you're always included)</label>
+      <div class="row">
+        <input type="text" id="priv-recip-input" placeholder="username" style="flex:1;min-width:180px;">
+        <button class="secondary" onclick="privAddRecipient()">+ Add</button>
+      </div>
+      <div class="chips" id="priv-recip-chips"></div>
+      <div class="row" style="margin-top:10px;">
+        <div id="priv-hours-field"><label class="field-label">Hours hosted</label><input type="number" id="priv-hours" min="1" value="168" style="width:110px;"></div>
+        <div><label class="field-label">Copies <span class="hint" id="priv-copies-note"></span></label><input type="number" id="priv-copies" min="1" value="1" style="width:90px;"></div>
+      </div>
+      <label class="field-label">Who can end hosting early (release policy)</label>
+      <label style="display:block;font-size:0.78rem;cursor:pointer;"><input type="radio" name="priv-policy" value="owner_only" checked> Only me (owner)</label>
+      <label style="display:block;font-size:0.78rem;cursor:pointer;"><input type="radio" name="priv-policy" value="any_of"> Me or any one recipient</label>
+      <label style="display:block;font-size:0.78rem;cursor:pointer;"><input type="radio" name="priv-policy" value="all_of"> Me, or all recipients together</label>
+      <div class="gw-line" id="priv-cost-line" style="margin-top:8px;">Pick a file to estimate.</div>
+      <div class="row" style="margin-top:10px;">
+        <button class="purple" id="priv-send-btn" onclick="confirmPrivateSend()">🔒 Encrypt, pay &amp; upload</button>
+      </div>
+      <div class="status" id="priv-status-note">Ready.</div>
+      <div id="priv-result" class="result-box" style="display:none;"></div>
+    </div>
+  </div>
+
+  <!-- ── Public Upload ── -->
+  <div class="tab-panel" id="tab-public">
+    <div class="card">
+      <h2>Public upload — shareable link, no encryption</h2>
+      <div class="hint">Bytes go up as-is; anyone with the link can open it. The gate serves the file with its real content type (html/svg are forced to download, anti-XSS).</div>
+      <label class="field-label">File</label>
+      <input type="file" id="pub-file-input" onchange="onPubFilePick()">
+      <div class="hint" id="pub-file-meta"></div>
+      <div class="row" style="margin-top:10px;">
+        <div id="pub-hours-field"><label class="field-label">Hours hosted</label><input type="number" id="pub-hours" min="1" value="168" style="width:110px;"></div>
+        <div><label class="field-label">Copies <span class="hint" id="pub-copies-note"></span></label><input type="number" id="pub-copies" min="1" value="1" style="width:90px;"></div>
+      </div>
+      <div class="gw-line" id="pub-cost-line" style="margin-top:8px;">Pick a file to estimate.</div>
+      <div class="row" style="margin-top:10px;">
+        <button id="pub-upload-btn" onclick="confirmPublicUpload()">🌐 Pay &amp; upload</button>
+      </div>
+      <div class="status" id="pub-status-note">Ready.</div>
+      <!-- Guardian feature: filled by renderHostedPanel() when POST /check says
+           the picked file's CID is already hosted on this gate. -->
+      <div id="pub-hosted-panel" class="result-box" style="display:none;"></div>
+      <div id="pub-result" class="result-box" style="display:none;"></div>
+    </div>
+  </div>
+
+  <!-- ── Reveal ── -->
+  <div class="tab-panel" id="tab-reveal">
+    <div class="card">
+      <h2>Reveal a private send</h2>
+      <div class="hint">Paste a <strong>🔒 Private send</strong> link (<code>v4reveal:…</code>) to decrypt it. Only an account it was addressed to can open it — and you must have your 🔑 encryption unlocked.</div>
+      <textarea id="reveal-input" placeholder="v4reveal:…" style="height:80px;margin-top:8px;font-size:0.68rem;resize:vertical;"></textarea>
+      <div class="row" style="margin-top:8px;">
+        <button class="purple" onclick="revealFromInput()">👁 Reveal</button>
+        <button class="secondary" onclick="clearReveal()">Clear</button>
+      </div>
+      <div class="status" id="reveal-status"></div>
+      <div id="reveal-result"></div>
+    </div>
+  </div>
+
+  <!-- ── Admin (hidden until /uploads/by-user reports is_admin) ── -->
+  <div class="tab-panel" id="tab-admin">
+    <div class="card">
+      <div class="row">
+        <h2 style="margin:0;flex:1;">🛠 Whitelist</h2>
+        <button class="secondary" onclick="loadAdminWhitelist()">↻ Refresh</button>
+      </div>
+      <div class="hint">You're a server admin (Hive tier) — every action here signs an <code>admin-action</code> message with your posting key; the box owner's <code>ADMIN_KEY</code> keeps working independently.</div>
+      <div class="row" style="margin-top:10px;">
+        <input type="text" id="adm-wl-account" placeholder="hive account" style="width:160px;">
+        <input type="number" id="adm-wl-quota-gb" placeholder="quota GB (blank = ∞)" min="0" step="0.1" style="width:160px;">
+        <label style="font-size:0.78rem;cursor:pointer;align-self:center;"><input type="checkbox" id="adm-wl-exempt"> fee-exempt</label>
+        <button class="purple" onclick="adminWhitelistAdd()">+ Whitelist</button>
+      </div>
+      <div class="status" id="adm-wl-status"></div>
+      <div id="adm-wl-list" style="margin-top:12px;"><div class="uploads-status">Hit Refresh to load (signs a read-only request).</div></div>
+    </div>
+    <div class="card" style="margin-top:12px;">
+      <h2>Moderation</h2>
+      <div class="hint">Ban = the account's uploads end (identity kill). Takedown = a CID is removed for everyone and can't come back (content kill). Delete pin = end ONE account's claim on ONE CID, leaving other hosts alone.</div>
+      <div class="row" style="margin-top:10px;">
+        <input type="text" id="adm-ban-account" placeholder="hive account" style="width:160px;">
+        <input type="text" id="adm-ban-reason" placeholder="reason" style="flex:1;min-width:140px;">
+        <select id="adm-ban-policy" style="width:110px;"><option value="prorata">prorata</option><option value="none">no refund</option></select>
+        <button class="danger" onclick="adminBan()">Ban</button>
+        <button class="secondary" onclick="adminUnban()">Unban</button>
+      </div>
+      <div class="row" style="margin-top:8px;">
+        <input type="text" id="adm-td-cid" placeholder="cid" style="flex:1;min-width:200px;">
+        <input type="text" id="adm-td-reason" placeholder="reason" style="width:160px;">
+        <button class="danger" onclick="adminTakedown()">Takedown</button>
+      </div>
+      <div class="row" style="margin-top:8px;">
+        <input type="text" id="adm-pd-cid" placeholder="cid" style="flex:1;min-width:200px;">
+        <input type="text" id="adm-pd-account" placeholder="whose pin" style="width:140px;">
+        <button class="danger" onclick="adminPinDelete()">Delete pin</button>
+      </div>
+      <div class="status" id="adm-mod-status"></div>
+    </div>
+  </div>
+
+</div><!-- /app -->
+
+<footer>
+  ipfs-gate standalone page · sister project of <a href="https://github.com/CompleteNoobs/v4call">v4call</a> · source: <a href="https://github.com/CompleteNoobs/ipfs-gate">CompleteNoobs/ipfs-gate</a><br>
+  Everything cryptographic happens in this tab. The gate never sees your keys or plaintext of encrypted uploads.
+</footer>
+</div>
+
+<script>
+'use strict';
+// ══════════════════════════════════════════════════════════════
+// State + config
+// ══════════════════════════════════════════════════════════════
+let myUsername = '', myPubKey = '', myPrivKey = null, myPrivKeyStr = '', useKeychain = false;
+const pubKeyCache = {};
+
+const HIVE_NODES = [
+  'https://api.hive.blog',
+  'https://api.deathwing.me',
+  'https://hive-api.arcange.eu',
+  'https://api.openhive.network',
+  'https://techcoderx.com'
+];
+
+// Gate defaults — refreshed from GET / (same learn-the-caps pattern as v4call
+// v0.16.21; the consts are fallbacks for when the gate hasn't answered yet).
+// gateCapKnown guards the size checks: until the gate has actually answered,
+// the 10MB fallback is a GUESS and must never be enforced or displayed as the
+// gate's cap (2026-07-05 lesson: operator raised MAX_FILE_SIZE_MB to 1000 but
+// a stale/raced page kept rejecting at "gate cap is 10 MB").
+let attachMaxBytes    = 10 * 1024 * 1024;
+let gateCapKnown      = false;
+let gatePermanent     = false;  // HOSTING_MODE=permanent → no expiry, host until unpinned
+let gateDefaultHours  = 168;
+let gateRatePerMbHour = null;
+let gateMbDivisor     = 1000000;
+let gatePayCurrency   = null;
+let gateCopiesMax     = 1;
+// Whitelist / gated-server mode. gateWhitelistMode comes from GET / (public);
+// the my* trio comes from the SIGNED /uploads/by-user response (null = not
+// yet known). See WHITELIST-MODE-DESIGN-NOTES.md §7/§8.
+let gateWhitelistMode = false;
+let myWhitelisted     = null;
+let myFeeExempt       = false;
+let myIsAdmin         = false;
+
+function defaultGateway() {
+  if (/^https?:$/.test(location.protocol)) return location.origin;
+  return 'https://ipfs.v4call.com';
+}
+function getGateway() {
+  try { return (localStorage.getItem('ipfsgate:page:gateway') || defaultGateway()).replace(/\/+$/, ''); }
+  catch (_) { return defaultGateway(); }
+}
+function saveGateway() {
+  const v = (document.getElementById('gw-input').value || '').trim().replace(/\/+$/, '');
+  if (!/^https?:\/\//.test(v)) { alert('Enter a full URL (https://…)'); return; }
+  try { localStorage.setItem('ipfsgate:page:gateway', v); } catch (_) {}
+  gateCapKnown = false; // the old gate's cap doesn't apply to the new one
+  refreshGateInfo();
+}
+
+// Local cid → {filename, mime, kind, context} map so the Uploads tab can label
+// encrypted uploads. The gate only stores ciphertext; in v4call this context
+// comes from the home server (record-upload-meta) — standalone, it's local.
+function getCtxMap() {
+  try { return JSON.parse(localStorage.getItem('ipfsgate:page:ctx') || '{}'); } catch (_) { return {}; }
+}
+function recordCtx(cid, meta) {
+  try {
+    const m = getCtxMap();
+    m[cid] = meta;
+    localStorage.setItem('ipfsgate:page:ctx', JSON.stringify(m));
+  } catch (_) {}
+}
+
+// ══════════════════════════════════════════════════════════════
+// Small helpers
+// ══════════════════════════════════════════════════════════════
+function escapeHtml(s) {
+  return String(s == null ? '' : s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+function bytesToHuman(n) {
+  n = Number(n) || 0;
+  if (n < 1024) return n + ' B';
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
+  if (n < 1024 * 1024 * 1024) return (n / 1024 / 1024).toFixed(2) + ' MB';
+  return (n / 1024 / 1024 / 1024).toFixed(2) + ' GB';
+}
+function timeUntilExpiry(iso) {
+  try {
+    const ms = new Date(iso) - Date.now();
+    if (ms <= 0) return null;
+    const m = Math.floor(ms / 60000);
+    if (m < 60) return m + ' min';
+    const h = Math.floor(m / 60);
+    if (h < 48) return h + ' h';
+    return Math.floor(h / 24) + ' days';
+  } catch (_) { return null; }
+}
+function bytesToHex(bytes) {
+  return Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+function u8concat(...parts) {
+  const total = parts.reduce((n, p) => n + p.length, 0);
+  const out = new Uint8Array(total);
+  let off = 0;
+  for (const p of parts) { out.set(p, off); off += p.length; }
+  return out;
+}
+function u32be(n) {
+  const b = new Uint8Array(4);
+  b[0] = (n >>> 24) & 0xff; b[1] = (n >>> 16) & 0xff; b[2] = (n >>> 8) & 0xff; b[3] = n & 0xff;
+  return b;
+}
+function b64ToBytes(b64) {
+  const bin = atob(b64);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+function b64urlEncode(str) {
+  const bytes = new TextEncoder().encode(str);
+  let bin = '';
+  for (const b of bytes) bin += String.fromCharCode(b);
+  return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+function b64urlDecode(s) {
+  let b64 = String(s || '').replace(/-/g, '+').replace(/_/g, '/');
+  while (b64.length % 4) b64 += '=';
+  const bin = atob(b64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return new TextDecoder().decode(bytes);
+}
+
+// ══════════════════════════════════════════════════════════════
+// Hive RPC (multi-node fallback)
+// ══════════════════════════════════════════════════════════════
+async function hiveCall(method, params) {
+  let lastErr = null;
+  for (const node of HIVE_NODES) {
+    try {
+      const res = await fetch(node, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ jsonrpc: '2.0', method, params, id: 1 })
+      });
+      const data = await res.json();
+      if (data.error) throw new Error(data.error.message || 'rpc error');
+      return data.result;
+    } catch (e) { lastErr = e; }
+  }
+  throw lastErr || new Error('all Hive nodes unreachable');
+}
+async function fetchChainPostingKey(username) {
+  const result = await hiveCall('condenser_api.get_accounts', [[username]]);
+  if (!result || !result.length) throw new Error(`Account "@${username}" not found.`);
+  const key = result[0].posting?.key_auths?.[0]?.[0];
+  if (!key) throw new Error('Could not read posting key for this account.');
+  return key;
+}
+async function fetchPubKey(username) {
+  if (pubKeyCache[username]) return pubKeyCache[username];
+  try {
+    const key = await fetchChainPostingKey(username);
+    pubKeyCache[username] = key;
+    return key;
+  } catch (_) { return null; }
+}
+
+// ══════════════════════════════════════════════════════════════
+// Login / unlock
+// ══════════════════════════════════════════════════════════════
+async function hiveLogin() {
+  const usernameRaw = document.getElementById('hive-username').value.trim().toLowerCase().replace('@', '');
+  const privKeyRaw = document.getElementById('hive-privkey').value.trim();
+  const errEl = document.getElementById('login-error');
+  const statEl = document.getElementById('login-status');
+  const btn = document.getElementById('login-btn');
+  errEl.textContent = ''; statEl.textContent = '';
+  if (!usernameRaw) { errEl.textContent = 'Please enter your Hive username.'; return; }
+  if (!privKeyRaw) { errEl.textContent = 'Please enter your posting private key.'; return; }
+  btn.disabled = true; statEl.textContent = 'Parsing key…';
+  try {
+    let privKey;
+    try { privKey = dhive.PrivateKey.fromString(privKeyRaw); }
+    catch (e) { throw new Error('Invalid key format. Use your Posting private key (starts with 5J).'); }
+    const derivedPub = privKey.createPublic().toString();
+    statEl.textContent = 'Checking Hive blockchain…';
+    const chainPostingPub = await fetchChainPostingKey(usernameRaw);
+    if (derivedPub !== chainPostingPub) throw new Error(`Key mismatch for @${usernameRaw}. Make sure you are using the POSTING private key.`);
+    myUsername = usernameRaw;
+    myPrivKey = privKey;
+    myPrivKeyStr = privKeyRaw;
+    myPubKey = derivedPub;
+    useKeychain = false;
+    pubKeyCache[myUsername] = myPubKey;
+    sessionStorage.setItem('hive_username', myUsername);
+    sessionStorage.setItem('hive_pubkey', myPubKey);
+    sessionStorage.removeItem('hive_keychain');
+    document.getElementById('hive-privkey').value = '';
+    statEl.textContent = `✓ Verified @${myUsername}`;
+    enterApp();
+  } catch (err) {
+    errEl.textContent = err.message;
+    statEl.textContent = '';
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function keychainLogin() {
+  const usernameRaw = document.getElementById('hive-username').value.trim().toLowerCase().replace('@', '');
+  const errEl = document.getElementById('login-error');
+  const statEl = document.getElementById('login-status');
+  const btn = document.getElementById('keychain-login-btn');
+  errEl.textContent = ''; statEl.textContent = '';
+  if (!usernameRaw) { errEl.textContent = 'Please enter your Hive username.'; return; }
+  if (!window.hive_keychain) { errEl.textContent = 'Hive Keychain not detected. Install it from hive-keychain.com or use the key login below.'; return; }
+  btn.disabled = true; statEl.textContent = 'Opening Keychain…';
+  const challenge = `ipfsgate-login-${usernameRaw}-${Date.now()}`;
+  window.hive_keychain.requestSignBuffer(usernameRaw, challenge, 'Posting', async (response) => {
+    if (!response.success) {
+      errEl.textContent = 'Keychain signing cancelled or failed.';
+      statEl.textContent = '';
+      btn.disabled = false;
+      return;
+    }
+    statEl.textContent = 'Verifying on Hive blockchain…';
+    try {
+      const chainPostingPub = await fetchChainPostingKey(usernameRaw);
+      const sig = dhive.Signature.fromString(response.result);
+      const msgHash = dhive.cryptoUtils.sha256(challenge);
+      const recovered = sig.recover(msgHash).toString();
+      if (recovered !== chainPostingPub) throw new Error('Signature verification failed — key mismatch.');
+      myUsername = usernameRaw;
+      myPrivKey = null;
+      myPrivKeyStr = '';
+      myPubKey = chainPostingPub;
+      useKeychain = true;
+      pubKeyCache[myUsername] = myPubKey;
+      sessionStorage.setItem('hive_username', myUsername);
+      sessionStorage.setItem('hive_pubkey', myPubKey);
+      sessionStorage.setItem('hive_keychain', 'true');
+      statEl.textContent = `✓ Verified @${myUsername} via Keychain`;
+      enterApp();
+    } catch (err) {
+      errEl.textContent = err.message;
+      statEl.textContent = '';
+      btn.disabled = false;
+    }
+  });
+}
+
+function enterApp() {
+  document.getElementById('login-card').style.display = 'none';
+  document.getElementById('app').style.display = '';
+  const badge = document.getElementById('hive-badge');
+  badge.textContent = '@' + myUsername + (useKeychain ? ' · Keychain' : '');
+  badge.style.display = '';
+  document.getElementById('gw-input').value = getGateway();
+  // Encryption unlock is needed whenever the raw posting key isn't in memory
+  // (Keychain login, or a restored session). Signing still works via Keychain.
+  document.getElementById('kc-key-bar').style.display = myPrivKeyStr ? 'none' : '';
+  refreshGateInfo();
+  loadUploadsList();
+  loadGuardianPledges();
+}
+
+function logout() {
+  myUsername = ''; myPubKey = ''; myPrivKey = null; myPrivKeyStr = ''; useKeychain = false;
+  _uplListSig = null;
+  _claimsListSig = null;
+  myWhitelisted = null; myFeeExempt = false; myIsAdmin = false;
+  applyWhitelistIdentity();
+  sessionStorage.removeItem('hive_username');
+  sessionStorage.removeItem('hive_pubkey');
+  sessionStorage.removeItem('hive_keychain');
+  document.getElementById('app').style.display = 'none';
+  document.getElementById('login-card').style.display = '';
+  document.getElementById('hive-badge').style.display = 'none';
+}
+
+function unlockEncryption() {
+  const input = document.getElementById('kc-key-input');
+  const status = document.getElementById('kc-key-status');
+  const keyStr = input.value.trim();
+  if (!keyStr) { status.textContent = 'Please enter your posting key.'; return; }
+  try {
+    const privKey = dhive.PrivateKey.fromString(keyStr);
+    const derivedPub = privKey.createPublic().toString();
+    if (derivedPub !== myPubKey) { status.textContent = "Key does not match your account's posting key."; return; }
+    myPrivKey = privKey;
+    myPrivKeyStr = keyStr;
+    input.value = '';
+    status.textContent = '';
+    const bar = document.getElementById('kc-key-bar');
+    bar.classList.add('unlocked');
+    document.getElementById('kc-key-label').textContent = '✓ Encryption unlocked for this session';
+    document.getElementById('kc-key-row').style.display = 'none';
+  } catch (e) {
+    status.textContent = 'Invalid key format. Use your Posting private key (starts with 5J).';
+  }
+}
+
+// ══════════════════════════════════════════════════════════════
+// Signing + memo-encryption (mirrors v4call desktop-app)
+// ══════════════════════════════════════════════════════════════
+async function signRaw(payload) {
+  if (useKeychain && window.hive_keychain) {
+    return new Promise((resolve) => {
+      window.hive_keychain.requestSignBuffer(myUsername, payload, 'Posting', (r) => {
+        resolve(r.success ? r.result : '');
+      });
+    });
+  }
+  if (!myPrivKey) return '';
+  try { return myPrivKey.sign(dhive.cryptoUtils.sha256(payload)).toString(); }
+  catch (e) { console.error('sign error:', e.message); return ''; }
+}
+function encryptMsg(plaintext, recipientPubStr) {
+  if (!myPrivKeyStr) throw new Error('Posting key required — unlock encryption first (🔑 bar at the top).');
+  return hivecrypt.encode(myPrivKeyStr, recipientPubStr, '#' + plaintext);
+}
+function decryptMsg(ciphertext) {
+  if (!myPrivKeyStr) return '[encrypted — unlock with the 🔑 bar to read]';
+  try { const d = hivecrypt.decode(myPrivKeyStr, ciphertext); return d.startsWith('#') ? d.slice(1) : d; }
+  catch (e) { return '[could not decrypt — not addressed to you]'; }
+}
+async function keychainTransferGateToken({ to, amount, memo, symbol }) {
+  // Hive-Engine token transfer via Keychain custom_json (Active auth).
+  // Returns the Hive tx_id on success, or null.
+  if (!window.hive_keychain) throw new Error('Payments need Hive Keychain (Active-key token transfer). Install it from hive-keychain.com.');
+  const sym = String(symbol || 'CNOOBS').toUpperCase();
+  const payload = JSON.stringify({
+    contractName: 'tokens', contractAction: 'transfer',
+    contractPayload: { to, symbol: sym, quantity: String(amount), memo }
+  });
+  return new Promise((resolve) => {
+    window.hive_keychain.requestCustomJson(
+      myUsername, 'ssc-mainnet-hive', 'Active', payload,
+      `Pay ${amount} ${sym} to ipfs-gate`,
+      (r) => {
+        if (!r.success) { resolve(null); return; }
+        resolve(r.result?.id || r.result?.tx_id || null);
+      }
+    );
+  });
+}
+
+// ══════════════════════════════════════════════════════════════
+// Wire format (byte-identical to v4call desktop-app / ipfs-gate envelope.js)
+//   upload-proof: ipfs-gate:upload-proof:v1:<sha256hex>:<reservation_id>:<uploader>
+//   inner blob:   [12B nonce][AES-GCM( [4B BE len][JSON header][file bytes] )]
+// ══════════════════════════════════════════════════════════════
+async function sha256HexBytes(bytes) {
+  const buf = await crypto.subtle.digest('SHA-256', bytes);
+  return bytesToHex(new Uint8Array(buf));
+}
+async function aesGcmEncrypt(plaintextBytes) {
+  const key = await crypto.subtle.generateKey({ name: 'AES-GCM', length: 256 }, true, ['encrypt', 'decrypt']);
+  const nonce = crypto.getRandomValues(new Uint8Array(12));
+  const ctBuf = await crypto.subtle.encrypt({ name: 'AES-GCM', iv: nonce }, key, plaintextBytes);
+  const rawKeyBuf = await crypto.subtle.exportKey('raw', key);
+  return { ciphertext: new Uint8Array(ctBuf), nonce, rawKey: new Uint8Array(rawKeyBuf) };
+}
+async function aesGcmDecrypt(rawKeyBytes, nonceBytes, ciphertextBytes) {
+  const key = await crypto.subtle.importKey('raw', rawKeyBytes, { name: 'AES-GCM' }, false, ['decrypt']);
+  const ptBuf = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: nonceBytes }, key, ciphertextBytes);
+  return new Uint8Array(ptBuf);
+}
+function parseInnerBlob(blobBytes, rawKeyBytes) {
+  if (blobBytes.length < 12 + 16) throw new Error('blob too small');
+  const nonce = blobBytes.subarray(0, 12);
+  const ct = blobBytes.subarray(12);
+  return aesGcmDecrypt(rawKeyBytes, nonce, ct).then(pt => {
+    if (pt.length < 4) throw new Error('plaintext too small');
+    const len = (pt[0] << 24) | (pt[1] << 16) | (pt[2] << 8) | pt[3];
+    if (len < 0 || 4 + len > pt.length) throw new Error('bad header length');
+    const headerStr = new TextDecoder().decode(pt.subarray(4, 4 + len));
+    const header = JSON.parse(headerStr);
+    const fileBytes = pt.subarray(4 + len);
+    return { header, fileBytes };
+  });
+}
+async function buildInnerBlob({ file, sender }) {
+  const fileBytes = new Uint8Array(await file.arrayBuffer());
+  const header = JSON.stringify({
+    v: 1, filename: file.name, mime: detectFileMime(file) || 'application/octet-stream',
+    original_size: fileBytes.length, sender
+  });
+  const headerBytes = new TextEncoder().encode(header);
+  const plaintext = u8concat(u32be(headerBytes.length), headerBytes, fileBytes);
+  const { ciphertext, nonce, rawKey } = await aesGcmEncrypt(plaintext);
+  const blob = u8concat(nonce, ciphertext);
+  return { blob, rawKey, plaintextSize: fileBytes.length };
+}
+function buildUploadProofMessage({ ciphertextSha256Hex, reservationId, uploader }) {
+  if (!/^[a-f0-9]{64}$/.test(ciphertextSha256Hex)) throw new Error('bad ciphertext sha256');
+  if (!/^[a-f0-9]{16}$/.test(reservationId)) throw new Error('bad reservation id');
+  const u = String(uploader || '').toLowerCase();
+  if (!/^[a-z0-9][a-z0-9.\-]*$/.test(u)) throw new Error('bad uploader');
+  return `ipfs-gate:upload-proof:v1:${ciphertextSha256Hex}:${reservationId}:${u}`;
+}
+function mimeToKind(mime) {
+  if (typeof mime !== 'string') return 'file';
+  if (mime === 'image/svg+xml') return 'file'; // SVG can carry <script> — never inline
+  if (mime === 'application/pdf') return 'pdf';
+  if (mime.startsWith('audio/')) return 'audio';
+  if (mime.startsWith('image/')) return 'image';
+  if (mime.startsWith('video/')) return 'video';
+  if (mime.startsWith('text/')) return 'text';
+  return 'file';
+}
+function detectFileMime(file) {
+  const name = (file.name || '').toLowerCase();
+  if (/\.tar\.gz$/.test(name) || /\.tgz$/.test(name)) return 'application/gzip';
+  if (/\.tar\.bz2$/.test(name) || /\.tbz2?$/.test(name)) return 'application/x-tar';
+  if (/\.tar\.xz$/.test(name) || /\.txz$/.test(name)) return 'application/x-tar';
+  if (file.type && file.type !== 'application/octet-stream') return file.type;
+  if (/\.(md|markdown)$/.test(name)) return 'text/markdown';
+  if (/\.txt$/.test(name)) return 'text/plain';
+  if (/\.zip$/.test(name)) return 'application/zip';
+  if (/\.tar$/.test(name)) return 'application/x-tar';
+  if (/\.gz$/.test(name)) return 'application/gzip';
+  if (/\.7z$/.test(name)) return 'application/x-7z-compressed';
+  if (/\.rar$/.test(name)) return 'application/vnd.rar';
+  return file.type || '';
+}
+function attachKindIcon(kind) {
+  return kind === 'audio' ? '🎵'
+       : kind === 'video' ? '🎬'
+       : kind === 'image' ? '📷'
+       : kind === 'pdf'   ? '📄'
+       : kind === 'text'  ? '📝'
+       : kind === 'file'  ? '📦'
+       : '📎';
+}
+const TEXT_INLINE_PREVIEW_BYTES = 64 * 1024;
+
+// ══════════════════════════════════════════════════════════════
+// Gate info (GET / — JSON; nginx routes browser-navigations to this page but
+// fetch() calls straight through to the gate)
+// ══════════════════════════════════════════════════════════════
+// Permanent-hosting gate: the duration picker is meaningless (uploads host
+// until unpinned), so hide the "Hours hosted" fields and label the panels.
+function applyHostingModeUI() {
+  for (const id of ['priv-hours-field', 'pub-hours-field']) {
+    const el = document.getElementById(id);
+    if (el) el.style.display = gatePermanent ? 'none' : '';
+  }
+  for (const id of ['priv-cost-line', 'pub-cost-line']) {
+    const el = document.getElementById(id);
+    if (el && gatePermanent) el.dataset.permanent = '1';
+  }
+}
+
+async function refreshGateInfo() {
+  const line = document.getElementById('gate-info-line');
+  const gw = getGateway();
+  line.textContent = '… querying ' + gw;
+  try {
+    // cache:'no-store' — "/" serves BOTH this JSON and the landing-page HTML.
+    // If the gate's nginx lacks Vary:Accept, the browser can serve the cached
+    // navigation HTML to this fetch and res.json() throws ("isn't answering").
+    // Bypassing the HTTP cache makes the client robust regardless of the gate.
+    const res = await fetch(gw + '/', { headers: { 'Accept': 'application/json' }, cache: 'no-store' });
+    if (!res.ok) throw new Error(`gate info HTTP ${res.status}`);
+    const ct = res.headers.get('content-type') || '';
+    if (!/application\/json/i.test(ct)) throw new Error(`gate info returned ${ct || 'unknown type'}, not JSON`);
+    const j = await res.json();
+    const pay = j.payment || {};
+    const pr = j.pricing || {};
+    if (pay.max_size_mb) { attachMaxBytes = pay.max_size_mb * 1024 * 1024; gateCapKnown = true; }
+    if (pay.default_hours) gateDefaultHours = parseInt(pay.default_hours) || gateDefaultHours;
+    if (pr.rate_per_mb_hour != null) gateRatePerMbHour = parseFloat(pr.rate_per_mb_hour);
+    if (pr.mb_divisor) gateMbDivisor = pr.mb_divisor;
+    if (pay.currency) gatePayCurrency = String(pay.currency).toUpperCase();
+    if (pr.copies_max) gateCopiesMax = parseInt(pr.copies_max) || 1;
+    gateWhitelistMode = !!(j.features && j.features.whitelist_mode);
+    gatePermanent = (pay.hosting_mode === 'permanent');
+    renderWhitelistBanner();
+    applyHostingModeUI();
+    line.innerHTML = `<b>${escapeHtml(j.service || 'ipfs-gate')}</b> · escrow @${escapeHtml(j.operator || '?')} · `
+      + `${escapeHtml(String(gateRatePerMbHour ?? '?'))} ${escapeHtml(gatePayCurrency || '?')}/MB·h · `
+      + `max ${escapeHtml(String(pay.max_size_mb || '?'))} MB · `
+      + (gatePermanent ? `<b>permanent</b> (hosts until unpinned)` : `default ${gateDefaultHours} h`)
+      + ` · copies ≤ ${gateCopiesMax}`;
+    const hoursEl = document.getElementById('priv-hours');
+    if (hoursEl && !hoursEl.dataset.touched) hoursEl.value = String(gateDefaultHours);
+    const note = document.getElementById('priv-copies-note');
+    if (note) note.textContent = gateCopiesMax <= 1 ? '(single-node gate → 1)' : `(up to ${gateCopiesMax})`;
+    const pubHoursEl = document.getElementById('pub-hours');
+    if (pubHoursEl && !pubHoursEl.dataset.touched) pubHoursEl.value = String(gateDefaultHours);
+    const pubNote = document.getElementById('pub-copies-note');
+    if (pubNote) pubNote.textContent = gateCopiesMax <= 1 ? '(single-node gate → 1)' : `(up to ${gateCopiesMax})`;
+  } catch (e) {
+    console.warn('[ipfs-gate] gate info fetch failed for', gw + '/', '—', e && e.message);
+    line.textContent = '⚠ could not reach the gate at ' + gw + ' — check the URL.';
+  }
+  refreshPrivEstimate();
+  refreshPubEstimate();
+}
+
+// Called right before enforcing attachMaxBytes: if the gate never confirmed
+// its cap (fetch failed at load, or the user beat it to the button), ask
+// again NOW. Returns true only when attachMaxBytes is the gate's real value —
+// the callers refuse to enforce the local fallback as if the gate said it.
+async function ensureGateCap() {
+  if (!gateCapKnown) await refreshGateInfo();
+  return gateCapKnown;
+}
+
+// ── Whitelist mode UI (banner + upload gating + admin tab reveal) ────────────
+// gateWhitelistMode is public knowledge (GET /); myWhitelisted/myFeeExempt/
+// myIsAdmin arrive with the signed /uploads/by-user response and stay null/
+// false until it lands. applyWhitelistIdentity() is re-run after both.
+
+function renderWhitelistBanner() {
+  const el = document.getElementById('whitelist-banner');
+  if (!el) return;
+  if (!gateWhitelistMode) { el.style.display = 'none'; el.innerHTML = ''; return; }
+  el.style.display = 'block';
+  if (myWhitelisted === false) {
+    el.innerHTML = '🔒 <b>This server is invite-only</b> — your account is not whitelisted, so uploads are disabled. Ask the operator for access.';
+    el.style.color = 'var(--danger)';
+  } else if (myWhitelisted === true) {
+    el.innerHTML = '🔒 Invite-only server — you\'re whitelisted' + (myFeeExempt ? ' · <b>✓ fee-exempt (uploads are free)</b>' : '') + '.';
+    el.style.color = '';
+  } else {
+    el.innerHTML = '🔒 This server is <b>invite-only</b> — only whitelisted Hive accounts can upload.';
+    el.style.color = '';
+  }
+}
+
+function applyWhitelistIdentity() {
+  renderWhitelistBanner();
+  // Block the two upload actions when we KNOW the account isn't whitelisted
+  // (better than letting the user encrypt/pick recipients and then hit a 403).
+  const blocked = gateWhitelistMode && myWhitelisted === false;
+  const privBtn = document.getElementById('priv-send-btn');
+  const pubBtn = document.getElementById('pub-upload-btn');
+  if (privBtn) { privBtn.disabled = blocked; privBtn.title = blocked ? 'not whitelisted on this gate' : ''; }
+  if (pubBtn) { pubBtn.disabled = blocked; pubBtn.title = blocked ? 'not whitelisted on this gate' : ''; }
+  // Reveal the Admin tab for roster admins (hide again on logout/account swap).
+  const adminBtn = document.getElementById('admin-tab-btn');
+  if (adminBtn) adminBtn.style.display = myIsAdmin ? '' : 'none';
+  refreshPrivEstimate();
+  refreshPubEstimate();
+}
+
+// ══════════════════════════════════════════════════════════════
+// Tabs
+// ══════════════════════════════════════════════════════════════
+function showTab(id) {
+  document.querySelectorAll('.tab-panel').forEach(p => p.classList.toggle('shown', p.id === id));
+  document.querySelectorAll('nav.tabs button').forEach(b => b.classList.toggle('active', b.dataset.tab === id));
+  if (id === 'tab-uploads') { loadUploadsList(); loadGuardianPledges(); }
+  if (id === 'tab-admin') loadAdminWhitelist();
+}
+
+// ══════════════════════════════════════════════════════════════
+// My Uploads (GET /uploads/by-user + POST /uploads/delete)
+// ══════════════════════════════════════════════════════════════
+// Cache the list signature for 240s (gate freshness window is ±300s) so
+// Refresh doesn't pop Keychain every time. Delete always fresh-signs.
+let _uplListSig = null;
+
+async function getListRequestSig() {
+  if (_uplListSig && _uplListSig.account === myUsername
+      && (Date.now() - _uplListSig.signedAt) < 240000) {
+    return _uplListSig;
+  }
+  const ts = Math.floor(Date.now() / 1000);
+  const msg = `ipfs-gate:list-uploads:v1:${myUsername}:${ts}`;
+  const sig = await signRaw(msg);
+  if (!sig) throw new Error('could not sign the request (Keychain declined, or unlock your key first)');
+  _uplListSig = { ts, sig, pubkey: myPubKey, account: myUsername, signedAt: Date.now() };
+  return _uplListSig;
+}
+
+async function loadUploadsList(forceResign) {
+  const listEl = document.getElementById('uploads-list');
+  if (!listEl) return;
+  if (!myUsername) { listEl.innerHTML = '<div class="uploads-status">Log in first.</div>'; return; }
+  if (forceResign) _uplListSig = null;
+  const gw = getGateway();
+  listEl.innerHTML = `<div class="uploads-status">… loading your uploads from ${escapeHtml(gw)}</div>`;
+  let s;
+  try { s = await getListRequestSig(); }
+  catch (e) { listEl.innerHTML = `<div class="uploads-status">⚠ ${escapeHtml(e.message)}</div>`; return; }
+  const qs = `hive_account=${encodeURIComponent(myUsername)}&ts=${s.ts}`
+           + `&pubkey=${encodeURIComponent(s.pubkey)}&sig=${encodeURIComponent(s.sig)}`;
+  let resp;
+  try {
+    resp = await fetch(`${gw}/uploads/by-user?${qs}`, { method: 'GET' });
+  } catch (e) {
+    listEl.innerHTML = `<div class="uploads-status">⚠ could not reach the gate at ${escapeHtml(gw)}. Check the Gate URL above.</div>`;
+    return;
+  }
+  if (resp.status === 401) { _uplListSig = null; listEl.innerHTML = '<div class="uploads-status">⚠ the gate rejected your signature (401). Hit Refresh to re-sign.</div>'; return; }
+  if (resp.status === 422) { _uplListSig = null; listEl.innerHTML = '<div class="uploads-status">⚠ the gate could not verify your Hive identity right now (422 — a Hive node was unreachable). Try Refresh in a moment.</div>'; return; }
+  if (resp.status === 429) { listEl.innerHTML = '<div class="uploads-status">⚠ too many requests (429). Wait a minute, then Refresh.</div>'; return; }
+  if (!resp.ok) { listEl.innerHTML = `<div class="uploads-status">⚠ gate error (${resp.status}).</div>`; return; }
+  let data;
+  try { data = await resp.json(); }
+  catch (e) { listEl.innerHTML = '<div class="uploads-status">⚠ bad response from the gate.</div>'; return; }
+  renderUploadsList(data, gw, getCtxMap());
+}
+
+function renderUploadsList(data, gw, ctx) {
+  ctx = ctx || {};
+  const listEl = document.getElementById('uploads-list');
+  const mineEl = document.getElementById('uploads-quota-mine');
+  const sharedEl = document.getElementById('uploads-quota-shared');
+  const uploads = Array.isArray(data.uploads) ? data.uploads : [];
+
+  const active = uploads.filter(u => u.status === 'active');
+  const yourBytes = active.reduce((sum, u) => sum + (u.size_bytes || 0), 0);
+  mineEl.textContent = `Your uploads: ${bytesToHuman(yourBytes)} across ${active.length} file${active.length === 1 ? '' : 's'}`;
+
+  const q = data.quota || {};
+  // Whitelist-mode identity rides on this signed response (design §7) —
+  // capture it, then re-apply the banner / upload gating / admin-tab state.
+  myWhitelisted = (typeof q.whitelisted === 'boolean') ? q.whitelisted : null;
+  myFeeExempt = !!q.fee_exempt;
+  myIsAdmin = !!data.is_admin;
+  applyWhitelistIdentity();
+
+  sharedEl.textContent = q.limit_bytes
+    ? (q.quota_scope === 'per_account'
+        ? `Your quota: ${bytesToHuman(q.used_bytes || 0)} of ${bytesToHuman(q.limit_bytes)} (per-account cap on this gate)`
+        : `Gate storage: ${bytesToHuman(q.used_bytes || 0)} of ${bytesToHuman(q.limit_bytes)} used (shared across all users)`)
+    : '';
+
+  if (uploads.length === 0) {
+    listEl.innerHTML = '<div class="uploads-empty">No uploads yet. Use 🔒 Private Send or 🌐 Public Upload to put a file on the gate.</div>';
+    return;
+  }
+  uploads.sort((a, b) => new Date(b.uploaded_at || 0) - new Date(a.uploaded_at || 0));
+  listEl.innerHTML = '';
+  uploads.forEach(u => listEl.appendChild(buildUploadRow(u, gw, ctx[u.cid])));
+}
+
+function buildUploadRow(u, gw, ctx) {
+  const row = document.createElement('div');
+  const isActive = u.status === 'active';
+  row.className = 'upl-row' + (isActive ? '' : ' inactive');
+  row.dataset.cid = u.cid;
+
+  const isPublic = u.mode === 'public';
+  let kind, icon, name;
+  if (isPublic) {
+    kind = u.mime ? mimeToKind(u.mime) : null;
+    icon = attachKindIcon(kind);
+    name = (ctx && ctx.filename) || (u.mime ? `${u.mime} file` : 'public upload');
+  } else if (ctx && (ctx.filename || ctx.kind)) {
+    kind = ctx.kind || (ctx.mime ? mimeToKind(ctx.mime) : null);
+    icon = attachKindIcon(kind);
+    name = ctx.filename || 'encrypted upload';
+  } else {
+    icon = '🔒';
+    name = 'encrypted upload';
+  }
+
+  const statusCls = u.status === 'active' ? 'active'
+                  : u.status === 'expired' ? 'expired'
+                  : 'removed';
+  const statusTxt = u.status === 'active'   ? (u.expires_at ? 'expires in ' + (timeUntilExpiry(u.expires_at) || '?') : 'permanent · until unpinned')
+                  : u.status === 'expired'  ? 'expired'
+                  : u.status === 'banned'   ? 'removed (banned)'
+                  : u.status === 'takedown' ? 'removed by operator'
+                  : u.status === 'refunded' ? 'refunded'
+                  : (u.status || 'unknown');
+
+  let uploadedTxt = '';
+  try { uploadedTxt = u.uploaded_at ? new Date(u.uploaded_at).toLocaleString() : ''; } catch (_) {}
+
+  const kindLabel = u.kind === 'own_copy' ? 'own copy' : u.kind === 'guardian' ? 'guardian' : u.kind === 'original' ? 'original' : null;
+  const g = u.guardians;
+  const guardianLine = (g && (g.queue_depth > 0 || g.co_hosts > 0))
+    ? `<div class="upl-ctx">🛡 ${g.queue_depth} guardian(s) pledged (${g.pledged_hours_total}h)${g.co_hosts > 0 ? ` · ${g.co_hosts} co-host(s)` : ''}</div>`
+    : '';
+
+  row.innerHTML = `
+    <div class="upl-top">
+      <span class="upl-icon">${icon}</span>
+      <span class="upl-name">${escapeHtml(name)}</span>
+      <span class="upl-mode ${isPublic ? 'public' : 'encrypted'}">${isPublic ? 'public' : 'encrypted'}</span>
+      ${kindLabel ? `<span class="upl-mode">${escapeHtml(kindLabel)}</span>` : ''}
+    </div>
+    <div class="upl-meta">
+      <span>${bytesToHuman(u.size_bytes || 0)}</span>
+      <span title="${escapeHtml(u.cid)}">cid:${escapeHtml(String(u.cid).slice(0, 12))}…</span>
+      ${uploadedTxt ? `<span>↑ ${escapeHtml(uploadedTxt)}</span>` : ''}
+      <span class="upl-status ${statusCls}">${escapeHtml(statusTxt)}</span>
+    </div>
+    ${guardianLine}
+    ${ctx && ctx.context ? `<div class="upl-ctx">${escapeHtml(ctx.context)}</div>` : ''}
+    ${isPublic && u.public_url ? `<div class="upl-actions"><span class="upl-publink">${escapeHtml(u.public_url)}</span><button class="upl-btn" data-act="copy">📋 Copy link</button><button class="upl-btn" data-act="open">↗ Open</button></div>` : ''}
+    <div class="upl-actions upl-action-bar"></div>
+  `;
+
+  row.querySelectorAll('[data-act]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const act = btn.getAttribute('data-act');
+      if (act === 'copy') {
+        navigator.clipboard?.writeText(u.public_url).then(() => {
+          btn.textContent = '✓ Copied';
+          setTimeout(() => { btn.textContent = '📋 Copy link'; }, 1500);
+        });
+      } else if (act === 'open') {
+        window.open(u.public_url, '_blank', 'noopener');
+      }
+    });
+  });
+  resetUploadActionBar(row, u, gw);
+  return row;
+}
+
+// Default action bar for an upload row — extend (claim-model pins only; a
+// legacy pin has no claim_id and can only be re-uploaded) + delete. Shared by
+// buildUploadRow and every prompt's Cancel path so the buttons never get lost.
+function resetUploadActionBar(row, u, gw) {
+  const bar = row.querySelector('.upl-action-bar');
+  if (!bar) return;
+  if (u.status !== 'active') { bar.innerHTML = ''; return; }
+  bar.innerHTML = `
+    ${u.claim_id ? '<button class="upl-btn" data-act="extend">⏳ Extend</button>' : ''}
+    <button class="upl-btn danger" data-act="delete">🗑 Delete / unpin</button>`;
+  const ext = bar.querySelector('[data-act="extend"]');
+  if (ext) ext.addEventListener('click', () => promptExtendClaim(row, u.claim_id, gw, {
+    resetBar: () => resetUploadActionBar(row, u, gw),
+    refresh: () => loadUploadsList()
+  }));
+  bar.querySelector('[data-act="delete"]').addEventListener('click', () => promptDeleteUpload(row, u, gw));
+}
+
+function promptDeleteUpload(row, u, gw) {
+  const bar = row.querySelector('.upl-action-bar');
+  if (!bar) return;
+  const warn = u.mode === 'public'
+    ? 'Unpin this? Anyone with the link gets a 404 afterwards.'
+    : "Unpin this? Recipients won't be able to fetch it anymore.";
+  bar.innerHTML = `<span class="upl-confirm">${escapeHtml(warn)}
+      <button class="upl-btn danger" data-c="yes">Confirm</button>
+      <button class="upl-btn" data-c="no">Cancel</button></span>`;
+  bar.querySelector('[data-c="no"]').addEventListener('click', () => resetUploadActionBar(row, u, gw));
+  bar.querySelector('[data-c="yes"]').addEventListener('click', () => deleteUpload(row, u, gw));
+}
+
+// ── Extend / top-up (cohosting §8 — the gate bills at the claim's LOCKED rate,
+// never the live rate). Generic over any active claim the user owns: used by
+// the My-Uploads rows and by an ACTIVATED guardian claim in the pledges card.
+// A quote of 0 means the claim was created fee-exempt (rate_locked 0) — the
+// gate then accepts the extend with no payment at all (Stage B), so Keychain
+// is skipped exactly like the upload flows.
+function promptExtendClaim(row, claimId, gw, opts) {
+  const bar = row.querySelector('.upl-action-bar');
+  if (!bar) return;
+  bar.innerHTML = `<span class="upl-confirm">Extend by
+      <input type="number" min="1" value="${gateDefaultHours}" style="width:80px;" data-ext-hours> h
+      <button class="upl-btn" data-e="quote">Get quote</button>
+      <button class="upl-btn" data-e="no">Cancel</button></span>`;
+  bar.querySelector('[data-e="no"]').addEventListener('click', opts.resetBar);
+  bar.querySelector('[data-e="quote"]').addEventListener('click', async () => {
+    const hours = Math.max(1, parseInt(bar.querySelector('[data-ext-hours]').value) || 1);
+    bar.innerHTML = '<span class="upl-confirm">… fetching quote</span>';
+    let q;
+    try {
+      const qRes = await fetch(`${gw}/claims/extend/quote?claim_id=${encodeURIComponent(claimId)}&hours=${hours}`);
+      q = await qRes.json().catch(() => ({}));
+      if (!qRes.ok) throw new Error(q.message || `quote failed (${qRes.status})`);
+    } catch (e) {
+      bar.innerHTML = `<span class="upl-confirm">⚠ ${escapeHtml(e.message)} <button class="upl-btn" data-e="back">OK</button></span>`;
+      bar.querySelector('[data-e="back"]').addEventListener('click', opts.resetBar);
+      return;
+    }
+    const free = Number(q.quote.total) === 0;
+    bar.innerHTML = `<span class="upl-confirm">${free
+        ? `Free (fee-exempt) — add ${q.quote.extra_hrs} h?`
+        : `${escapeHtml(String(q.quote.total))} ${escapeHtml(q.quote.currency || '')} for ${q.quote.extra_hrs} h more (locked rate).`}
+        <button class="upl-btn" data-e="go">${free ? '⏳ Extend free' : '⏳ Pay & extend'}</button>
+        <button class="upl-btn" data-e="no">Cancel</button></span>`;
+    bar.querySelector('[data-e="no"]').addEventListener('click', opts.resetBar);
+    bar.querySelector('[data-e="go"]').addEventListener('click', () => executeExtendClaim(bar, claimId, gw, q, opts));
+  });
+}
+
+async function executeExtendClaim(bar, claimId, gw, q, opts) {
+  try {
+    let txId = null;
+    if (Number(q.quote.total) > 0) {
+      bar.innerHTML = '<span class="upl-confirm">… paying (Keychain)</span>';
+      txId = await keychainTransferGateToken({
+        to: q.payment.escrow_account, amount: q.payment.amount,
+        memo: q.payment.memo, symbol: q.payment.currency
+      });
+      if (!txId) { bar.innerHTML = '<span class="upl-confirm">⚠ payment cancelled</span>'; setTimeout(opts.resetBar, 1500); return; }
+      bar.innerHTML = '<span class="upl-confirm">… waiting for tx to index (3s)</span>';
+      await new Promise(r => setTimeout(r, 3000));
+    }
+    bar.innerHTML = '<span class="upl-confirm">… extending</span>';
+    const resp = await fetch(`${gw}/claims/extend`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ claim_id: claimId, extra_hours: q.quote.extra_hrs, ...(txId ? { tx_id: txId } : {}) })
+    });
+    const j = await resp.json().catch(() => ({}));
+    if (!resp.ok) {
+      bar.innerHTML = `<span class="upl-confirm">⚠ extend failed: ${escapeHtml(j.message || String(resp.status))}${txId ? ` — payment tx ${escapeHtml(txId)} may need operator review (orphan-payments).` : ''}</span>`;
+      return;
+    }
+    const until = j.expires_at ? new Date(j.expires_at).toLocaleString() : '?';
+    bar.innerHTML = `<span class="upl-confirm" style="color:var(--green);">✓ +${j.added_hours} h — hosted until ${escapeHtml(until)}</span>`;
+    if (opts.refresh) setTimeout(opts.refresh, 1500);
+  } catch (e) {
+    bar.innerHTML = `<span class="upl-confirm">⚠ ${escapeHtml(e.message)}</span>`;
+  }
+}
+
+async function deleteUpload(row, u, gw) {
+  const bar = row.querySelector('.upl-action-bar');
+  if (bar) bar.innerHTML = '<span class="upl-confirm">… unpinning</span>';
+  const ts = Math.floor(Date.now() / 1000);
+  const msg = `ipfs-gate:delete-pin:v1:${u.cid}:${myUsername}:${ts}`;
+  let sig = '';
+  try { sig = await signRaw(msg); } catch (_) {}
+  if (!sig) { if (bar) bar.innerHTML = '<span class="upl-confirm">⚠ signing declined</span>'; return; }
+  let resp;
+  try {
+    resp = await fetch(`${gw}/uploads/delete`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ cid: u.cid, hive_account: myUsername, ts, pubkey: myPubKey, sig })
+    });
+  } catch (e) {
+    if (bar) bar.innerHTML = '<span class="upl-confirm">⚠ could not reach the gate</span>';
+    return;
+  }
+  if (resp.status === 404) { markRowRemoved(row, true); return; }
+  if (!resp.ok) { if (bar) bar.innerHTML = `<span class="upl-confirm">⚠ delete failed (${resp.status})</span>`; return; }
+  let j = {};
+  try { j = await resp.json(); } catch (_) {}
+  markRowRemoved(row, j.fully_unpinned);
+  loadUploadsList();
+}
+
+function markRowRemoved(row, fullyUnpinned) {
+  row.classList.add('inactive');
+  const bar = row.querySelector('.upl-action-bar');
+  if (bar) bar.innerHTML = `<span class="upl-confirm" style="color:var(--green);">✓ unpinned${fullyUnpinned === false ? ' (other copies remain)' : ''}</span>`;
+}
+
+// ══════════════════════════════════════════════════════════════
+// My Guardian Pledges (kind='guardian' claims this account holds on OTHERS'
+// files — dormant pledges never show up in "My Uploads" since they hold no
+// pins row until activated. Mirrors the uploads-list machinery above.)
+// ══════════════════════════════════════════════════════════════
+let _claimsListSig = null;
+
+async function getClaimsRequestSig() {
+  if (_claimsListSig && _claimsListSig.account === myUsername
+      && (Date.now() - _claimsListSig.signedAt) < 240000) {
+    return _claimsListSig;
+  }
+  const ts = Math.floor(Date.now() / 1000);
+  const msg = `ipfs-gate:list-claims:v1:${myUsername}:${ts}`;
+  const sig = await signRaw(msg);
+  if (!sig) throw new Error('could not sign the request (Keychain declined, or unlock your key first)');
+  _claimsListSig = { ts, sig, pubkey: myPubKey, account: myUsername, signedAt: Date.now() };
+  return _claimsListSig;
+}
+
+async function loadGuardianPledges(forceResign) {
+  const listEl = document.getElementById('guardian-pledges-list');
+  if (!listEl) return;
+  if (!myUsername) { listEl.innerHTML = '<div class="uploads-status">Log in first.</div>'; return; }
+  if (forceResign) _claimsListSig = null;
+  const gw = getGateway();
+  listEl.innerHTML = `<div class="uploads-status">… loading your guardian pledges from ${escapeHtml(gw)}</div>`;
+  let s;
+  try { s = await getClaimsRequestSig(); }
+  catch (e) { listEl.innerHTML = `<div class="uploads-status">⚠ ${escapeHtml(e.message)}</div>`; return; }
+  const qs = `hive_account=${encodeURIComponent(myUsername)}&ts=${s.ts}`
+           + `&pubkey=${encodeURIComponent(s.pubkey)}&sig=${encodeURIComponent(s.sig)}`;
+  let resp;
+  try {
+    resp = await fetch(`${gw}/claims/mine?${qs}`, { method: 'GET' });
+  } catch (e) {
+    listEl.innerHTML = `<div class="uploads-status">⚠ could not reach the gate at ${escapeHtml(gw)}. Check the Gate URL above.</div>`;
+    return;
+  }
+  if (resp.status === 401) { _claimsListSig = null; listEl.innerHTML = '<div class="uploads-status">⚠ the gate rejected your signature (401). Hit Refresh to re-sign.</div>'; return; }
+  if (resp.status === 422) { _claimsListSig = null; listEl.innerHTML = '<div class="uploads-status">⚠ the gate could not verify your Hive identity right now (422 — a Hive node was unreachable). Try Refresh in a moment.</div>'; return; }
+  if (resp.status === 429) { listEl.innerHTML = '<div class="uploads-status">⚠ too many requests (429). Wait a minute, then Refresh.</div>'; return; }
+  if (!resp.ok) { listEl.innerHTML = `<div class="uploads-status">⚠ gate error (${resp.status}).</div>`; return; }
+  let data;
+  try { data = await resp.json(); }
+  catch (e) { listEl.innerHTML = '<div class="uploads-status">⚠ bad response from the gate.</div>'; return; }
+  renderGuardianPledges(data, gw);
+}
+
+function renderGuardianPledges(data, gw) {
+  const listEl = document.getElementById('guardian-pledges-list');
+  const claims = (Array.isArray(data.claims) ? data.claims : []).filter(c => c.kind === 'guardian');
+  if (claims.length === 0) {
+    listEl.innerHTML = '<div class="uploads-empty">No guardian pledges yet. Use 🛡 Become a Guardian on an already-hosted file (Public Upload tab) to back someone else\'s content.</div>';
+    return;
+  }
+  claims.sort((a, b) => new Date(b.created_ts || 0) - new Date(a.created_ts || 0));
+  listEl.innerHTML = '';
+  claims.forEach(c => listEl.appendChild(buildGuardianPledgeRow(c, gw)));
+}
+
+function buildGuardianPledgeRow(c, gw) {
+  const row = document.createElement('div');
+  row.className = 'upl-row' + (c.state === 'dormant' || c.state === 'active' ? '' : ' inactive');
+  row.dataset.claimId = c.claim_id;
+
+  const stateTxt = c.state === 'dormant' ? '🕓 pledged, waiting'
+                 : c.state === 'active'  ? '🛡 currently hosting'
+                 : c.state === 'cancelled' ? 'cancelled'
+                 : c.state === 'expired' ? 'expired'
+                 : (c.state || 'unknown');
+  const expiryTxt = c.state === 'dormant' ? 'not started' : (c.expiry_ts ? new Date(c.expiry_ts).toLocaleString() : '?');
+
+  row.innerHTML = `
+    <div class="upl-top">
+      <span class="upl-icon">🛡</span>
+      <span class="upl-name" title="${escapeHtml(c.cid)}">cid:${escapeHtml(String(c.cid).slice(0, 12))}…</span>
+      <span class="upl-mode">${escapeHtml(stateTxt)}</span>
+    </div>
+    <div class="upl-meta">
+      <span>#${escapeHtml(String(c.pledge_order ?? '?'))} in queue</span>
+      <span>pledged ${escapeHtml(String(c.paid_hours))}h (budget ${escapeHtml(String(c.pledge_budget ?? c.amount_paid))} ${escapeHtml(c.currency || '')})</span>
+      <span>${c.state === 'dormant' ? 'starts if promoted' : 'until'}: ${escapeHtml(expiryTxt)}</span>
+    </div>
+    <div class="upl-actions upl-action-bar">
+      ${c.state === 'dormant' ? '<button class="upl-btn danger" data-act="cancel">✕ Cancel pledge</button>'
+        : c.state === 'active' ? '<button class="upl-btn" data-act="extend">⏳ Extend</button>' : ''}
+    </div>
+  `;
+
+  const cancelBtn = row.querySelector('[data-act="cancel"]');
+  if (cancelBtn) cancelBtn.addEventListener('click', () => promptCancelPledge(row, c, gw));
+  // An ACTIVATED guardian is now the live host — extending its claim extends
+  // the file's hosting, same endpoint as any other active claim.
+  const extendBtn = row.querySelector('[data-act="extend"]');
+  if (extendBtn) {
+    const extOpts = {
+      resetBar: () => {
+        const bar = row.querySelector('.upl-action-bar');
+        if (!bar) return;
+        bar.innerHTML = '<button class="upl-btn" data-act="extend">⏳ Extend</button>';
+        bar.querySelector('[data-act="extend"]').addEventListener('click', () => promptExtendClaim(row, c.claim_id, gw, extOpts));
+      },
+      refresh: () => loadGuardianPledges()
+    };
+    extendBtn.addEventListener('click', () => promptExtendClaim(row, c.claim_id, gw, extOpts));
+  }
+  return row;
+}
+
+function promptCancelPledge(row, c, gw) {
+  const bar = row.querySelector('.upl-action-bar');
+  if (!bar) return;
+  bar.innerHTML = `<span class="upl-confirm">Cancel this pledge? Dormant pledges refund in full.
+      <button class="upl-btn danger" data-c="yes">Confirm</button>
+      <button class="upl-btn" data-c="no">Cancel</button></span>`;
+  bar.querySelector('[data-c="no"]').addEventListener('click', () => {
+    bar.innerHTML = '<button class="upl-btn danger" data-act="cancel">✕ Cancel pledge</button>';
+    bar.querySelector('[data-act="cancel"]').addEventListener('click', () => promptCancelPledge(row, c, gw));
+  });
+  bar.querySelector('[data-c="yes"]').addEventListener('click', () => cancelPledge(row, c, gw));
+}
+
+async function cancelPledge(row, c, gw) {
+  const bar = row.querySelector('.upl-action-bar');
+  if (bar) bar.innerHTML = '<span class="upl-confirm">… cancelling</span>';
+  const ts = Math.floor(Date.now() / 1000);
+  const msg = `ipfs-gate:cancel-claim:v1:${c.claim_id}:${myUsername}:${ts}`;
+  let sig = '';
+  try { sig = await signRaw(msg); } catch (_) {}
+  if (!sig) { if (bar) bar.innerHTML = '<span class="upl-confirm">⚠ signing declined</span>'; return; }
+  let resp;
+  try {
+    resp = await fetch(`${gw}/claims/cancel`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ claim_id: c.claim_id, hive_account: myUsername, ts, pubkey: myPubKey, sig })
+    });
+  } catch (e) {
+    if (bar) bar.innerHTML = '<span class="upl-confirm">⚠ could not reach the gate</span>';
+    return;
+  }
+  if (!resp.ok) { const j = await resp.json().catch(() => ({})); if (bar) bar.innerHTML = `<span class="upl-confirm">⚠ cancel failed (${j.message || resp.status})</span>`; return; }
+  row.classList.add('inactive');
+  if (bar) bar.innerHTML = '<span class="upl-confirm" style="color:var(--green);">✓ cancelled — refunded in full</span>';
+  loadGuardianPledges();
+}
+
+// ══════════════════════════════════════════════════════════════
+// Admin tab (Hive-tier server admin — WHITELIST-MODE-DESIGN-NOTES.md §5/§8)
+// Every action signs ipfs-gate:admin-action:v1:<action>:<target>:<me>:<ts>
+// with the posting key. The message binds action+target, so each call signs
+// fresh (no sig caching — admin actions are infrequent, replay-safety wins).
+// ══════════════════════════════════════════════════════════════
+function setAdmWlStatus(text, isErr) {
+  const n = document.getElementById('adm-wl-status');
+  if (n) { n.textContent = text || ''; n.className = 'status' + (isErr ? ' err' : ''); }
+}
+function setAdmModStatus(text, isErr) {
+  const n = document.getElementById('adm-mod-status');
+  if (n) { n.textContent = text || ''; n.className = 'status' + (isErr ? ' err' : ''); }
+}
+
+async function signAdminAction(action, target) {
+  const ts = Math.floor(Date.now() / 1000);
+  const msg = `ipfs-gate:admin-action:v1:${action}:${target}:${myUsername}:${ts}`;
+  const sig = await signRaw(msg);
+  if (!sig) throw new Error('signing declined');
+  return { admin_account: myUsername, admin_ts: ts, admin_pubkey: myPubKey, admin_sig: sig };
+}
+
+async function adminPost(path, action, target, body) {
+  const auth = await signAdminAction(action, target);
+  const resp = await fetch(`${getGateway()}${path}`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ ...body, ...auth })
+  });
+  const j = await resp.json().catch(() => ({}));
+  if (!resp.ok) throw new Error(j.message || `failed (${resp.status})`);
+  return j;
+}
+
+async function loadAdminWhitelist() {
+  const listEl = document.getElementById('adm-wl-list');
+  if (!listEl) return;
+  listEl.innerHTML = '<div class="uploads-status">… loading</div>';
+  let auth;
+  try { auth = await signAdminAction('whitelist-list', 'all'); }
+  catch (e) { listEl.innerHTML = `<div class="uploads-status">⚠ ${escapeHtml(e.message)}</div>`; return; }
+  const qs = `admin_account=${encodeURIComponent(auth.admin_account)}&admin_ts=${auth.admin_ts}`
+           + `&admin_pubkey=${encodeURIComponent(auth.admin_pubkey)}&admin_sig=${encodeURIComponent(auth.admin_sig)}`;
+  let resp;
+  try { resp = await fetch(`${getGateway()}/admin/whitelist?${qs}`); }
+  catch (e) { listEl.innerHTML = '<div class="uploads-status">⚠ could not reach the gate.</div>'; return; }
+  const j = await resp.json().catch(() => ({}));
+  if (!resp.ok) { listEl.innerHTML = `<div class="uploads-status">⚠ ${escapeHtml(j.message || String(resp.status))}</div>`; return; }
+  renderAdminWhitelist(j);
+}
+
+function renderAdminWhitelist(data) {
+  const listEl = document.getElementById('adm-wl-list');
+  const entries = Array.isArray(data.whitelist) ? data.whitelist : [];
+  if (!data.whitelist_mode) {
+    setAdmWlStatus('⚠ WHITELIST_MODE is OFF on this gate — the list below is stored but not enforced.', true);
+  }
+  if (entries.length === 0) {
+    listEl.innerHTML = '<div class="uploads-empty">Nobody whitelisted yet.</div>';
+    return;
+  }
+  listEl.innerHTML = '';
+  entries.forEach(w => {
+    const row = document.createElement('div');
+    row.className = 'upl-row';
+    const quotaTxt = w.quota_bytes != null ? bytesToHuman(w.quota_bytes) : '∞';
+    row.innerHTML = `
+      <div class="upl-top">
+        <span class="upl-name">@${escapeHtml(w.hive_account)}</span>
+        ${w.fee_exempt ? '<span class="upl-mode">fee-exempt</span>' : ''}
+      </div>
+      <div class="upl-meta">
+        <span>quota: ${escapeHtml(quotaTxt)}</span>
+        <span>added by ${escapeHtml(w.added_by || '?')}</span>
+        ${w.note ? `<span>${escapeHtml(w.note)}</span>` : ''}
+      </div>
+      <div class="upl-actions"><button class="upl-btn danger" data-wl-rm="${escapeHtml(w.hive_account)}">✕ Remove</button></div>`;
+    row.querySelector('[data-wl-rm]').addEventListener('click', () => adminWhitelistRemove(w.hive_account));
+    listEl.appendChild(row);
+  });
+}
+
+async function adminWhitelistAdd() {
+  const account = (document.getElementById('adm-wl-account').value || '').trim().replace(/^@+/, '').toLowerCase();
+  if (!account) { setAdmWlStatus('⚠ enter a hive account', true); return; }
+  const gbRaw = document.getElementById('adm-wl-quota-gb').value;
+  const quota_bytes = gbRaw === '' ? null : Math.round(parseFloat(gbRaw) * 1e9);
+  const fee_exempt = document.getElementById('adm-wl-exempt').checked;
+  try {
+    setAdmWlStatus('Signing + adding…');
+    await adminPost('/admin/whitelist/add', 'whitelist-add', account, { target_account: account, quota_bytes, fee_exempt });
+    setAdmWlStatus(`✓ @${account} whitelisted${fee_exempt ? ' (fee-exempt)' : ''}${quota_bytes != null ? ` · ${bytesToHuman(quota_bytes)} quota` : ''}.`);
+    document.getElementById('adm-wl-account').value = '';
+    loadAdminWhitelist();
+  } catch (e) { setAdmWlStatus('⚠ ' + e.message, true); }
+}
+
+async function adminWhitelistRemove(account) {
+  try {
+    setAdmWlStatus(`Signing + removing @${account}…`);
+    await adminPost('/admin/whitelist/remove', 'whitelist-remove', account, { target_account: account });
+    setAdmWlStatus(`✓ @${account} removed — existing uploads stay (use Ban to end them).`);
+    loadAdminWhitelist();
+  } catch (e) { setAdmWlStatus('⚠ ' + e.message, true); }
+}
+
+async function adminBan() {
+  const account = (document.getElementById('adm-ban-account').value || '').trim().replace(/^@+/, '').toLowerCase();
+  const reason = (document.getElementById('adm-ban-reason').value || '').trim();
+  const refund_policy = document.getElementById('adm-ban-policy').value;
+  if (!account || !reason) { setAdmModStatus('⚠ account + reason required', true); return; }
+  try {
+    setAdmModStatus('Signing + banning…');
+    const j = await adminPost('/admin/ban', 'ban', account, { hive_account: account, reason, refund_policy });
+    setAdmModStatus(`✓ @${account} banned — ${j.claims_voided} claim(s) voided, ${j.guardians_activated} guardian(s) promoted.`);
+  } catch (e) { setAdmModStatus('⚠ ' + e.message, true); }
+}
+
+async function adminUnban() {
+  const account = (document.getElementById('adm-ban-account').value || '').trim().replace(/^@+/, '').toLowerCase();
+  if (!account) { setAdmModStatus('⚠ enter the account to unban', true); return; }
+  try {
+    setAdmModStatus('Signing + unbanning…');
+    await adminPost('/admin/unban', 'unban', account, { hive_account: account });
+    setAdmModStatus(`✓ @${account} unbanned.`);
+  } catch (e) { setAdmModStatus('⚠ ' + e.message, true); }
+}
+
+async function adminTakedown() {
+  const cid = (document.getElementById('adm-td-cid').value || '').trim();
+  const reason = (document.getElementById('adm-td-reason').value || '').trim();
+  if (!cid || !reason) { setAdmModStatus('⚠ cid + reason required', true); return; }
+  try {
+    setAdmModStatus('Signing + taking down…');
+    const j = await adminPost('/admin/takedown', 'takedown', cid, { cid, reason });
+    setAdmModStatus(`✓ CID taken down — ${j.claims_voided} claim(s) voided, ${j.guardians_refunded} innocent guardian(s) refunded.`);
+  } catch (e) { setAdmModStatus('⚠ ' + e.message, true); }
+}
+
+async function adminPinDelete() {
+  const cid = (document.getElementById('adm-pd-cid').value || '').trim();
+  const account = (document.getElementById('adm-pd-account').value || '').trim().replace(/^@+/, '').toLowerCase();
+  if (!cid || !account) { setAdmModStatus('⚠ cid + account required', true); return; }
+  try {
+    setAdmModStatus('Signing + deleting pin…');
+    const j = await adminPost('/admin/pins/delete', 'pin-delete', `${cid}:${account}`, { target_account: account, cid });
+    setAdmModStatus(`✓ ${j.claims_cancelled} claim(s) ended for @${account} on that CID${j.fully_unpinned ? ' — file unpinned' : ' — other hosts remain'}.`);
+  } catch (e) { setAdmModStatus('⚠ ' + e.message, true); }
+}
+
+// ══════════════════════════════════════════════════════════════
+// Private Send (encrypt-to-people, pay-to-host, v4reveal link)
+// ══════════════════════════════════════════════════════════════
+let privSendState = { file: null, recipients: new Set() };
+let privPendingEnv = null; // unsigned envelope stashed if the final sign is declined (no re-pay on retry)
+
+function privSigInput(env) {
+  const recips = Object.keys(env.per_recipient || {}).map(s => s.toLowerCase()).sort().join(',');
+  const addrs = ((env.release_policy && env.release_policy.addresses) || []).map(s => s.toLowerCase()).sort().join(',');
+  const ptype = (env.release_policy && env.release_policy.type) || 'owner_only';
+  return `v4call-reveal:v1:${env.cid}|${env.size_bytes}|${env.sender}|${env.created_at}|${env.expires_at}|${env.kind_hint}|${env.commitment}|${ptype}:${addrs}|${recips}`;
+}
+async function verifyPrivEnvelopeSig(env) {
+  try {
+    if (!env.envelope_sig || !env.sender) return null;
+    const pubKeyStr = await fetchPubKey(env.sender);
+    if (!pubKeyStr) return null;
+    const message = privSigInput(env);
+    if (!dhive.Signature || typeof dhive.Signature.fromString !== 'function') return null;
+    const sig = dhive.Signature.fromString(env.envelope_sig);
+    const recovered = sig.recover(dhive.cryptoUtils.sha256(message));
+    return recovered.toString() === pubKeyStr;
+  } catch (e) { console.warn('[private] envelope sig verify failed:', e.message); return null; }
+}
+function buildRevealArtifact(env) { return 'v4reveal:' + b64urlEncode(JSON.stringify(env)); }
+
+function setPrivStatus(text, isErr) {
+  const n = document.getElementById('priv-status-note');
+  n.textContent = text;
+  n.className = 'status' + (isErr ? ' err' : '');
+}
+function onPrivFilePick() {
+  const f = (document.getElementById('priv-file-input').files || [])[0];
+  privSendState.file = f || null;
+  const meta = document.getElementById('priv-file-meta');
+  if (!f) { meta.textContent = ''; refreshPrivEstimate(); return; }
+  // Only warn against a CONFIRMED gate cap; if the gate hasn't answered yet,
+  // fetch it and re-render rather than flashing the 10MB fallback.
+  const overCap = gateCapKnown && f.size > attachMaxBytes ? ` ⚠ over gate cap (${(attachMaxBytes / 1024 / 1024).toFixed(0)} MB)` : '';
+  meta.textContent = `${f.name} · ${bytesToHuman(f.size)} · ${detectFileMime(f) || 'application/octet-stream'}${overCap}`;
+  if (!gateCapKnown) refreshGateInfo().then(() => { if (gateCapKnown) onPrivFilePick(); });
+  refreshPrivEstimate();
+}
+function privAddRecipient() {
+  const inp = document.getElementById('priv-recip-input');
+  const bare = (inp.value || '').trim().replace(/^@+/, '').toLowerCase().split('@')[0];
+  if (!bare) return;
+  if (!/^[a-z][a-z0-9.\-]{2,15}$/.test(bare)) { setPrivStatus(`⚠ "${bare}" doesn't look like a Hive username.`, true); return; }
+  if (bare === myUsername) { setPrivStatus("You're always included — no need to add yourself.", true); inp.value = ''; return; }
+  privSendState.recipients.add(bare);
+  inp.value = '';
+  setPrivStatus('Ready.');
+  renderPrivRecipients();
+  refreshPrivEstimate();
+}
+function privRemoveRecipient(u) {
+  privSendState.recipients.delete(u);
+  renderPrivRecipients();
+  refreshPrivEstimate();
+}
+function renderPrivRecipients() {
+  const box = document.getElementById('priv-recip-chips');
+  const recs = [...privSendState.recipients];
+  if (!recs.length) { box.innerHTML = '<span class="hint">No recipients yet — only you will be able to open it.</span>'; return; }
+  box.innerHTML = recs.map(u =>
+    `<span class="chip">@${escapeHtml(u)}<span class="rm" data-priv-rm="${escapeHtml(u)}">✕</span></span>`
+  ).join('');
+  box.querySelectorAll('[data-priv-rm]').forEach(el => el.onclick = () => privRemoveRecipient(el.getAttribute('data-priv-rm')));
+}
+function refreshPrivEstimate() {
+  const el = document.getElementById('priv-cost-line');
+  if (!el) return;
+  const f = privSendState.file;
+  if (!f) { el.textContent = 'Pick a file to estimate.'; return; }
+  const copies = Math.max(1, Math.min(gateCopiesMax, parseInt(document.getElementById('priv-copies').value) || 1));
+  if (gatePermanent) {
+    const mb = (f.size / gateMbDivisor).toFixed(2);
+    el.textContent = myFeeExempt ? `Permanent — hosts until you unpin. Free (fee-exempt), ${mb} MB × ${copies} cop.`
+      : gateRatePerMbHour ? `Permanent — one-time ≈ ${(gateRatePerMbHour * (f.size / gateMbDivisor) * copies).toFixed(3)} ${gatePayCurrency || '?'} (${mb} MB × ${copies} cop) — exact at pay.`
+      : `Permanent — hosts until unpinned; exact cost quoted at pay.`;
+    return;
+  }
+  const hours = Math.max(1, parseInt(document.getElementById('priv-hours').value) || gateDefaultHours);
+  if (myFeeExempt) { el.textContent = `Free — you're fee-exempt on this gate (${(f.size / gateMbDivisor).toFixed(2)} MB × ${hours} h × ${copies} cop).`; return; }
+  if (!gateRatePerMbHour) { el.textContent = `~ ${(f.size / 1e6).toFixed(2)} MB × ${hours} h × ${copies} — exact cost quoted at pay.`; return; }
+  const mb = f.size / gateMbDivisor;
+  const est = gateRatePerMbHour * mb * hours * copies;
+  el.textContent = `≈ ${est.toFixed(3)} ${gatePayCurrency || '?'} (${mb.toFixed(2)} MB × ${hours} h × ${copies} cop) — exact at pay`;
+}
+
+async function confirmPrivateSend() {
+  const btn = document.getElementById('priv-send-btn');
+  if (!privSendState.file) { setPrivStatus('⚠ Pick a file first.', true); return; }
+  if (!myPrivKeyStr) { setPrivStatus('⚠ Unlock encryption first (🔑 bar at the top) — recipient key wrapping needs your posting key.', true); return; }
+  const file = privSendState.file;
+  if (!(await ensureGateCap())) { setPrivStatus(`⚠ Can't read this gate's upload limit — ${getGateway()} isn't answering. Check the Gateway URL at the top, then retry.`, true); return; }
+  if (file.size > attachMaxBytes) { setPrivStatus(`⚠ ${(file.size / 1024 / 1024).toFixed(2)} MB — exceeds this gate's cap (${(attachMaxBytes / 1024 / 1024).toFixed(0)} MB).`, true); return; }
+  const hours = Math.max(1, parseInt(document.getElementById('priv-hours').value) || gateDefaultHours);
+  const copies = Math.max(1, Math.min(gateCopiesMax, parseInt(document.getElementById('priv-copies').value) || 1));
+  const policyType = (document.querySelector('input[name=priv-policy]:checked') || {}).value || 'owner_only';
+  const recipients = [...privSendState.recipients];
+
+  btn.disabled = true;
+  try {
+    const artifact = await runPrivateSend({ file, gatewayUrl: getGateway(), recipients, hours, copies, policyType });
+    if (artifact) { showPrivResult(artifact); setPrivStatus('✓ Link ready below.'); }
+    // artifact === null → upload+pay landed but envelope sign declined; the
+    // ↻ Retry signature UI is already showing.
+  } catch (e) {
+    setPrivStatus('✗ ' + (e.message || 'failed'), true);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function runPrivateSend({ file, gatewayUrl, recipients, hours, copies, policyType }) {
+  // 1) Read plaintext (for the commitment) + encrypt to a fresh AES key.
+  setPrivStatus('Encrypting…');
+  const fileBytes = new Uint8Array(await file.arrayBuffer());
+  const { blob, rawKey } = await buildInnerBlob({ file, sender: myUsername });
+  const ciphertextSha256Hex = await sha256HexBytes(blob);
+
+  // Commitment = SHA-256(fileBytes ‖ salt); salt rides in the envelope so a
+  // recipient can recompute after decrypting. receipt_hash = H(plaintext),
+  // stored gate-side for proof-of-receipt (NOT in the public link).
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const commitment = await sha256HexBytes(u8concat(fileBytes, salt));
+  const saltB64 = btoa(String.fromCharCode(...salt));
+  const receiptHash = await sha256HexBytes(fileBytes);
+
+  const release_policy = { type: policyType, addresses: recipients.map(r => r.split('@')[0].toLowerCase()) };
+
+  // 2) Reserve — claim-model quote (size × hours × copies).
+  setPrivStatus('Reserving quota…');
+  const reserveRes = await fetch(`${gatewayUrl}/reserve`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ uploader: myUsername, size_bytes: blob.length, hours_requested: hours, copies, mode: 'encrypted' })
+  });
+  if (!reserveRes.ok) { const j = await reserveRes.json().catch(() => ({})); throw new Error(`reserve failed: ${j.message || reserveRes.status}`); }
+  const reserve = await reserveRes.json();
+  const reservationId = reserve.reservation_id;
+  const escrowAccount = reserve.payment.escrow_account;
+  const memo = reserve.payment.memo;
+  const payAmount = reserve.payment.amount;
+  const payCurrency = (reserve.payment.currency || gatePayCurrency || 'CNOOBS').toUpperCase();
+  // Whitelist fee exemption: the gate quoted 0 and will accept the upload with
+  // no on-chain payment (no tx_id) — skip the Keychain transfer entirely.
+  const feeExempt = !!(reserve.quote && reserve.quote.fee_exempt);
+  if (reserve.quote) {
+    const q = reserve.quote;
+    setPrivStatus(feeExempt
+      ? `Free (fee-exempt) — ${q.billable_mb} MB × ${q.billable_hrs} h × ${q.copies} cop.`
+      : `Quote: ${q.total} ${q.currency} — ${q.billable_mb} MB × ${q.billable_hrs} h × ${q.copies} cop${q.copies_capped ? ' (copies capped to node count)' : ''}.`);
+  }
+
+  // 3) Sign upload proof.
+  setPrivStatus('Signing upload proof…');
+  const proofMsg = buildUploadProofMessage({ ciphertextSha256Hex, reservationId, uploader: myUsername });
+  const uploadProofSig = await signRaw(proofMsg);
+  if (!uploadProofSig) throw new Error('upload proof signature cancelled');
+
+  let txId = null;
+  if (!feeExempt) {
+    // 4) Pay (Keychain custom_json — Active auth).
+    setPrivStatus(`Paying ${payAmount} ${payCurrency} (Keychain)…`);
+    txId = await keychainTransferGateToken({ to: escrowAccount, amount: payAmount, memo, symbol: payCurrency });
+    if (!txId) throw new Error('payment cancelled or failed');
+
+    // 5) Settle delay so the tx is indexed before /upload checks it.
+    setPrivStatus('Waiting for tx to index (3s)…');
+    await new Promise(r => setTimeout(r, 3000));
+  }
+
+  // 6) Upload ciphertext + release_policy + commitment.
+  setPrivStatus('Uploading ciphertext…');
+  const form = new FormData();
+  form.append('reservation_id', reservationId);
+  if (txId) form.append('tx_id', txId);
+  form.append('uploader_pubkey', myPubKey);
+  form.append('upload_proof_sig', uploadProofSig);
+  form.append('release_policy', JSON.stringify(release_policy));
+  form.append('receipt_hash', receiptHash);
+  form.append('ciphertext', new Blob([blob], { type: 'application/octet-stream' }), 'ciphertext.bin');
+  let upRes;
+  try {
+    upRes = await fetch(`${gatewayUrl}/upload`, { method: 'POST', body: form });
+  } catch (e) {
+    throw new Error(txId
+      ? `upload failed (${e.message}) — your ${payAmount} ${payCurrency} payment to ${escrowAccount} was already broadcast. tx: ${txId} · reservation: ${reservationId}. Ask the operator to check /admin/orphan-payments.`
+      : `upload failed (${e.message}) — nothing was paid (fee-exempt); just retry.`);
+  }
+  if (!upRes.ok) { const j = await upRes.json().catch(() => ({})); throw new Error(`upload failed: ${j.message || upRes.status}${txId ? ` — payment tx ${txId} may need operator review (orphan-payments).` : ' — nothing was paid (fee-exempt); just retry.'}`); }
+  const upJson = await upRes.json();
+  const cid = upJson.cid;
+  const expires_at = upJson.expires_at || null;
+  const order_id = upJson.order_id || null;
+  const claim_id = upJson.claim_id || null;
+  let gateway_hint = upJson.gateway_url || '';
+  if (!gateway_hint || /\/\/ipfs\.localhost(\/|$|:)/i.test(gateway_hint) || /\/\/localhost(\/|$|:)/i.test(gateway_hint)) {
+    gateway_hint = `${gatewayUrl}/ipfs/${cid}`;
+  }
+
+  const mime = detectFileMime(file) || 'application/octet-stream';
+  recordCtx(cid, { filename: file.name, mime, kind: mimeToKind(mime), context: 'private send → @' + (recipients.join(', @') || myUsername) });
+
+  // 7) Wrap the AES key to each recipient's Hive posting key (always incl. self).
+  setPrivStatus('Wrapping keys for recipients…');
+  const rawKeyB64 = btoa(String.fromCharCode(...rawKey));
+  const audience = new Set([myUsername, ...recipients.map(r => r.split('@')[0].toLowerCase())]);
+  const per_recipient = {};
+  const skipped = [];
+  for (const u of audience) {
+    let pubKey = (u === myUsername) ? myPubKey : null;
+    if (!pubKey) { try { pubKey = await fetchPubKey(u); } catch (_) { pubKey = null; } }
+    if (!pubKey) { skipped.push(u); continue; }
+    try { per_recipient[u] = encryptMsg(rawKeyB64, pubKey); }
+    catch (e) { console.warn('[private] wrap failed for', u, e.message); skipped.push(u); }
+  }
+  if (!per_recipient[myUsername]) throw new Error('could not wrap the key to your own account — aborting (no one could decrypt).');
+  if (skipped.length) setPrivStatus(`⚠ couldn't wrap for: @${skipped.join(', @')} — they won't be able to open it. Building link for the rest…`, true);
+
+  // 8) Build + sign the recipient-scoped envelope, encode the artifact.
+  setPrivStatus('Signing envelope…');
+  const env = {
+    type: 'private-reveal', v: 1,
+    cid, size_bytes: blob.length, sender: myUsername,
+    created_at: new Date().toISOString(), expires_at,
+    kind_hint: mimeToKind(mime),
+    gateway_hint, order_id, claim_id,
+    release_policy, commitment, salt: saltB64,
+    per_recipient
+  };
+  const sig = await signRaw(privSigInput(env));
+  if (!sig) {
+    privPendingEnv = env;
+    showPrivResultRetrySign();
+    setPrivStatus("Upload + payment done, but the envelope wasn't signed — click ↻ Retry signature to finish the link (no re-payment).", true);
+    return null;
+  }
+  env.envelope_sig = sig;
+  return buildRevealArtifact(env);
+}
+
+async function privRetrySign() {
+  if (!privPendingEnv) return;
+  setPrivStatus('Signing envelope…');
+  const sig = await signRaw(privSigInput(privPendingEnv));
+  if (!sig) { setPrivStatus('Still not signed — click ↻ Retry signature.', true); return; }
+  privPendingEnv.envelope_sig = sig;
+  const artifact = buildRevealArtifact(privPendingEnv);
+  privPendingEnv = null;
+  showPrivResult(artifact);
+  setPrivStatus('✓ Link ready below.');
+}
+function showPrivResultRetrySign() {
+  const box = document.getElementById('priv-result');
+  box.style.display = 'block';
+  box.innerHTML = '<div style="font-size:0.72rem;color:var(--danger);margin-bottom:6px;">Your file is uploaded + paid, but the envelope wasn\'t signed — the link needs your signature to be usable. No re-payment on retry.</div>'
+    + '<button class="purple" onclick="privRetrySign()">↻ Retry signature</button>';
+}
+function showPrivResult(artifact) {
+  const box = document.getElementById('priv-result');
+  box.style.display = 'block';
+  box.innerHTML = `
+    <div style="font-size:0.7rem;color:var(--subtext);margin-bottom:5px;">REVEAL LINK — share with your recipients (only they can decrypt):</div>
+    <textarea id="priv-result-text" readonly style="height:72px;font-size:0.66rem;resize:vertical;">${escapeHtml(artifact)}</textarea>
+    <div class="row" style="margin-top:6px;">
+      <button class="purple" onclick="privCopyResult()">📋 Copy link</button>
+    </div>
+    <div class="hint" style="margin-top:6px;">Recipients paste it into the <strong>Reveal</strong> tab here — or v4call's Reveal tab. The ciphertext lives on the gate; this link carries the keys.</div>`;
+}
+function privCopyResult() {
+  const ta = document.getElementById('priv-result-text');
+  if (!ta) return;
+  ta.select();
+  try { navigator.clipboard.writeText(ta.value); } catch (_) { try { document.execCommand('copy'); } catch (_) {} }
+  setPrivStatus('✓ Copied to clipboard.');
+}
+
+// ══════════════════════════════════════════════════════════════
+// Public upload (plaintext → shareable gateway link)
+// ══════════════════════════════════════════════════════════════
+function setPubStatus(text, isErr) {
+  const n = document.getElementById('pub-status-note');
+  n.textContent = text;
+  n.className = 'status' + (isErr ? ' err' : '');
+}
+function onPubFilePick() {
+  const f = (document.getElementById('pub-file-input').files || [])[0];
+  const meta = document.getElementById('pub-file-meta');
+  // a new file means the old already-hosted answer no longer applies
+  document.getElementById('pub-hosted-panel').style.display = 'none';
+  hostedCid = null;
+  if (!f) { meta.textContent = ''; refreshPubEstimate(); return; }
+  const mime = detectFileMime(f) || 'application/octet-stream';
+  const warn = gateCapKnown && f.size > attachMaxBytes ? ` ⚠ over gate cap (${(attachMaxBytes / 1024 / 1024).toFixed(0)} MB)` : '';
+  meta.textContent = `${f.name} · ${bytesToHuman(f.size)} · ${mime}${warn}`;
+  if (!gateCapKnown) refreshGateInfo().then(() => { if (gateCapKnown) onPubFilePick(); });
+  refreshPubEstimate();
+}
+function refreshPubEstimate() {
+  const el = document.getElementById('pub-cost-line');
+  if (!el) return;
+  const f = (document.getElementById('pub-file-input').files || [])[0];
+  if (!f) { el.textContent = 'Pick a file to estimate.'; return; }
+  const copies = Math.max(1, Math.min(gateCopiesMax, parseInt(document.getElementById('pub-copies').value) || 1));
+  if (gatePermanent) {
+    const mb = (f.size / gateMbDivisor).toFixed(2);
+    el.textContent = myFeeExempt ? `Permanent — hosts until you unpin. Free (fee-exempt), ${mb} MB × ${copies} cop.`
+      : gateRatePerMbHour ? `Permanent — one-time ≈ ${(gateRatePerMbHour * (f.size / gateMbDivisor) * copies).toFixed(3)} ${gatePayCurrency || '?'} (${mb} MB × ${copies} cop) — exact at pay.`
+      : `Permanent — hosts until unpinned; exact cost quoted at pay.`;
+    return;
+  }
+  const hours = Math.max(1, parseInt(document.getElementById('pub-hours').value) || gateDefaultHours);
+  if (myFeeExempt) { el.textContent = `Free — you're fee-exempt on this gate (${(f.size / gateMbDivisor).toFixed(2)} MB × ${hours} h × ${copies} cop).`; return; }
+  if (!gateRatePerMbHour) { el.textContent = `~ ${(f.size / 1e6).toFixed(2)} MB × ${hours} h × ${copies} — exact cost quoted at pay.`; return; }
+  const mb = f.size / gateMbDivisor;
+  const est = gateRatePerMbHour * mb * hours * copies;
+  el.textContent = `≈ ${est.toFixed(3)} ${gatePayCurrency || '?'} (${mb.toFixed(2)} MB × ${hours} h × ${copies} cop) — exact at pay`;
+}
+function showPubResult(url) {
+  const r = document.getElementById('pub-result');
+  r.style.display = 'block';
+  r.innerHTML = `<div style="font-size:0.68rem;color:var(--subtext);margin-bottom:4px;">SHAREABLE LINK (anyone can open)</div>
+    <div class="row">
+      <span class="upl-publink" id="pub-result-url"></span>
+      <button class="upl-btn" id="pub-copy-btn">📋 Copy</button>
+      <button class="upl-btn" id="pub-open-btn">↗ Open</button>
+    </div>`;
+  document.getElementById('pub-result-url').textContent = url;
+  document.getElementById('pub-copy-btn').addEventListener('click', () => {
+    navigator.clipboard?.writeText(url).then(() => {
+      const b = document.getElementById('pub-copy-btn'); b.textContent = '✓ Copied';
+      setTimeout(() => { b.textContent = '📋 Copy'; }, 1500);
+    });
+  });
+  document.getElementById('pub-open-btn').addEventListener('click', () => window.open(url, '_blank', 'noopener'));
+}
+async function confirmPublicUpload(skipHostedCheck) {
+  const file = (document.getElementById('pub-file-input').files || [])[0];
+  if (!file) { setPubStatus('Pick a file first.', true); return; }
+  if (!(await ensureGateCap())) { setPubStatus(`⚠ Can't read this gate's upload limit — ${getGateway()} isn't answering. Check the Gateway URL at the top, then retry.`, true); return; }
+  if (file.size > attachMaxBytes) { setPubStatus(`File too big — this gate caps uploads at ${(attachMaxBytes / 1024 / 1024).toFixed(0)} MB.`, true); return; }
+  const btn = document.getElementById('pub-upload-btn');
+  btn.disabled = true;
+  try {
+    // Guardian feature: same bytes = same CID for public uploads, so ask the
+    // gate FIRST (free, nothing stored) whether this file is already hosted.
+    // If it is, offer own-copy / guardian instead of a blind re-upload.
+    if (!skipHostedCheck) {
+      setPubStatus('Checking whether this file is already hosted…');
+      const hosted = await gateCheckAlreadyHosted(file, getGateway());
+      if (hosted && hosted.already_hosted) {
+        renderHostedPanel(hosted, file);
+        setPubStatus('This file is already hosted here — pick an option below.');
+        return;
+      }
+    }
+    document.getElementById('pub-hosted-panel').style.display = 'none';
+    const hours = Math.max(1, parseInt(document.getElementById('pub-hours').value) || gateDefaultHours);
+    const copies = Math.max(1, Math.min(gateCopiesMax, parseInt(document.getElementById('pub-copies').value) || 1));
+    const res = await uploadPublicFile(file, getGateway(), hours, copies);
+    recordCtx(res.cid, { filename: file.name, mime: res.mime, kind: mimeToKind(res.mime), context: 'public link' });
+    showPubResult(res.url);
+    setPubStatus('✓ Uploaded — link ready below.');
+    loadUploadsList();
+  } catch (e) {
+    setPubStatus('⚠ ' + e.message, true);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+// ── Guardian feature (already-hosted → own copy / guardian) ──────────────────
+let hostedCid = null, hostedFileName = '';
+
+/** POST /check — best-effort: an old gate without it just means "proceed". */
+async function gateCheckAlreadyHosted(file, gatewayUrl) {
+  try {
+    const form = new FormData();
+    form.append('ciphertext', new Blob([new Uint8Array(await file.arrayBuffer())]), file.name);
+    const res = await fetch(`${gatewayUrl}/check`, { method: 'POST', body: form });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch (e) { return null; }
+}
+
+function setHostedStatus(text, isErr) {
+  const n = document.getElementById('hosted-status');
+  if (!n) return;
+  n.textContent = text || '';
+  n.className = 'status' + (isErr ? ' err' : '');
+}
+
+function renderHostedPanel(j, file) {
+  hostedCid = j.cid;
+  hostedFileName = file ? file.name : '';
+  const p = document.getElementById('pub-hosted-panel');
+  p.style.display = 'block';
+  const until = j.hosted_until ? new Date(j.hosted_until).toLocaleString() : '?';
+  p.innerHTML = `
+    <div style="font-size:0.78rem;margin-bottom:4px;"><b>📌 This file is already hosted on this gate.</b></div>
+    <div class="hint">Paid to stay up until <b>${escapeHtml(until)}</b> · ${Number(j.active_hosts) || 1} live host(s) · ${Number(j.guardian_queue_depth) || 0} guardian(s) queued. You don't have to re-upload — you can back the existing copy instead:</div>
+    <div class="row" style="margin-top:8px;align-items:center;">
+      <label class="field-label" style="margin:0;">Hours to fund</label>
+      <input type="number" id="hosted-hours" min="1" value="${gateDefaultHours}" style="width:90px;">
+    </div>
+    <div class="row" style="margin-top:8px;">
+      <button class="purple" onclick="becomeGuardian()">🛡 Become a Guardian</button>
+      <button onclick="hostOwnCopy()">📄 Host my own copy</button>
+      <button class="secondary" onclick="confirmPublicUpload(true)">⬆ Upload anyway</button>
+    </div>
+    <div class="hint" style="margin-top:6px;"><b>Guardian</b> = pledge a budget now, pay nothing unless the file would otherwise be dropped — you join a first-come queue and take over hosting only when the last live host ends (cancel while dormant = full refund). <b>Own copy</b> = pay now for your own independent copy — own timer, own refund, live immediately.</div>
+    <div class="status" id="hosted-status"></div>`;
+}
+
+async function becomeGuardian() {
+  if (!myUsername) { setHostedStatus('Log in first.', true); return; }
+  if (!hostedCid) { setHostedStatus('No CID — re-run the check.', true); return; }
+  const gw = getGateway();
+  const hours = Math.max(1, parseInt(document.getElementById('hosted-hours').value) || gateDefaultHours);
+  try {
+    setHostedStatus('Fetching guardian quote…');
+    const qRes = await fetch(`${gw}/guardian/quote?cid=${encodeURIComponent(hostedCid)}&hours=${hours}&hive_account=${encodeURIComponent(myUsername)}`);
+    const q = await qRes.json().catch(() => ({}));
+    if (!qRes.ok) throw new Error(q.message || `quote failed (${qRes.status})`);
+
+    let txId = null;
+    if (q.quote && q.quote.fee_exempt) {
+      setHostedStatus('Free (fee-exempt) — pledging…');
+    } else {
+      setHostedStatus(`Pledging ${q.payment.amount} ${q.payment.currency} for ${q.quote.billable_hrs} h (Keychain)…`);
+      txId = await keychainTransferGateToken({ to: q.payment.escrow_account, amount: q.payment.amount, memo: q.payment.memo, symbol: q.payment.currency });
+      if (!txId) throw new Error('payment cancelled or failed');
+
+      setHostedStatus('Waiting for tx to index (3s)…');
+      await new Promise(r => setTimeout(r, 3000));
+    }
+
+    const pRes = await fetch(`${gw}/guardian/pledge`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ pledger: myUsername, cid: hostedCid, hours_requested: hours, ...(txId ? { tx_id: txId } : {}) })
+    });
+    const pj = await pRes.json().catch(() => ({}));
+    if (!pRes.ok) throw new Error(`${pj.message || pRes.status} — payment tx ${txId} may need operator review (orphan-payments).`);
+    setHostedStatus(`✓ You are Guardian #${pj.queue_position} of ${pj.queue_depth} for this file — pledged ${pj.pledged_hours} h (budget ${pj.amount_escrowed} ${pj.currency}). Dormant: you pay nothing more unless the file would otherwise drop; cancel any time for a full refund.`);
+  } catch (e) { setHostedStatus('⚠ ' + e.message, true); }
+}
+
+async function hostOwnCopy() {
+  if (!myUsername) { setHostedStatus('Log in first.', true); return; }
+  if (!hostedCid) { setHostedStatus('No CID — re-run the check.', true); return; }
+  const gw = getGateway();
+  const hours = Math.max(1, parseInt(document.getElementById('hosted-hours').value) || gateDefaultHours);
+  try {
+    setHostedStatus('Fetching own-copy quote…');
+    const qRes = await fetch(`${gw}/claims/own-copy/quote?cid=${encodeURIComponent(hostedCid)}&hours=${hours}&hive_account=${encodeURIComponent(myUsername)}`);
+    const q = await qRes.json().catch(() => ({}));
+    if (!qRes.ok) throw new Error(q.message || `quote failed (${qRes.status})`);
+
+    let txId = null;
+    if (q.quote && q.quote.fee_exempt) {
+      setHostedStatus('Free (fee-exempt) — claiming your copy…');
+    } else {
+      setHostedStatus(`Paying ${q.payment.amount} ${q.payment.currency} for ${q.quote.billable_hrs} h (Keychain)…`);
+      txId = await keychainTransferGateToken({ to: q.payment.escrow_account, amount: q.payment.amount, memo: q.payment.memo, symbol: q.payment.currency });
+      if (!txId) throw new Error('payment cancelled or failed');
+
+      setHostedStatus('Waiting for tx to index (3s)…');
+      await new Promise(r => setTimeout(r, 3000));
+    }
+
+    const cRes = await fetch(`${gw}/claims/own-copy`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ owner: myUsername, cid: hostedCid, hours_requested: hours, ...(txId ? { tx_id: txId } : {}) })
+    });
+    const cj = await cRes.json().catch(() => ({}));
+    if (!cRes.ok) throw new Error(`${cj.message || cRes.status} — payment tx ${txId} may need operator review (orphan-payments).`);
+    const until = cj.expires_at ? new Date(cj.expires_at).toLocaleString() : '?';
+    recordCtx(hostedCid, { filename: hostedFileName, context: 'own copy' });
+    setHostedStatus(`✓ Your own copy is live until ${until} (${cj.paid_hours} h paid, no re-upload needed). It survives regardless of what the other hosts do.`);
+    loadUploadsList();
+  } catch (e) { setHostedStatus('⚠ ' + e.message, true); }
+}
+async function uploadPublicFile(file, gatewayUrl, hours, copies) {
+  const buf = new Uint8Array(await file.arrayBuffer());
+  const mime = detectFileMime(file) || 'application/octet-stream';
+  const kind = mimeToKind(mime);
+  const sha = await sha256HexBytes(buf);
+  const hoursReq = Math.max(1, hours || gateDefaultHours);
+  const copiesReq = Math.max(1, Math.min(gateCopiesMax, copies || 1));
+
+  setPubStatus('Reserving quota…');
+  const reserveRes = await fetch(`${gatewayUrl}/reserve`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ uploader: myUsername, size_bytes: buf.length, mode: 'public', hours_requested: hoursReq, copies: copiesReq })
+  });
+  if (!reserveRes.ok) { const j = await reserveRes.json().catch(() => ({})); throw new Error(`reserve failed: ${j.message || reserveRes.status}`); }
+  const reserve = await reserveRes.json();
+  const reservationId = reserve.reservation_id;
+  const escrowAccount = reserve.payment.escrow_account;
+  const memo = reserve.payment.memo;
+  const payAmount = reserve.payment.amount;
+  const payCurrency = (reserve.payment.currency || 'CNOOBS').toUpperCase();
+  // Whitelist fee exemption — same skip as the private-send flow.
+  const feeExempt = !!(reserve.quote && reserve.quote.fee_exempt);
+  if (reserve.quote) {
+    const q = reserve.quote;
+    setPubStatus(feeExempt
+      ? `Free (fee-exempt) — ${q.billable_mb} MB × ${q.billable_hrs} h × ${q.copies} cop.`
+      : `Quote: ${q.total} ${q.currency} — ${q.billable_mb} MB × ${q.billable_hrs} h × ${q.copies} cop${q.copies_capped ? ' (copies capped to node count)' : ''}.`);
+  }
+
+  setPubStatus('Signing upload proof…');
+  const proofMsg = buildUploadProofMessage({ ciphertextSha256Hex: sha, reservationId, uploader: myUsername });
+  const uploadProofSig = await signRaw(proofMsg);
+  if (!uploadProofSig) throw new Error('upload proof signature cancelled');
+
+  let txId = null;
+  if (!feeExempt) {
+    setPubStatus(`Paying ${payAmount} ${payCurrency} (Keychain)…`);
+    txId = await keychainTransferGateToken({ to: escrowAccount, amount: payAmount, memo, symbol: payCurrency });
+    if (!txId) throw new Error('payment cancelled or failed');
+
+    setPubStatus('Waiting for tx to index (3s)…');
+    await new Promise(r => setTimeout(r, 3000));
+  }
+
+  setPubStatus('Uploading (plaintext)…');
+  const form = new FormData();
+  form.append('reservation_id', reservationId);
+  if (txId) form.append('tx_id', txId);
+  form.append('uploader_pubkey', myPubKey);
+  form.append('upload_proof_sig', uploadProofSig);
+  form.append('mode', 'public');
+  form.append('mime', mime);
+  form.append('kind', kind);
+  // File still goes in the `ciphertext` field (the gate's multer field name);
+  // for a public reservation the gate treats these bytes as plaintext.
+  form.append('ciphertext', new Blob([buf], { type: mime }), file.name);
+  let upRes;
+  try {
+    upRes = await fetch(`${gatewayUrl}/upload`, { method: 'POST', body: form });
+  } catch (e) {
+    throw new Error(txId
+      ? `upload failed (${e.message}) — your ${payAmount} ${payCurrency} payment to ${escrowAccount} was already broadcast. tx: ${txId} · reservation: ${reservationId}. Ask the operator to check /admin/orphan-payments.`
+      : `upload failed (${e.message}) — nothing was paid (fee-exempt); just retry.`);
+  }
+  if (!upRes.ok) { const j = await upRes.json().catch(() => ({})); throw new Error(`upload failed: ${j.message || upRes.status}${txId ? ` — payment tx ${txId} may need operator review (orphan-payments).` : ' — nothing was paid (fee-exempt); just retry.'}`); }
+  const upJson = await upRes.json();
+  const cid = upJson.cid;
+  let url = upJson.gateway_url || '';
+  if (!url || /\/\/ipfs\.localhost(\/|$|:)/i.test(url) || /\/\/localhost(\/|$|:)/i.test(url)) url = `${gatewayUrl}/ipfs/${cid}`;
+  return { cid, url, mime };
+}
+
+// ══════════════════════════════════════════════════════════════
+// Reveal (decode a v4reveal: link → fetch → decrypt → render)
+// ══════════════════════════════════════════════════════════════
+function setRevealStatus(text, isErr) {
+  const n = document.getElementById('reveal-status');
+  n.textContent = text || '';
+  n.className = 'status' + (isErr ? ' err' : '');
+}
+function clearReveal() {
+  document.getElementById('reveal-input').value = '';
+  document.getElementById('reveal-result').innerHTML = '';
+  setRevealStatus('');
+}
+function parseRevealArtifact(raw) {
+  let s = (raw || '').trim();
+  if (!s) throw new Error('paste a v4reveal link first');
+  const m = s.match(/v4reveal[:=]\s*([A-Za-z0-9\-_]+)/);
+  if (m) s = m[1];
+  else s = s.replace(/^v4reveal:/i, '').replace(/\s+/g, '');
+  let env;
+  try { env = JSON.parse(b64urlDecode(s)); }
+  catch (e) { throw new Error('not a valid Reveal link (could not decode)'); }
+  if (!env || env.type !== 'private-reveal' || !env.cid || !env.per_recipient) {
+    throw new Error('not a Private Send link (wrong format)');
+  }
+  return env;
+}
+async function revealFromInput() {
+  const raw = document.getElementById('reveal-input').value;
+  document.getElementById('reveal-result').innerHTML = '';
+  let env;
+  try { env = parseRevealArtifact(raw); }
+  catch (e) { setRevealStatus('✗ ' + e.message, true); return; }
+  await revealEnvelope(env);
+}
+async function revealEnvelope(env) {
+  if (!myUsername) { setRevealStatus('✗ Log in first.', true); return; }
+
+  // 1) Verify the sender's signature before trusting anything.
+  setRevealStatus('Verifying sender signature…');
+  const sigOk = await verifyPrivEnvelopeSig(env);
+  if (sigOk === false) { setRevealStatus('✗ Signature check FAILED — this link was tampered with. Refusing to fetch.', true); return; }
+  const sigNote = (sigOk === true)
+    ? '✓ signed by @' + env.sender
+    : '⚠ could not verify sender signature (network?) — proceeding; the encryption itself still protects the bytes';
+
+  // 2) Am I addressed?
+  if (!env.per_recipient[myUsername]) {
+    const who = Object.keys(env.per_recipient).map(u => '@' + u).join(', ');
+    setRevealStatus(`✗ This file isn't addressed to you (@${myUsername}). Recipients: ${who}.`, true);
+    return;
+  }
+  // 3) Need encryption unlocked to unwrap the key.
+  if (!myPrivKeyStr) { setRevealStatus('✗ Unlock encryption first (🔑 bar at the top) to decrypt.', true); return; }
+
+  // 4) Unwrap my per-recipient AES key.
+  let rawKeyBytes;
+  try {
+    const rawKeyB64 = decryptMsg(env.per_recipient[myUsername]);
+    if (!rawKeyB64 || /^\[.*\]$/.test(rawKeyB64)) throw new Error('could not unwrap key (is this addressed to you?)');
+    rawKeyBytes = b64ToBytes(rawKeyB64);
+    if (rawKeyBytes.length !== 32) throw new Error('unwrapped key wrong length');
+  } catch (e) { setRevealStatus('✗ ' + e.message, true); return; }
+
+  // 5) Fetch ciphertext from the gateway hint (or rebuild from gate + cid).
+  let ciphertextBytes;
+  try {
+    setRevealStatus('Fetching ciphertext…');
+    const url = env.gateway_hint || (getGateway() + '/ipfs/' + env.cid);
+    const resp = await fetch(url, { method: 'GET' });
+    if (resp.status === 404) { setRevealStatus('✗ 404 — the pin expired or never landed at this gateway.', true); return; }
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    ciphertextBytes = new Uint8Array(await resp.arrayBuffer());
+  } catch (e) { setRevealStatus('✗ fetch failed: ' + e.message, true); return; }
+
+  // 6) Decrypt + parse the inner blob (the AES-GCM tag also guards integrity).
+  let header, fileBytes;
+  try {
+    ({ header, fileBytes } = await parseInnerBlob(ciphertextBytes, rawKeyBytes));
+  } catch (e) { setRevealStatus('✗ decrypt failed — ' + e.message, true); return; }
+
+  // 7) Render.
+  setRevealStatus(sigNote);
+  renderRevealResult(env, header, fileBytes);
+}
+function renderRevealResult(env, header, fileBytes) {
+  const box = document.getElementById('reveal-result');
+  const mime = header.mime || 'application/octet-stream';
+  const filename = header.filename || env.cid;
+  const kind = env.kind_hint || mimeToKind(mime);
+  const blob = new Blob([fileBytes], { type: mime });
+  const url = URL.createObjectURL(blob);
+
+  box.innerHTML = '';
+  const card = document.createElement('div');
+  card.className = 'reveal-card';
+  const head = document.createElement('div');
+  head.style.cssText = 'font-size:0.78rem;margin-bottom:6px;';
+  head.innerHTML = `<strong>${escapeHtml(filename)}</strong> · ${escapeHtml(mime)} · ${bytesToHuman(fileBytes.length)}<br>`
+    + `<span class="hint">from @${escapeHtml(env.sender)}`
+    + (env.expires_at ? ` · expires in ${timeUntilExpiry(env.expires_at) || '?'}` : '')
+    + `</span>`;
+  card.appendChild(head);
+
+  const thumbWrap = document.createElement('div');
+  if (kind === 'image') {
+    const img = document.createElement('img'); img.src = url; img.alt = filename;
+    img.title = `${filename} — click to open`; img.onclick = () => window.open(url, '_blank', 'noopener,noreferrer');
+    thumbWrap.appendChild(img);
+  } else if (kind === 'audio') {
+    const a = document.createElement('audio'); a.controls = true; a.preload = 'metadata'; a.src = url;
+    a.style.width = '100%'; a.style.maxWidth = '320px';
+    thumbWrap.appendChild(a);
+  } else if (kind === 'video') {
+    const v = document.createElement('video'); v.controls = true; v.preload = 'metadata'; v.src = url;
+    v.style.cssText = 'width:100%;max-width:480px;max-height:360px;border-radius:6px;background:#000;';
+    thumbWrap.appendChild(v);
+  } else if (kind === 'pdf') {
+    const f = document.createElement('iframe'); f.src = url + '#toolbar=0'; f.title = filename;
+    f.style.cssText = 'width:100%;max-width:480px;height:400px;border:1px solid var(--border);border-radius:6px;background:#fff;';
+    thumbWrap.appendChild(f);
+  } else if (kind === 'text') {
+    const truncated = fileBytes.length > TEXT_INLINE_PREVIEW_BYTES;
+    const previewBytes = truncated ? fileBytes.subarray(0, TEXT_INLINE_PREVIEW_BYTES) : fileBytes;
+    const pre = document.createElement('pre');
+    pre.className = 'textprev';
+    pre.textContent = new TextDecoder('utf-8', { fatal: false }).decode(previewBytes);
+    thumbWrap.appendChild(pre);
+    if (truncated) {
+      const t = document.createElement('div');
+      t.className = 'hint';
+      t.textContent = `… preview truncated at ${(TEXT_INLINE_PREVIEW_BYTES / 1024).toFixed(0)} KB of ${bytesToHuman(fileBytes.length)} — save for full.`;
+      thumbWrap.appendChild(t);
+    }
+  } else {
+    thumbWrap.innerHTML = `<div><strong>📦 ${escapeHtml(filename)}</strong><br><span class="hint">${escapeHtml(mime)} · ${bytesToHuman(fileBytes.length)} — no inline preview, use Save.</span></div>`;
+  }
+  card.appendChild(thumbWrap);
+
+  const actions = document.createElement('div');
+  actions.className = 'upl-actions';
+  const dl = document.createElement('button'); dl.className = 'upl-btn'; dl.textContent = '💾 Save';
+  dl.onclick = () => { const a = document.createElement('a'); a.href = url; a.download = filename; document.body.appendChild(a); a.click(); a.remove(); };
+  actions.appendChild(dl);
+  const op = document.createElement('button'); op.className = 'upl-btn'; op.textContent = '↗ Open';
+  op.onclick = () => window.open(url, '_blank', 'noopener,noreferrer');
+  actions.appendChild(op);
+  card.appendChild(actions);
+
+  // Proof-of-receipt: recompute H(plaintext) from the decrypted bytes and sign
+  // it — proves to the gate you actually decrypted; per the file's release
+  // policy this can let the owner stop hosting early + get a refund.
+  if (env.order_id) {
+    const rcptWrap = document.createElement('div');
+    rcptWrap.style.cssText = 'margin-top:8px;border-top:1px solid var(--border);padding-top:8px;';
+    const rbtn = document.createElement('button');
+    rbtn.className = 'upl-btn';
+    rbtn.textContent = '✅ Confirm receipt';
+    rbtn.title = 'Prove you decrypted this; per its release policy, may let the owner stop hosting early';
+    const rstat = document.createElement('div');
+    rstat.className = 'hint';
+    rstat.style.marginTop = '5px';
+    rstat.textContent = 'release policy: ' + ((env.release_policy && env.release_policy.type) || 'owner_only');
+    rbtn.onclick = () => confirmReceipt(env, fileBytes, rbtn, rstat);
+    rcptWrap.appendChild(rbtn);
+    rcptWrap.appendChild(rstat);
+    card.appendChild(rcptWrap);
+  }
+  box.appendChild(card);
+}
+async function confirmReceipt(env, fileBytes, btn, statusEl) {
+  if (!env || !env.order_id) return;
+  if (!myUsername) { statusEl.textContent = '✗ Log in first.'; return; }
+  if (btn) btn.disabled = true;
+  try {
+    statusEl.textContent = 'Computing proof…';
+    const proofHash = await sha256HexBytes(fileBytes); // H(plaintext) — only a decryptor can produce it
+    const ts = Math.floor(Date.now() / 1000);
+    const message = `ipfs-gate:receipt:v1:${env.order_id}:${myUsername}:${ts}:${proofHash}`;
+    statusEl.textContent = 'Signing…';
+    const sig = await signRaw(message);
+    if (!sig) { statusEl.textContent = '✗ signature cancelled.'; if (btn) btn.disabled = false; return; }
+    const gateBase = (env.gateway_hint || '').replace(/\/ipfs\/[^/]*\/?$/i, '') || getGateway();
+    statusEl.textContent = 'Submitting receipt…';
+    const resp = await fetch(`${gateBase}/claims/receipt`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ order_id: env.order_id, hive_account: myUsername, ts, pubkey: myPubKey, sig, proof_hash: proofHash })
+    });
+    const j = await resp.json().catch(() => ({}));
+    if (!resp.ok) { statusEl.textContent = '✗ ' + (j.message || j.error || `HTTP ${resp.status}`); if (btn) btn.disabled = false; return; }
+    if (j.released && j.ended) {
+      statusEl.textContent = `✓ Receipt confirmed — hosting released early. ${j.fully_unpinned ? 'File unpinned.' : 'A guardian kept it alive.'} Owner refunded the unused time.`;
+      if (btn) btn.textContent = '✓ Released';
+    } else if (j.released === false && typeof j.got === 'number') {
+      statusEl.textContent = `✓ Receipt recorded — ${j.got}/${j.needed} recipients confirmed (all_of: waiting for the rest).`;
+      if (btn) btn.textContent = '✓ Receipt sent';
+    } else {
+      statusEl.textContent = '✓ Receipt recorded' + (j.note ? ' — ' + j.note : '.');
+      if (btn) btn.textContent = '✓ Receipt sent';
+    }
+  } catch (e) {
+    statusEl.textContent = '✗ ' + (e.message || 'failed');
+    if (btn) btn.disabled = false;
+  }
+}
+
+// ══════════════════════════════════════════════════════════════
+// Boot
+// ══════════════════════════════════════════════════════════════
+document.getElementById('site-host').textContent = /^https?:$/.test(location.protocol) ? location.host : 'ipfs.v4call.com';
+document.getElementById('hive-privkey').addEventListener('keydown', e => { if (e.key === 'Enter') hiveLogin(); });
+document.getElementById('hive-username').addEventListener('keydown', e => {
+  if (e.key === 'Enter') {
+    if (window.hive_keychain) keychainLogin();
+    else document.getElementById('hive-privkey').focus();
+  }
+});
+document.getElementById('kc-key-input').addEventListener('keydown', e => { if (e.key === 'Enter') unlockEncryption(); });
+document.getElementById('priv-hours').addEventListener('input', function () { this.dataset.touched = '1'; refreshPrivEstimate(); });
+document.getElementById('priv-copies').addEventListener('input', refreshPrivEstimate);
+document.getElementById('pub-hours').addEventListener('input', function () { this.dataset.touched = '1'; refreshPubEstimate(); });
+document.getElementById('pub-copies').addEventListener('input', refreshPubEstimate);
+document.getElementById('priv-recip-input').addEventListener('keydown', e => { if (e.key === 'Enter') privAddRecipient(); });
+
+// Dim the Keychain button if the extension isn't there (it injects late).
+setTimeout(() => {
+  if (!window.hive_keychain) {
+    const kcBtn = document.getElementById('keychain-login-btn');
+    if (kcBtn) { kcBtn.style.opacity = '0.4'; kcBtn.title = 'Hive Keychain not detected'; }
+  }
+}, 500);
+
+// Restore a session (same-tab reload). Key-login users get their identity back
+// but must re-unlock (the private key is never persisted anywhere).
+(function restoreSession() {
+  const u = sessionStorage.getItem('hive_username');
+  const p = sessionStorage.getItem('hive_pubkey');
+  if (u && p) {
+    myUsername = u;
+    myPubKey = p;
+    useKeychain = sessionStorage.getItem('hive_keychain') === 'true';
+    pubKeyCache[u] = p;
+    // Keychain injects after page load — wait for it before signing anything.
+    setTimeout(enterApp, useKeychain ? 600 : 0);
+  }
+})();
+renderPrivRecipients();
+</script>
+</body>
+</html>

@@ -1,0 +1,347 @@
+// ipfs-gate v0.1 — moderation primitives.
+// All admin-side state changes go through here so audit logging is consistent.
+
+const quota = require('./quota');
+
+const ADMIN_ID = 'operator'; // single-admin for v0.1
+// Default offender refund policy on a forced takedown when the request omits one.
+const DEFAULT_REFUND_POLICY = (process.env.REFUND_POLICY === 'none') ? 'none' : 'prorata';
+
+// admin_id defaults to the v0.1 single-admin constant; the Hive-account admin
+// tier (WHITELIST-MODE-DESIGN-NOTES.md §5) passes 'hive:<account>' explicitly
+// so the audit trail attributes who actually acted. Callers that omit it keep
+// today's exact behavior.
+function audit({ action, target_type, target, reason, metadata, admin_id = ADMIN_ID }) {
+  const db = quota.open();
+  db.prepare(`
+    INSERT INTO moderation_log (action, target_type, target, reason, admin_id, timestamp, metadata)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    action,
+    target_type,
+    target,
+    reason || null,
+    admin_id,
+    quota.now(),
+    metadata ? JSON.stringify(metadata) : null
+  );
+  const row = db.prepare('SELECT last_insert_rowid() AS id').get();
+  return row.id;
+}
+
+/**
+ * Ban a Hive account — IDENTITY kill (cohosting §7). Voids ALL the user's claims
+ * (active + dormant) and marks their active pins 'banned', then reconciles each
+ * CID they actively hosted: the file SURVIVES if ANOTHER user has a guardian on
+ * it (FIFO baton-pass), and is only unpinned if nobody else funds it. The content
+ * itself is NOT banned (use takedown for that).
+ *
+ * Returns { voided_claims, pins_affected, cids_to_unpin, activated, refund_policy,
+ * moderation_log_id }. Refund execution is the CALLER's job (server settles each
+ * voided claim per refund_policy — the banned user is not innocent). cids_to_unpin
+ * = CIDs with no funder left; caller kubo-unpins + GCs.
+ */
+function banAccount({ hive_account, reason, refund_policy, admin_id = ADMIN_ID }) {
+  if (!hive_account) throw Object.assign(new Error('hive_account required'), { code: 'bad_request' });
+  if (!reason) throw Object.assign(new Error('reason required'), { code: 'bad_request' });
+  if (!['none', 'prorata'].includes(refund_policy)) {
+    throw Object.assign(new Error('refund_policy must be none|prorata'), { code: 'bad_request' });
+  }
+  const account = String(hive_account).toLowerCase();
+
+  const db = quota.open();
+  const tx = db.transaction(() => {
+    const t = quota.now();
+
+    db.prepare(`
+      INSERT OR REPLACE INTO banned_accounts
+        (hive_account, banned_at, banned_by, reason, refund_policy, unbanned_at, unbanned_by)
+      VALUES (?, ?, ?, ?, ?, NULL, NULL)
+    `).run(account, t, admin_id, reason, refund_policy);
+
+    // Collect the user's claims to void (active + dormant) BEFORE voiding — the
+    // pre-void rows drive the refund math in the caller.
+    const voidedClaims = db.prepare(
+      "SELECT * FROM claims WHERE owner = ? AND state IN ('active','dormant')"
+    ).all(account);
+
+    db.prepare(
+      "UPDATE claims SET state = 'cancelled' WHERE owner = ? AND state IN ('active','dormant')"
+    ).run(account);
+
+    const upd = db.prepare(`
+      UPDATE pins SET status = 'banned', status_changed_at = ?, status_reason = ?
+      WHERE uploader = ? AND status = 'active'
+    `).run(t, reason, account);
+
+    // Reconcile each CID the user actively hosted: another user's queued guardian
+    // takes the baton (file survives); unpin only where nobody else funds it.
+    // The banned user's own guardians were just voided, so they can't be promoted.
+    const activeCids = [...new Set(voidedClaims.filter(c => c.state === 'active').map(c => c.cid))];
+    const cidsToUnpin = [];
+    const activated = [];
+    for (const cid of activeCids) {
+      const rec = quota.reconcileCidAfterEnd(cid);
+      if (rec.activated) activated.push(rec.activated);
+      else if (rec.unpin) cidsToUnpin.push(cid);
+    }
+
+    const mlId = audit({
+      action: 'ban',
+      target_type: 'account',
+      target: account,
+      reason,
+      metadata: { refund_policy, pins_affected: upd.changes, claims_voided: voidedClaims.length, guardians_activated: activated.length },
+      admin_id
+    });
+
+    return { voidedClaims, pins_affected: upd.changes, cidsToUnpin, activated, moderation_log_id: mlId };
+  });
+
+  const r = tx.immediate();
+  return {
+    voided_claims: r.voidedClaims,
+    pins_affected: r.pins_affected,
+    cids_to_unpin: r.cidsToUnpin,
+    activated: r.activated,
+    refund_policy,
+    moderation_log_id: r.moderation_log_id
+  };
+}
+
+function unbanAccount({ hive_account, admin_id = ADMIN_ID }) {
+  if (!hive_account) throw Object.assign(new Error('hive_account required'), { code: 'bad_request' });
+  const account = String(hive_account).toLowerCase();
+  const db = quota.open();
+  const t = quota.now();
+  const r = db.prepare(`
+    UPDATE banned_accounts SET unbanned_at = ?, unbanned_by = ?
+    WHERE hive_account = ? AND unbanned_at IS NULL
+  `).run(t, admin_id, account);
+  if (r.changes === 0) {
+    throw Object.assign(new Error('account is not currently banned'), { code: 'not_found' });
+  }
+  const moderation_log_id = audit({ action: 'unban', target_type: 'account', target: account, admin_id });
+  return { moderation_log_id };
+}
+
+/**
+ * Takedown a single CID — CONTENT kill (cohosting §7). Adds the CID to the
+ * permanent banned-CID registry (blocked at /upload + guardian-pledge so it
+ * cannot reappear under any user), voids the active claim(s) AND the entire
+ * dormant guardian queue, and marks pins 'takedown'. The bytes are always
+ * unpinned by the caller (content kill — no guardian survives).
+ *
+ * Returns { voided_claims, pins_affected, refund_policy, moderation_log_id }.
+ * Refund execution is the CALLER's job (server settles each voided claim: active
+ * host/offender per refund_policy; dormant guardians = innocent → full refund).
+ */
+function takedownCid({ cid, reason, refund_policy, admin_id = ADMIN_ID }) {
+  if (!cid) throw Object.assign(new Error('cid required'), { code: 'bad_request' });
+  if (!reason) throw Object.assign(new Error('reason required'), { code: 'bad_request' });
+  const policy = ['none', 'prorata'].includes(refund_policy) ? refund_policy : DEFAULT_REFUND_POLICY;
+  const db = quota.open();
+  const tx = db.transaction(() => {
+    const t = quota.now();
+    db.prepare(`
+      INSERT OR REPLACE INTO blocked_cids
+        (cid, blocked_at, blocked_by, reason, unblocked_at, unblocked_by)
+      VALUES (?, ?, ?, ?, NULL, NULL)
+    `).run(cid, t, admin_id, reason);
+
+    // Void the active claim(s) AND the whole dormant guardian queue for the CID.
+    const voidedClaims = db.prepare(
+      "SELECT * FROM claims WHERE cid = ? AND state IN ('active','dormant')"
+    ).all(cid);
+    db.prepare(
+      "UPDATE claims SET state = 'cancelled' WHERE cid = ? AND state IN ('active','dormant')"
+    ).run(cid);
+
+    const upd = db.prepare(`
+      UPDATE pins SET status = 'takedown', status_changed_at = ?, status_reason = ?
+      WHERE cid = ? AND status = 'active'
+    `).run(t, reason, cid);
+
+    const mlId = audit({
+      action: 'takedown',
+      target_type: 'cid',
+      target: cid,
+      reason,
+      metadata: { pins_affected: upd.changes, claims_voided: voidedClaims.length, refund_policy: policy },
+      admin_id
+    });
+
+    return { voidedClaims, pins_affected: upd.changes, moderation_log_id: mlId, refund_policy: policy };
+  });
+  const r = tx.immediate();
+  return {
+    voided_claims: r.voidedClaims,
+    pins_affected: r.pins_affected,
+    refund_policy: r.refund_policy,
+    moderation_log_id: r.moderation_log_id
+  };
+}
+
+function untakedownCid({ cid, admin_id = ADMIN_ID }) {
+  if (!cid) throw Object.assign(new Error('cid required'), { code: 'bad_request' });
+  const db = quota.open();
+  const t = quota.now();
+  const r = db.prepare(`
+    UPDATE blocked_cids SET unblocked_at = ?, unblocked_by = ?
+    WHERE cid = ? AND unblocked_at IS NULL
+  `).run(t, admin_id, cid);
+  if (r.changes === 0) {
+    throw Object.assign(new Error('cid is not currently in takedown'), { code: 'not_found' });
+  }
+  const moderation_log_id = audit({ action: 'untakedown', target_type: 'cid', target: cid, admin_id });
+  return { moderation_log_id };
+}
+
+/**
+ * Bulk-import takedowns from a JSON array.
+ * Returns { imported, skipped_existing, errors }.
+ */
+function importTakedowns(list) {
+  if (!Array.isArray(list)) {
+    throw Object.assign(new Error('list must be an array'), { code: 'bad_request' });
+  }
+  const out = { imported: 0, skipped_existing: 0, errors: [] };
+  const db = quota.open();
+  const checkExisting = db.prepare('SELECT 1 FROM blocked_cids WHERE cid = ?');
+  for (const entry of list) {
+    try {
+      if (!entry || !entry.cid || !entry.reason) {
+        out.errors.push({ entry, error: 'missing cid or reason' });
+        continue;
+      }
+      if (checkExisting.get(entry.cid)) {
+        out.skipped_existing++;
+        continue;
+      }
+      takedownCid({ cid: entry.cid, reason: entry.reason });
+      out.imported++;
+    } catch (e) {
+      out.errors.push({ entry, error: e.message });
+    }
+  }
+  return out;
+}
+
+// ─── Whitelist CRUD (WHITELIST-MODE-DESIGN-NOTES.md §2/§5) ───────────────────
+// Mirrors banAccount/unbanAccount/listBans. INSERT OR REPLACE on add doubles
+// as "update this entry's quota/exemption" and as re-adding a soft-removed
+// account (removed_at reset to NULL).
+
+function addToWhitelist({ hive_account, added_by = ADMIN_ID, quota_bytes = null, fee_exempt = false, note = null }) {
+  if (!hive_account) throw Object.assign(new Error('hive_account required'), { code: 'bad_request' });
+  if (quota_bytes != null && (!Number.isInteger(quota_bytes) || quota_bytes < 0)) {
+    throw Object.assign(new Error('quota_bytes must be a non-negative integer or null'), { code: 'bad_request' });
+  }
+  const account = String(hive_account).toLowerCase();
+  const db = quota.open();
+  db.prepare(`
+    INSERT OR REPLACE INTO whitelisted_accounts
+      (hive_account, added_at, added_by, quota_bytes, fee_exempt, note, removed_at, removed_by)
+    VALUES (?, ?, ?, ?, ?, ?, NULL, NULL)
+  `).run(account, quota.now(), added_by, quota_bytes, fee_exempt ? 1 : 0, note);
+  const moderation_log_id = audit({
+    action: 'whitelist_add', target_type: 'account', target: account,
+    metadata: { quota_bytes, fee_exempt: !!fee_exempt },
+    admin_id: added_by
+  });
+  return { moderation_log_id };
+}
+
+function removeFromWhitelist({ hive_account, removed_by = ADMIN_ID }) {
+  if (!hive_account) throw Object.assign(new Error('hive_account required'), { code: 'bad_request' });
+  const account = String(hive_account).toLowerCase();
+  const db = quota.open();
+  const r = db.prepare(`
+    UPDATE whitelisted_accounts SET removed_at = ?, removed_by = ?
+    WHERE hive_account = ? AND removed_at IS NULL
+  `).run(quota.now(), removed_by, account);
+  if (r.changes === 0) {
+    throw Object.assign(new Error('account is not currently whitelisted'), { code: 'not_found' });
+  }
+  const moderation_log_id = audit({
+    action: 'whitelist_remove', target_type: 'account', target: account, admin_id: removed_by
+  });
+  return { moderation_log_id };
+}
+
+function listWhitelist() {
+  return quota.open().prepare(
+    'SELECT * FROM whitelisted_accounts WHERE removed_at IS NULL ORDER BY added_at DESC'
+  ).all();
+}
+
+function listBans() {
+  return quota.open().prepare(
+    'SELECT * FROM banned_accounts WHERE unbanned_at IS NULL ORDER BY banned_at DESC'
+  ).all();
+}
+
+function listTakedowns() {
+  return quota.open().prepare(
+    'SELECT * FROM blocked_cids WHERE unblocked_at IS NULL ORDER BY blocked_at DESC'
+  ).all();
+}
+
+function listModerationLog(limit = 50, offset = 0) {
+  const db = quota.open();
+  const total = db.prepare('SELECT COUNT(*) AS c FROM moderation_log').get().c;
+  const log = db.prepare(
+    'SELECT * FROM moderation_log ORDER BY timestamp DESC LIMIT ? OFFSET ?'
+  ).all(limit, offset);
+  // Parse metadata JSON for clients
+  for (const row of log) {
+    if (row.metadata) {
+      try { row.metadata = JSON.parse(row.metadata); } catch (e) { /* leave as string */ }
+    }
+  }
+  return { log, total, limit, offset };
+}
+
+function listOrphanPayments() {
+  return quota.open().prepare(
+    "SELECT * FROM payments WHERE status IN ('orphan','paid_unconfirmed') ORDER BY verified_at DESC"
+  ).all();
+}
+
+function logManualRefund({ payment_id, refund_tx_id, reason }) {
+  if (!payment_id) throw Object.assign(new Error('payment_id required'), { code: 'bad_request' });
+  if (!refund_tx_id) throw Object.assign(new Error('refund_tx_id required'), { code: 'bad_request' });
+  const db = quota.open();
+  const pmt = db.prepare('SELECT * FROM payments WHERE id = ?').get(payment_id);
+  if (!pmt) throw Object.assign(new Error('payment not found'), { code: 'not_found' });
+  if (pmt.status === 'refunded') {
+    throw Object.assign(new Error('payment already marked refunded'), { code: 'conflict' });
+  }
+  quota.markPaymentRefunded(payment_id, refund_tx_id);
+  const moderation_log_id = audit({
+    action: 'refund_issued',
+    target_type: 'payment',
+    target: String(payment_id),
+    reason,
+    metadata: { refund_tx_id }
+  });
+  return { payment_id, marked_refunded: true, moderation_log_id };
+}
+
+module.exports = {
+  banAccount,
+  unbanAccount,
+  takedownCid,
+  untakedownCid,
+  importTakedowns,
+  addToWhitelist,
+  removeFromWhitelist,
+  listWhitelist,
+  listBans,
+  listTakedowns,
+  listModerationLog,
+  listOrphanPayments,
+  logManualRefund,
+  audit,
+  ADMIN_ID
+};
