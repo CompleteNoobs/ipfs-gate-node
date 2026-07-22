@@ -7,7 +7,7 @@
     "start": "node server.js",
     "dev": "node --watch server.js",
     "migrate": "node -e \"require('./quota').runMigrations()\"",
-    "test": "node --test test/",
+    "test": "node --test test/*.test.js",
     "test:hive": "node test-hive-verify.js",
     "docker:prep": "sh scripts/vendor-escrow.sh",
     "docker:build": "sh scripts/vendor-escrow.sh && docker compose up -d --build"
