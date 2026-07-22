@@ -35,7 +35,11 @@ async function main() {
   const reporter = createEscrowReporter({ escrowCore, getSkHex: () => skHex, reporter: ACCOUNT, service: 'ipfs-gate' });
   const adapter = escrowCore.createIpfsGateAdapter({ account: ACCOUNT, currency: 'CNOOBS', keyEnv: 'IPFS_GATE_ACTIVE_KEY' });
 
-  const ref = `smoke-${Date.now()}`;
+  // A FIXED ref (SMOKE_REF) makes the smoke two-run-safe on flaky/lab relays:
+  // run 1 publishes and may time out while the box grinds through live-chain
+  // verification; the box's receipt is STORED on the relay, so run 2 with the
+  // same ref receives it from history and passes.
+  const ref = process.env.SMOKE_REF || `smoke-${Date.now()}`;
   let done = false;
 
   const bm = createEscrowBoxMode({
