@@ -8,6 +8,16 @@
 > behind an `ESCROW_MODE` flag, default `in-process` (byte-identical monolith behaviour).
 > Build plan: `../decoupling-notes/ipfs-gate-split-plan.md`. The monolith docs below still
 > describe the default in-process mode accurately.
+>
+> **Box mode (`ESCROW_MODE=box`)** — the keyless flip, built Phase 3: read-only payment
+> verification stays inline, but every refund becomes a signed claim-settle report to the
+> [ipfs-gate-escrow](https://github.com/CompleteNoobs/ipfs-gate-escrow) box over
+> escrow-protocol/0.1 (Nostr kind-31337; durable `pending_reports` queue, drainer,
+> receipts verified under the pinned `ESCROW_BOX_PUBKEY`). Setup: set `ESCROW_BOX_PUBKEY`
+> (the box logs it at boot), REMOVE `IPFS_GATE_ACTIVE_KEY` from this host, add this node's
+> logged reporting pubkey to the box's `ESCROW_EXPECTED_REPORTERS`. See `.env.example`
+> ("Escrow mode") — note the GUARDIAN_CANCEL_FEE_PCT / MIN_REFUND pairing rule (the box's
+> values are authoritative). Single-server combined docker profile: coming in Phase 4.
 
 ---
 

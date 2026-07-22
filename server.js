@@ -71,6 +71,31 @@ if (!ADMIN_KEY) {
   console.warn('WARN: ADMIN_KEY is empty — admin endpoints are unprotected. Set ADMIN_KEY in .env.');
 }
 
+// ─── Escrow mode (the decoupling flip — decoupling-notes/ipfs-gate-split-plan.md) ──
+// 'in-process' (DEFAULT) = the proven monolith path, byte-identical: this process
+// verifies payments AND broadcasts refunds with IPFS_GATE_ACTIVE_KEY.
+// 'box' = KEYLESS node: read-only payment verification stays here, but every
+// refund becomes a signed claim-settle report to the isolated ipfs-gate-escrow
+// box (escrow-protocol/0.1 over Nostr); the box re-verifies on-chain, disburses
+// with the only key, and returns a signed receipt.
+const ESCROW_MODE = (process.env.ESCROW_MODE || 'in-process').toLowerCase();
+const ESCROW_BOX_PUBKEY = (process.env.ESCROW_BOX_PUBKEY || '').trim().toLowerCase();
+const ESCROW_BOX_RELAYS = (process.env.NOSTR_RELAYS || 'wss://nostr.v4call.com')
+  .split(',').map(s => s.trim()).filter(Boolean);
+let escrowBoxMode = null;   // set in boot() when ESCROW_MODE === 'box'
+if (ESCROW_MODE === 'box') {
+  if (!/^[0-9a-f]{64}$/.test(ESCROW_BOX_PUBKEY)) {
+    console.error('FATAL: ESCROW_MODE=box requires ESCROW_BOX_PUBKEY (64-hex — the box logs it at boot). Refusing to start keyless without a pinned box key.');
+    process.exit(1);
+  }
+  if (process.env.IPFS_GATE_ACTIVE_KEY) {
+    console.warn('WARN: ESCROW_MODE=box but IPFS_GATE_ACTIVE_KEY is set on this host. It will NOT be used — REMOVE it: the whole point of box mode is that a node compromise cannot drain funds.');
+  }
+} else if (ESCROW_MODE !== 'in-process') {
+  console.error(`FATAL: unknown ESCROW_MODE '${ESCROW_MODE}' (expected 'in-process' or 'box').`);
+  process.exit(1);
+}
+
 // ─── App ────────────────────────────────────────────────────────────────────
 
 const app = express();
@@ -247,6 +272,27 @@ async function broadcastRefund(claim, amount, reason) {
     claim_id: claim.claim_id, to_account: claim.owner, amount,
     currency: claim.currency, memo, status: 'pending', reason
   });
+
+  // BOX MODE: this node is keyless. Hand the claim's verified-payment envelope to
+  // the escrow box as a signed claim-settle report and return non-blocking; the
+  // refund row flips pending→sent/failed when the box's signed receipt arrives
+  // (onSettled/onCompleted in boot()). The box recomputes the refund from ITS
+  // authoritative knobs — `amount` above is the node-side estimate for display.
+  if (escrowBoxMode) {
+    try {
+      const payRows = quota.getClaimPayments(claim);
+      await escrowBoxMode.settleClaim({
+        claimId: claim.claim_id, claim, payRows, trigger: reason,
+        now: Date.now(), meta: { refund_id: rec.refund_id },
+      });
+      return { amount, status: 'pending', refund_id: rec.refund_id };
+    } catch (e) {
+      // Never throw (broadcastRefund contract). The durable queue/drainer normally
+      // absorbs transport problems; reaching here means enqueue itself failed.
+      console.error(`[refund] ${rec.refund_id} box-mode enqueue failed: ${e.message}`);
+      return { amount, status: 'pending', refund_id: rec.refund_id, error: e.message };
+    }
+  }
 
   try {
     const sent = await hive.sendRefund({ to: claim.owner, amount, currency: claim.currency, memo });
@@ -2357,6 +2403,65 @@ async function boot() {
   quota.open();
   quota.runMigrations();
 
+  if (ESCROW_MODE === 'box') {
+    // Lazy requires: the default in-process boot stays exactly the monolith path
+    // (escrow-core and the box-mode modules are never even loaded).
+    const fs = require('fs');
+    const path = require('path');
+    const escrowCore = require('escrow-core');
+    const { createEscrowReporter } = require('./escrow-report');
+    const { createSettlementQueue } = require('./escrow-settlement-queue');
+    const { createEscrowBoxMode } = require('./escrow-box-mode');
+
+    // The node's escrow-reporting key (schnorr). Unlike v4call there is no Nostr
+    // identity to reuse — persist a dedicated key (0600) so the pubkey is stable:
+    // the box pins it in ESCROW_EXPECTED_REPORTERS.
+    const keyPath = process.env.ESCROW_REPORTING_KEY_PATH || path.join(__dirname, 'data', 'escrow-reporting-key.json');
+    let skHex;
+    try {
+      const j = JSON.parse(fs.readFileSync(keyPath, 'utf8'));
+      if (!/^[0-9a-f]{64}$/i.test(j.sk_hex || '')) throw new Error('sk_hex missing/invalid');
+      skHex = j.sk_hex.toLowerCase();
+    } catch (e) {
+      if (e.code !== 'ENOENT') console.warn(`[escrow-box] ${keyPath}: ${e.message} — generating a fresh key`);
+      skHex = crypto.randomBytes(32).toString('hex');
+      fs.mkdirSync(path.dirname(keyPath), { recursive: true });
+      fs.writeFileSync(keyPath, JSON.stringify({
+        sk_hex: skHex, pubkey: escrowCore.getReportingPubkey(skHex), created_at: new Date().toISOString(),
+      }, null, 2), { mode: 0o600 });
+      console.log(`[escrow-box] generated node reporting key → ${keyPath}`);
+    }
+
+    const escrowAdapter = escrowCore.createIpfsGateAdapter({
+      account: IPFS_GATE_HIVE_ACCOUNT, currency: PAYMENT_CURRENCY, keyEnv: 'IPFS_GATE_ACTIVE_KEY' });
+    const escrowReporter = createEscrowReporter({
+      escrowCore, getSkHex: () => skHex, reporter: IPFS_GATE_HIVE_ACCOUNT, service: 'ipfs-gate' });
+    const queue = createSettlementQueue({ db: quota.open() });
+    escrowBoxMode = createEscrowBoxMode({
+      escrowAdapter, escrowReporter, queue,
+      boxPubkey: ESCROW_BOX_PUBKEY, relays: ESCROW_BOX_RELAYS, selfSkHex: () => skHex });
+
+    // Receipt → refund-row lifecycle. onSettled fires EXACTLY once per settled
+    // ref; onCompleted exactly once per pending→terminal transition. A receipt
+    // still 'pending' leaves the row pending (the completion receipt upgrades it).
+    // The box's refund/disburse tx are the authority; the row's amount stays the
+    // node-side estimate for display.
+    const finalizeRefund = (ref, { receipt, meta }) => {
+      const refundId = meta && meta.refund_id;
+      if (!refundId) { console.warn(`[escrow-box] receipt for ${ref} has no refund_id meta — nothing to finalize`); return; }
+      if (receipt.status === 'failed') {
+        quota.markRefundSettled(refundId, 'failed', null);
+      } else if (receipt.status === 'settled') {
+        quota.markRefundSettled(refundId, Number(receipt.refund) > 0 ? 'sent' : 'skipped', receipt.disburseTx || null);
+      }
+    };
+    escrowBoxMode.onSettled(async (ref, ctx) => finalizeRefund(ref, ctx));
+    escrowBoxMode.onCompleted(async (ref, ctx) => finalizeRefund(ref, ctx));
+    await escrowBoxMode.start();
+    console.log(`[server] ESCROW_MODE=box — keyless node; refunds settle via escrow box ${ESCROW_BOX_PUBKEY.slice(0, 12)}… (${ESCROW_BOX_RELAYS.length} relay(s))`);
+    console.log(`[server]   node reporting pubkey: ${escrowReporter.pubkey()}   ← add to the box's ESCROW_EXPECTED_REPORTERS`);
+  }
+
   // Probe Kubo (non-fatal — server can run, just won't be useful)
   try {
     const s = await kubo.stats();
@@ -2375,7 +2480,7 @@ async function boot() {
     console.log(`ipfs-gate v1 (claim model) listening on ${BIND_HOST}:${PORT}`);
     console.log(`  operator account: @${IPFS_GATE_HIVE_ACCOUNT}`);
     console.log(`  pricing: ${pricing.RATE_PER_MB_HOUR} ${PAYMENT_CURRENCY} / MB-hour, min ${pricing.MIN_HOURS}h, ${pricing.NODE_COUNT} node(s), ≤${MAX_FILE_SIZE_MB}MB`);
-    console.log(`  refunds: ${process.env.IPFS_GATE_ACTIVE_KEY ? 'auto (escrow key set)' : 'MANUAL — IPFS_GATE_ACTIVE_KEY unset, refunds recorded pending'}`);
+    console.log(`  refunds: ${escrowBoxMode ? 'via escrow box (keyless node, ESCROW_MODE=box)' : (process.env.IPFS_GATE_ACTIVE_KEY ? 'auto (escrow key set)' : 'MANUAL — IPFS_GATE_ACTIVE_KEY unset, refunds recorded pending')}`);
     console.log(`  CORS origin: ${CORS_ORIGIN}`);
   });
 }

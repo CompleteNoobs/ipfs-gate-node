@@ -1183,14 +1183,15 @@ async function deleteUpload(row, u, gw) {
   if (!resp.ok) { if (bar) bar.innerHTML = `<span class="upl-confirm">⚠ delete failed (${resp.status})</span>`; return; }
   let j = {};
   try { j = await resp.json(); } catch (_) {}
-  markRowRemoved(row, j.fully_unpinned);
+  const refundPending = Array.isArray(j.refunds) && j.refunds.some(r => r && r.status === 'pending');
+  markRowRemoved(row, j.fully_unpinned, refundPending);
   loadUploadsList();
 }
 
-function markRowRemoved(row, fullyUnpinned) {
+function markRowRemoved(row, fullyUnpinned, refundPending) {
   row.classList.add('inactive');
   const bar = row.querySelector('.upl-action-bar');
-  if (bar) bar.innerHTML = `<span class="upl-confirm" style="color:var(--green);">✓ unpinned${fullyUnpinned === false ? ' (other copies remain)' : ''}</span>`;
+  if (bar) bar.innerHTML = `<span class="upl-confirm" style="color:var(--green);">✓ unpinned${fullyUnpinned === false ? ' (other copies remain)' : ''}${refundPending ? ' — refund pending (settling via escrow box)' : ''}</span>`;
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -1336,8 +1337,14 @@ async function cancelPledge(row, c, gw) {
     return;
   }
   if (!resp.ok) { const j = await resp.json().catch(() => ({})); if (bar) bar.innerHTML = `<span class="upl-confirm">⚠ cancel failed (${j.message || resp.status})</span>`; return; }
+  let j = {}; try { j = await resp.json(); } catch (_) {}
   row.classList.add('inactive');
-  if (bar) bar.innerHTML = '<span class="upl-confirm" style="color:var(--green);">✓ cancelled — refunded in full</span>';
+  // Box mode (keyless gate): the refund settles asynchronously via the escrow
+  // box — the response says 'pending' and flips to sent on the box's receipt.
+  const refundPending = j.refund && j.refund.status === 'pending';
+  if (bar) bar.innerHTML = refundPending
+    ? '<span class="upl-confirm" style="color:var(--green);">✓ cancelled — refund pending (settling via escrow box, usually under a minute)</span>'
+    : '<span class="upl-confirm" style="color:var(--green);">✓ cancelled — refunded in full</span>';
   loadGuardianPledges();
 }
 

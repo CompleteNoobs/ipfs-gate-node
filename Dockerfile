@@ -7,8 +7,18 @@ RUN apk add --no-cache python3 make g++ curl
 WORKDIR /app
 
 # Install deps first (cached layer when only source changes)
-COPY package.json package-lock.json* ./
-RUN npm ci --omit=dev
+COPY package.json ./
+
+# escrow-core is a sibling dependency (`file:../escrow-core` in package.json) and
+# lives OUTSIDE this build context. `npm run docker:prep` vendors a clean source
+# snapshot into ./vendor/escrow-core; we place it at /escrow-core — a sibling of
+# /app — so the UNCHANGED `file:../escrow-core` path resolves at install time
+# exactly as on bare metal. --install-links packs it as a real directory (a
+# symlink would resolve escrow-core's own deps from /escrow-core, which has no
+# node_modules in the image → boot crash). Replaces the old `npm ci`: the file:
+# dep makes the lockfile machine-local.
+COPY vendor/escrow-core /escrow-core
+RUN npm install --omit=dev --install-links
 
 # App sources.
 # Use a glob, NOT a hardcoded file list: an explicit list silently dropped
@@ -16,7 +26,8 @@ RUN npm ci --omit=dev
 # server.js crash-looped on `Cannot find module './pricing'` → nginx 502. Globbing
 # every top-level module means future stages (Stage 6+) ship automatically.
 # (test/ is a subdir → not matched by *.js, so tests don't bloat the image.)
-COPY *.js ./
+# *.mjs covers the box-mode Nostr client (escrow-box-client.mjs).
+COPY *.js *.mjs ./
 COPY backends ./backends
 COPY migrations ./migrations
 

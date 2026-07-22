@@ -42,3 +42,5 @@ coverage/
 # Local operator certs (Let's Encrypt mounts elsewhere)
 certs/
 letsencrypt/
+# Vendored escrow-core snapshot (docker:prep output — never commit the money lib)
+vendor/

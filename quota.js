@@ -344,6 +344,21 @@ function markPaymentRefunded(paymentId, refundTxId) {
   `).run(refundTxId, now(), paymentId);
 }
 
+/**
+ * Every payment funding one claim: the original deposit (claims.payment_id FK)
+ * plus each extend top-up (memo `ipfs-gate:extend:<claim_id>` — extendClaim
+ * bumps paid_hours but records the top-up only in payments). Box mode sends
+ * exactly this set in the claim-settle report so the escrow box can re-verify
+ * the FULL envelope on-chain. Includes fee-exempt synthetic rows
+ * (`whitelist-free:*`) — the report builder filters them; they never leave
+ * the node.
+ */
+function getClaimPayments(claim) {
+  return db.prepare(`
+    SELECT * FROM payments WHERE id = ? OR memo = ? ORDER BY id ASC
+  `).all(claim.payment_id ?? -1, `ipfs-gate:extend:${claim.claim_id}`);
+}
+
 // ─── Pins ───────────────────────────────────────────────────────────────────
 
 function createPin({ cid, uploader, size_bytes, payment_id, ttl_days, expires_at = null, mode = 'encrypted', mime = null }) {
@@ -897,6 +912,7 @@ module.exports = {
   getPaymentById,
   getPaymentByTxId,
   markPaymentRefunded,
+  getClaimPayments,
   // pins
   createPin,
   getPinById,
