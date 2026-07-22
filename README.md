@@ -1,11 +1,13 @@
-# ipfs-gate
+# ipfs-gate-node
 
-> ℹ️ **This monolith repo is ACTIVE again.** A decoupling into
-> [ipfs-gate-node](https://github.com/CompleteNoobs/ipfs-gate-node) +
-> [escrow-core](https://github.com/CompleteNoobs/escrow-core) was started 2026-06-16 and then
-> **deferred** — feature work resumed here (Guardian feature, whitelist/family-server mode,
-> extend/top-up, the standalone web interface all landed in this repo, July 2026). The split
-> repos remain as the eventual direction; until that resumes, **this is the source of truth.**
+> ℹ️ **The headless ipfs-gate server** — gateway, pinning, claims, HTTP API. Carved from the
+> [ipfs-gate](https://github.com/CompleteNoobs/IPFS-Gate) monolith @`56c0965` (full history
+> grafted 2026-07-22; the live monolith deployments are untouched and keep running). In the
+> target architecture this node holds **no money key**: refund settlement moves to an isolated
+> [escrow-core](https://github.com/CompleteNoobs/escrow-core) deployment (`ipfs-gate-escrow`)
+> behind an `ESCROW_MODE` flag, default `in-process` (byte-identical monolith behaviour).
+> Build plan: `../decoupling-notes/ipfs-gate-split-plan.md`. The monolith docs below still
+> describe the default in-process mode accurately.
 
 ---
 
