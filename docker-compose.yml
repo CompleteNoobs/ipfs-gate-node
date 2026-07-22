@@ -1,6 +1,21 @@
-# ipfs-gate v0.1 — docker-compose.
-# Three services: kubo (IPFS daemon), ipfs-gate (this app), nginx (HTTPS + reverse proxy).
-# certbot is separate (run on-demand for cert issuance/renewal).
+# ipfs-gate — docker-compose.
+# Base services (always): kubo (IPFS daemon), ipfs-gate (this app), nginx (HTTPS + reverse
+# proxy). certbot is separate (run on-demand for cert issuance/renewal).
+#
+# SINGLE-SERVER COMBINED MODE (the decoupling's supported one-box topology):
+#   docker compose --profile escrow up -d          → + the ipfs-gate-escrow money box
+#   docker compose --profile escrow --profile relay up -d   → + a local strfry relay
+#                                                     (fully-offline escrow transport)
+# Prereqs: clone ipfs-gate-escrow AND escrow-core as SIBLINGS of this repo, run
+# `npm run docker:prep` in BOTH this repo and ../ipfs-gate-escrow (vendors escrow-core
+# into each build context), and set ESCROW_MODE=box + ESCROW_BOX_PUBKEY in ./.env while
+# ../ipfs-gate-escrow/.env holds the money key (the ONLY place it exists).
+# With --profile relay, point NOSTR_RELAYS at ws://relay:7777 in BOTH .env files.
+#
+# ⚠ Topology guidance (v4call owner decision 2026-06-16, carried over): one box is fine
+# for TEST-token dry-runs and small self-hosted setups; with REAL funds two separate
+# hosts are strongly recommended — a node compromise then cannot reach the money key's
+# host at all.
 
 services:
   kubo:
@@ -52,6 +67,40 @@ services:
       - ./data/letsencrypt-webroot:/var/www/certbot:ro
     depends_on:
       - ipfs-gate
+    networks:
+      - internal
+
+  # ── --profile escrow: the money box as a separate container on this host ──
+  # Build context is the SIBLING repo; its own .env is the ONLY home of
+  # IPFS_GATE_ACTIVE_KEY. No ports — the box is outbound-only (Hive RPC over
+  # HTTPS, the relay over WS/WSS).
+  ipfs-gate-escrow:
+    build: ../ipfs-gate-escrow
+    container_name: ipfs-gate-escrow
+    profiles: ["escrow"]
+    restart: unless-stopped
+    env_file: ../ipfs-gate-escrow/.env
+    environment:
+      - ESCROW_DB_PATH=/app/data/ipfs-gate-escrow.db
+      - ESCROW_KEY_PATH=/app/data/escrow-reporting-key.json
+    volumes:
+      - ../ipfs-gate-escrow/data:/app/data
+    networks:
+      - internal
+
+  # ── --profile relay: local strfry for fully-offline escrow-protocol testing ──
+  # Containers reach it as ws://relay:7777 (set NOSTR_RELAYS in both .envs).
+  # Expose 7777 on the host so bare-metal/dev processes can use ws://<host>:7777.
+  relay:
+    image: dockurr/strfry:latest
+    container_name: ipfs-gate-relay
+    profiles: ["relay"]
+    restart: unless-stopped
+    ports:
+      - "7777:7777"
+    volumes:
+      - ./relay/strfry.conf:/etc/strfry.conf:ro
+      - ./data/strfry-db:/app/strfry-db
     networks:
       - internal
 
