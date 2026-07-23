@@ -64,8 +64,14 @@ async function main() {
 
   await bm.start();
   console.log(`publishing fabricated single-payment report ref=${ref} → box ${BOX_PUB.slice(0, 12)}…`);
+  // The fake txId MUST be 40-hex: a malformed id makes Hive nodes throw an
+  // UNCODED JSON-RPC error ("Invalid hex character") which classifies as
+  // transient → the box silently retries forever and no receipt ever comes.
+  // A well-formed-but-nonexistent id yields unprocessable_entity (structural)
+  // → terminal failed receipt → the round-trip completes. (Found live 2026-07-22.)
   await bm.settlePayment({
-    ref, txId: 'smoke-nonexistent-tx', sender: ACCOUNT, amount: 0.001, currency: 'CNOOBS',
+    ref, txId: 'ab'.repeat(20), sender: ACCOUNT, amount: 0.001,
+    currency: process.env.PAYMENT_CURRENCY || 'CNOOBS',
     memo: `ipfs-gate:upload:${ref}`, payoutTo: ACCOUNT, platformFee: 0, now: Date.now(),
   });
 
