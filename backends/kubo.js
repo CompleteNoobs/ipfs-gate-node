@@ -10,8 +10,14 @@
 //   POST /api/v0/repo/stat           — disk usage
 //   POST /api/v0/version             — version + status check
 
+const fs = require('fs');
+const crypto = require('crypto');
+const http = require('http');
 const KUBO_API_URL = (process.env.KUBO_API_URL || 'http://kubo:5001').replace(/\/$/, '');
 const KUBO_TIMEOUT_MS = parseInt(process.env.KUBO_TIMEOUT_MS || '60000', 10);
+// Adds of large files stream from disk and can take far longer than the quick
+// pin/ls/gc calls — give /add its own generous timeout (default 15 min).
+const KUBO_ADD_TIMEOUT_MS = parseInt(process.env.KUBO_ADD_TIMEOUT_MS || '900000', 10);
 
 async function kuboFetch(path, opts = {}) {
   const url = `${KUBO_API_URL}${path}`;
@@ -98,6 +104,88 @@ async function cidOf(bytes) {
     throw Object.assign(new Error(`Kubo /add (only-hash) returned no Hash: ${JSON.stringify(parsed)}`), { code: 'bad_gateway' });
   }
   return { cid: parsed.Hash };
+}
+
+/**
+ * Parse Kubo /add's newline-delimited JSON response → the CID Hash.
+ */
+function parseAddHash(text, label) {
+  const firstLine = String(text || '').trim().split('\n').filter(Boolean).pop();
+  if (!firstLine) throw Object.assign(new Error(`Kubo ${label} returned empty body`), { code: 'bad_gateway' });
+  let parsed;
+  try { parsed = JSON.parse(firstLine); }
+  catch (e) { throw Object.assign(new Error(`Kubo ${label} returned non-JSON: ${String(text).slice(0, 200)}`), { code: 'bad_gateway' }); }
+  if (!parsed.Hash) throw Object.assign(new Error(`Kubo ${label} returned no Hash: ${JSON.stringify(parsed)}`), { code: 'bad_gateway' });
+  return parsed.Hash;
+}
+
+/**
+ * Stream a file into Kubo's /add as multipart/form-data WITHOUT buffering it.
+ * Native fetch + FormData/Blob buffers the whole body in undici (FormData is not
+ * streamed), so we build the multipart envelope by hand and pass an async-
+ * generator body with duplex:'half' — undici then streams it chunk-by-chunk.
+ * Content-Length is known up front (preamble + file size + epilogue), so no
+ * chunked encoding. This is the real >100MB fix: node RAM stays flat regardless
+ * of file size.
+ */
+async function streamAdd(filePath, qs, label) {
+  const stat = await fs.promises.stat(filePath);
+  const boundary = '----ipfsgate' + crypto.randomBytes(12).toString('hex');
+  const pre = Buffer.from(
+    `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="ciphertext.bin"\r\n` +
+    `Content-Type: application/octet-stream\r\n\r\n`
+  );
+  const post = Buffer.from(`\r\n--${boundary}--\r\n`);
+  const url = new URL(`${KUBO_API_URL}/api/v0/add?${qs}`);
+
+  return await new Promise((resolve, reject) => {
+    const req = http.request({
+      method: 'POST',
+      hostname: url.hostname,
+      port: url.port || 80,
+      path: url.pathname + url.search,
+      headers: {
+        'Content-Type': `multipart/form-data; boundary=${boundary}`,
+        'Content-Length': pre.length + stat.size + post.length
+      }
+    }, (res) => {
+      let text = '';
+      res.setEncoding('utf8');
+      res.on('data', d => { text += d; });
+      res.on('end', () => {
+        if (res.statusCode < 200 || res.statusCode >= 300) {
+          return reject(Object.assign(new Error(`Kubo ${label} HTTP ${res.statusCode}: ${text.slice(0, 200)}`), { code: 'bad_gateway', status: res.statusCode }));
+        }
+        try { resolve({ cid: parseAddHash(text, label) }); }
+        catch (e) { reject(e); }
+      });
+    });
+    req.setTimeout(KUBO_ADD_TIMEOUT_MS, () => req.destroy(Object.assign(new Error(`Kubo ${label} timed out after ${KUBO_ADD_TIMEOUT_MS}ms`), { code: 'bad_gateway' })));
+    req.on('error', reject);
+
+    // Stream: preamble, then the file (pipe = backpressure → flat RAM), then epilogue.
+    const fileStream = fs.createReadStream(filePath);
+    fileStream.on('error', (e) => req.destroy(e));
+    req.write(pre);
+    fileStream.pipe(req, { end: false });
+    fileStream.on('end', () => req.end(post));
+  });
+}
+
+/**
+ * Pin a file FROM DISK to local Kubo (streamed — see streamAdd). Add flags are
+ * identical to pin()'s, so the same bytes hash to the same CID.
+ */
+function pinFile(filePath) {
+  return streamAdd(filePath, 'pin=true&cid-version=1&raw-leaves=true&wrap-with-directory=false', '/add');
+}
+
+/**
+ * Streamed only-hash (POST /check): a file's CID from disk without storing or
+ * pinning. Flags identical to pinFile()/pin() so detection matches.
+ */
+function cidOfFile(filePath) {
+  return streamAdd(filePath, 'only-hash=true&pin=false&cid-version=1&raw-leaves=true&wrap-with-directory=false', '/add (only-hash)');
 }
 
 /**
@@ -196,7 +284,9 @@ async function cat(cid, { offset, length } = {}) {
 
 module.exports = {
   pin,
+  pinFile,
   cidOf,
+  cidOfFile,
   unpin,
   gc,
   exists,

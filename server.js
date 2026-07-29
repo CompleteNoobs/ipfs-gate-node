@@ -9,6 +9,8 @@ const cors = require('cors');
 const rateLimit = require('express-rate-limit');
 const multer = require('multer');
 const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
 
 const quota = require('./quota');
 const envelope = require('./envelope');
@@ -433,8 +435,14 @@ const userApiLimiter = rateLimit({
 
 // ─── Multer for ciphertext uploads ──────────────────────────────────────────
 
+// Ciphertext is streamed to a temp file on disk (NOT buffered whole in RAM), so
+// large uploads (>100MB) don't OOM the box: multer writes the incoming part to
+// disk, then kubo.pinFile() streams it into Kubo via a file-backed Blob. The
+// temp dir lives on the mounted data volume (disk-backed — never tmpfs/RAM).
+const UPLOAD_TMP_DIR = process.env.UPLOAD_TMP_DIR || path.join('/app/data', 'uploads-tmp');
+try { fs.mkdirSync(UPLOAD_TMP_DIR, { recursive: true }); } catch (e) { /* multer surfaces a clear error if truly unwritable */ }
 const upload = multer({
-  storage: multer.memoryStorage(),
+  storage: multer.diskStorage({ destination: UPLOAD_TMP_DIR }),
   limits: { fileSize: MAX_FILE_SIZE_BYTES + 1024 } // tiny slop for header overhead
 });
 
@@ -610,12 +618,15 @@ app.post('/upload', uploadLimiter, upload.single('ciphertext'), async (req, res)
     if (!reservation_id || !uploader_pubkey || !upload_proof_sig) {
       return respondError(res, 'bad_request', 'reservation_id, uploader_pubkey, upload_proof_sig all required');
     }
-    if (!req.file || !req.file.buffer) {
+    if (!req.file || !req.file.path) {
       return respondError(res, 'bad_request', 'ciphertext file field required');
     }
 
-    const ciphertext = req.file.buffer;
-    const sizeBytes = ciphertext.length;
+    const ciphertextPath = req.file.path;
+    const sizeBytes = req.file.size;
+    // Remove the streamed temp file once the response is done — covers every
+    // exit path (early error returns, success, or a dropped connection).
+    res.on('close', () => { fs.unlink(ciphertextPath, () => {}); });
     if (sizeBytes > MAX_FILE_SIZE_BYTES) {
       return respondError(res, 'payload_too_large', `ciphertext exceeds ${MAX_FILE_SIZE_MB}MB`);
     }
@@ -692,7 +703,7 @@ app.post('/upload', uploadLimiter, upload.single('ciphertext'), async (req, res)
     }
 
     // 3. Verify upload_proof_sig
-    const ciphertextSha256Hex = envelope.sha256Hex(ciphertext);
+    const ciphertextSha256Hex = await envelope.sha256FileHex(ciphertextPath);
     const sigOk = envelope.verifyUploadProof({
       ciphertextSha256Hex,
       reservationId: reservation_id,
@@ -816,7 +827,7 @@ app.post('/upload', uploadLimiter, upload.single('ciphertext'), async (req, res)
     // 8. Pin to Kubo
     let pinResult;
     try {
-      pinResult = await kubo.pin(ciphertext);
+      pinResult = await kubo.pinFile(ciphertextPath);
     } catch (e) {
       // Pin failed. Mark reservation cancelled. Payment stays as 'confirmed' for now —
       // operator should refund manually + log via /admin/log-refund.
@@ -962,14 +973,15 @@ app.get('/status/:cid', (req, res) => {
  */
 app.post('/check', uploadLimiter, upload.single('ciphertext'), async (req, res) => {
   try {
-    if (!req.file || !req.file.buffer) {
+    if (!req.file || !req.file.path) {
       return respondError(res, 'bad_request', 'ciphertext file field required');
     }
-    if (req.file.buffer.length > MAX_FILE_SIZE_BYTES) {
+    res.on('close', () => { fs.unlink(req.file.path, () => {}); });
+    if (req.file.size > MAX_FILE_SIZE_BYTES) {
       return respondError(res, 'payload_too_large', `file exceeds ${MAX_FILE_SIZE_MB}MB`);
     }
 
-    const { cid } = await kubo.cidOf(req.file.buffer);
+    const { cid } = await kubo.cidOfFile(req.file.path);
     if (quota.isCidBlocked(cid)) {
       return respondError(res, 'legal_takedown', 'this CID is blocked on this server');
     }

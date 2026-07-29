@@ -9,6 +9,7 @@
 
 const crypto = require('crypto');
 const dhive = require('@hiveio/dhive');
+const fs = require('fs');
 
 // ─── Hash helpers ───────────────────────────────────────────────────────────
 
@@ -18,6 +19,18 @@ function sha256Hex(bytes) {
 
 function sha256Bytes(bytes) {
   return crypto.createHash('sha256').update(bytes).digest();
+}
+
+// Streamed sha256 of a file on disk (hex) — for large uploads never held whole
+// in RAM. Byte-for-byte identical result to sha256Hex(bytes) for the same content.
+function sha256FileHex(filePath) {
+  return new Promise((resolve, reject) => {
+    const h = crypto.createHash('sha256');
+    const s = fs.createReadStream(filePath);
+    s.on('error', reject);
+    s.on('data', chunk => h.update(chunk));
+    s.on('end', () => resolve(h.digest('hex')));
+  });
 }
 
 // ─── Canonical messages ─────────────────────────────────────────────────────
@@ -113,6 +126,7 @@ function verifyUploadProof({
 module.exports = {
   sha256Hex,
   sha256Bytes,
+  sha256FileHex,
   buildUploadProofMessage,
   buildEnvelopeSigInput,
   envelopeSigHash,
